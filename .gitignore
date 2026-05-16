@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.log
+*.err
+*.out
+*.pth
+*.pt
+*.npy
+*.npz
+*.nc
+data_cache/
+checkpoints/
+test_prediction_plots/
+hindcast_stats/
+.DS_Store
