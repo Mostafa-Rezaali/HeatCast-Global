@@ -3,13 +3,54 @@ __pycache__/
 *.log
 *.err
 *.out
+
+# Python / notebooks / local environments
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Node / tool dependencies
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Model/data/cache outputs
 *.pth
 *.pt
 *.npy
 *.npz
 *.nc
+*.pkl
 data_cache/
 checkpoints/
 test_prediction_plots/
 hindcast_stats/
+hindcast_paper_data/
+paper_figures/
+
+# Archives, papers, screenshots, and local review packets
+*.zip
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.pptx
+*.docx
+review_packet*/
+screen_capture*
+screen_crop*
+
+# Personal/proposal working folders
+nsf_ags_prf_uploads/
+nsf_ags_prf_*.md
+nsf_ags_prf_*.py
+build_nsf_coa_workbook.mjs
+repair_nsf_coa_template.py
+codex_prompt_publication_analyses.md
+paper_analysis/
+Working_Version/
+Subdomain/
+files/
+2/
+
 .DS_Store
