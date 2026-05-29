@@ -37,6 +37,26 @@ def _input_mode(model):
     return getattr(_raw_model(model), "input_mode", "standard")
 
 
+def _predicts_persistence_residual(model):
+    return bool(getattr(_raw_model(model), "predict_persistence_residual", False))
+
+
+def _multi_lead_tube(model):
+    return bool(getattr(_raw_model(model), "multi_lead_tube", False))
+
+
+def _tube_center_index(model):
+    raw = _raw_model(model)
+    leads = tuple(int(x) for x in getattr(raw, "prediction_leads", (15,)))
+    center = int(getattr(raw, "center_lead", 15 if 15 in leads else leads[len(leads) // 2]))
+    return leads.index(center)
+
+
+def _tube_loss_weights(model):
+    raw = _raw_model(model)
+    return tuple(float(x) for x in getattr(raw, "tube_loss_weights", (0.80, 0.10, 0.10)))
+
+
 def _ensure_standard_input(model):
     mode = _input_mode(model)
     if mode != "standard":
@@ -102,25 +122,63 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
     x_input = _deterministic_input(model, x_t, x_tm1, x_tm2, spatial_c)
     dummy_t = torch.full((y.shape[0],), 0.5, device=device)
 
-    anom_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
+    raw_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
+    pred = x_t + raw_pred if _predicts_persistence_residual(model) else raw_pred
 
-    mask_expanded = mask.expand_as(anom_pred)
+    if _multi_lead_tube(model):
+        if y.ndim != 4:
+            raise RuntimeError(f"Tube target must have shape (B,L,H,W), got {tuple(y.shape)}")
+        mask_expanded = mask.expand_as(pred)
+        valid = mask_expanded > 0.5
+        if valid.any():
+            daily_mse = ((pred - y).square() * mask_expanded).sum() / mask_expanded.sum().clamp_min(1.0)
+            center_idx = _tube_center_index(model)
+            center_pred = pred[:, center_idx:center_idx + 1]
+            center_truth = y[:, center_idx:center_idx + 1]
+            center_mask = mask.expand_as(center_pred)
+            center_mse = ((center_pred - center_truth).square() * center_mask).sum() / center_mask.sum().clamp_min(1.0)
+            weekly_pred = pred.mean(dim=1, keepdim=True)
+            weekly_truth = y.mean(dim=1, keepdim=True)
+            weekly_mask = mask.expand_as(weekly_pred)
+            weekly_mse = ((weekly_pred - weekly_truth).square() * weekly_mask).sum() / weekly_mask.sum().clamp_min(1.0)
+        else:
+            daily_mse = pred.sum() * 0.0
+            center_mse = daily_mse
+            weekly_mse = daily_mse
+        w_daily, w_center, w_weekly = _tube_loss_weights(model)
+        total_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
+        zero = torch.tensor(0.0, device=device)
+        return total_loss, {
+            "det_loss": total_loss.detach(),
+            "recon_mse": daily_mse.detach(),
+            "tube_daily_mse": daily_mse.detach(),
+            "tube_center_mse": center_mse.detach(),
+            "tube_weekly_mse": weekly_mse.detach(),
+            "residual_abs": raw_pred.detach().abs().mean(),
+            "loss_t<0.33": zero,
+            "loss_0.33<t<0.67": zero,
+            "loss_t>0.67": zero,
+            "pred": pred,
+        }
+
+    mask_expanded = mask.expand_as(pred)
     valid = mask_expanded > 0.5
     if valid.any():
-        total_loss = F.huber_loss(anom_pred[valid], y[valid], delta=2.0)
-        recon_mse = F.mse_loss(anom_pred[valid], y[valid])
+        total_loss = F.huber_loss(pred[valid], y[valid], delta=2.0)
+        recon_mse = F.mse_loss(pred[valid], y[valid])
     else:
-        total_loss = anom_pred.sum() * 0.0
+        total_loss = pred.sum() * 0.0
         recon_mse = total_loss.detach()
 
     zero = torch.tensor(0.0, device=device)
     return total_loss, {
         "det_loss": total_loss.detach(),
         "recon_mse": recon_mse.detach(),
+        "residual_abs": raw_pred.detach().abs().mean(),
         "loss_t<0.33": zero,
         "loss_0.33<t<0.67": zero,
         "loss_t>0.67": zero,
-        "pred": anom_pred,  # prediction tensor for extreme loss
+        "pred": pred,  # prediction tensor for extreme loss
     }
 
 
@@ -132,9 +190,14 @@ def generate_deterministic_sample(model, spatial_c, vec_c, x_t, x_tm1, x_tm2,
     x_input = _deterministic_input(model, x_t, x_tm1, x_tm2, spatial_c)
     dummy_t = torch.full((1,), 0.5, device=device)
 
-    y_hat = model(x_input, dummy_t, vec_c, global_fields=global_fields)
+    raw_hat = model(x_input, dummy_t, vec_c, global_fields=global_fields)
+    y_hat = x_t + raw_hat if _predicts_persistence_residual(model) else raw_hat
     y_hat = y_hat * mask + OCEAN_FILL * (1 - mask)
     y_hat = y_hat.clamp(-4.0, 4.0)
+
+    if _multi_lead_tube(model):
+        center_idx = _tube_center_index(model)
+        return y_hat[0, center_idx, :h, :w].cpu().numpy()
 
     return y_hat[0, 0, :h, :w].cpu().numpy()
 

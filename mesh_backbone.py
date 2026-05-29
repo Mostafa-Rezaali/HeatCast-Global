@@ -327,7 +327,7 @@ class MeshFlowNet(nn.Module):
 
     deterministic=True (GraphCast):
       Input:  [x_t, x_tm1, x_tm2, spatial_c]
-      Output: direct target anomaly
+      Output: direct target field, or residual over persistence when enabled
       t:      fixed at 0.5 internally (acts as learned bias)
     """
     def __init__(
@@ -345,6 +345,11 @@ class MeshFlowNet(nn.Module):
         deterministic=False,
         dropout=0.0,
         input_mode="standard",
+        predict_persistence_residual=False,
+        multi_lead_tube=False,
+        prediction_leads=(15,),
+        tube_temporal_heads=4,
+        tube_loss_weights=(0.80, 0.10, 0.10),
     ):
         super().__init__()
         self.img_channels = img_channels
@@ -352,6 +357,12 @@ class MeshFlowNet(nn.Module):
         self.use_global = num_global_channels > 0
         self.deterministic = deterministic
         self.input_mode = input_mode
+        self.predict_persistence_residual = bool(predict_persistence_residual)
+        self.multi_lead_tube = bool(multi_lead_tube)
+        self.prediction_leads = tuple(int(x) for x in prediction_leads)
+        self.tube_num_leads = len(self.prediction_leads)
+        self.center_lead = 15 if 15 in self.prediction_leads else self.prediction_leads[self.tube_num_leads // 2]
+        self.tube_loss_weights = tuple(float(x) for x in tube_loss_weights)
 
         if deterministic:
             grid_input_dim = spatial_cond_channels
@@ -390,6 +401,44 @@ class MeshFlowNet(nn.Module):
             hidden_dim=hidden_dim, output_dim=img_channels,
             time_dim=time_dim, dropout=dropout,
         )
+        if self.multi_lead_tube:
+            if not deterministic:
+                raise ValueError("multi_lead_tube is currently implemented for deterministic mode only.")
+            heads = max(1, min(int(tube_temporal_heads), int(latent_dim)))
+            while latent_dim % heads != 0 and heads > 1:
+                heads -= 1
+            self.lead_embedding = nn.Embedding(self.tube_num_leads, latent_dim)
+            self.lead_time_proj = nn.Linear(latent_dim, time_dim)
+            self.tube_temporal_attn = nn.MultiheadAttention(
+                embed_dim=latent_dim,
+                num_heads=heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.tube_temporal_norm = nn.LayerNorm(latent_dim)
+            self.tube_temporal_ffn = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+                nn.Linear(hidden_dim, latent_dim),
+            )
+            self.tube_temporal_ffn_norm = nn.LayerNorm(latent_dim)
+        # Mesh-to-grid interpolation is sparse and can leave visible triangular
+        # facets in raster outputs. This tiny residual CNN learns a local
+        # grid-space correction after the graph decode while preserving the
+        # large-scale mesh signal. The final layer starts at zero so old
+        # checkpoints load safely and begin with identical behavior.
+        refine_dim = max(16, min(64, latent_dim // 4))
+        self.grid_refiner = nn.Sequential(
+            nn.Conv2d(img_channels, refine_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
+            nn.Conv2d(refine_dim, refine_dim, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(refine_dim, img_channels, kernel_size=3, padding=1),
+        )
+        nn.init.zeros_(self.grid_refiner[-1].weight)
+        nn.init.zeros_(self.grid_refiner[-1].bias)
         self._mesh = mesh
 
     def set_mesh(self, mesh):
@@ -433,6 +482,37 @@ class MeshFlowNet(nn.Module):
         mesh_h = self.processor(mesh_h, mesh.mesh_edge_index_t, mesh.mesh_edge_attr_t,
                                 t_emb=t_emb)
 
+        if self.multi_lead_tube:
+            lead_idx = torch.arange(self.tube_num_leads, device=x.device)
+            lead_emb = self.lead_embedding(lead_idx).to(dtype=mesh_h.dtype)
+            tube_h = mesh_h.unsqueeze(1) + lead_emb.view(1, self.tube_num_leads, 1, -1)
+
+            # Temporal attention is applied across the lead dimension for each mesh node.
+            tube_tokens = tube_h.permute(0, 2, 1, 3).reshape(
+                B * mesh_h.shape[1], self.tube_num_leads, mesh_h.shape[-1]
+            )
+            attn_out, _ = self.tube_temporal_attn(tube_tokens, tube_tokens, tube_tokens, need_weights=False)
+            tube_tokens = self.tube_temporal_norm(tube_tokens + attn_out)
+            tube_tokens = self.tube_temporal_ffn_norm(tube_tokens + self.tube_temporal_ffn(tube_tokens))
+            tube_h = tube_tokens.reshape(
+                B, mesh_h.shape[1], self.tube_num_leads, mesh_h.shape[-1]
+            ).permute(0, 2, 1, 3).contiguous()
+
+            flat_mesh_h = tube_h.reshape(B * self.tube_num_leads, mesh_h.shape[1], mesh_h.shape[-1])
+            flat_grid_skip = grid_skip.unsqueeze(1).expand(
+                B, self.tube_num_leads, grid_skip.shape[1], grid_skip.shape[2]
+            ).reshape(B * self.tube_num_leads, grid_skip.shape[1], grid_skip.shape[2])
+            lead_t_emb = self.lead_time_proj(lead_emb).to(dtype=t_emb.dtype)
+            flat_t_emb = (t_emb.unsqueeze(1) + lead_t_emb.unsqueeze(0)).reshape(
+                B * self.tube_num_leads, t_emb.shape[-1]
+            )
+            grid_out = self.decoder(flat_mesh_h, flat_grid_skip,
+                                    mesh.m2g_edge_index_t, mesh.m2g_edge_attr_t,
+                                    t_emb=flat_t_emb)
+            out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
+            out = out + self.grid_refiner(out)
+            return out.reshape(B, self.tube_num_leads, self.img_channels, H, W).squeeze(2)
+
         # Phase 1: Pass t_emb into decoder for FiLM before output_mlp
         grid_out = self.decoder(mesh_h, grid_skip,
                                 mesh.m2g_edge_index_t, mesh.m2g_edge_attr_t,
@@ -440,6 +520,7 @@ class MeshFlowNet(nn.Module):
 
         # Phase 3: Reconstruct directly to (H, W). No padding restoration.
         out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
+        out = out + self.grid_refiner(out)
         return out
 
 

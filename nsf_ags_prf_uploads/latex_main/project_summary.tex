@@ -1,0 +1,72 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ======= PACKAGES =======
+\usepackage[utf8]{inputenc}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{setspace}
+\setstretch{1.5}
+\usepackage{fancyhdr}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\usepackage{lastpage}
+\usepackage{hyperref}
+\usepackage{mathpazo}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\linespread{1.5}
+
+% ======= HEADER & FOOTER =======
+\pagestyle{fancy}
+\fancyhf{}
+
+% Header (faded + smaller)
+\fancyhead[L]{\footnotesize\textcolor{gray!90}{\textit{Project Summary}}}
+\fancyhead[R]{\footnotesize\textcolor{gray!90}{\textit{Mostafa Rezaali}}}
+
+% Footer (faded)
+\fancyfoot[L]{\footnotesize\textcolor{gray!90}{\textit{NSF AGS-PRF -- University of Florida}}}
+\fancyfoot[R]{\footnotesize\textcolor{gray!90}{Page \thepage}}
+
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0.4pt}
+
+% ======= PARAGRAPH STYLE =======
+\setlength{\parindent}{15pt}
+\setlength{\parskip}{6pt}
+\titlespacing*{\section}{0pt}{0.45em}{0.15em}
+\titlespacing*{\subsection}{0pt}{0.35em}{0.1em}
+
+% ======= DOCUMENT BEGINS =======
+\begin{document}
+
+% ======= TITLE BLOCK =======
+\begin{center}
+    \vspace*{-1.5cm}
+    {\Large\bfseries Postdoctoral Fellowship Application} \\[0.2cm]
+    {\small\textit{NSF Atmospheric and Geospace Sciences Postdoctoral Research Fellowship}} \\[0.05cm]
+    {\small\textit{Department of Geography, University of Florida}} \\[0.1cm]
+    \rule{0.6\textwidth}{0.4pt}
+\end{center}
+\vspace{-0.5cm}
+
+\noindent
+Mostafa Rezaali \\
+Ph.D. Candidate, Climate Science (Geography) \\
+University of Florida \\
+mostafarezaali@gmail.com \quad $\mid$ \quad (352) 709-5350 \\[0.3cm]
+{\large\bfseries Project Summary}\\[-0.15cm]
+\rule{\textwidth}{0.4pt}
+
+\small
+\setstretch{1.08}
+\vspace{-0.15cm}
+\section*{Overview}
+Extreme heat and rapidly developing drought are among the most damaging U.S. climate hazards, yet week-3 predictability remains limited because local land-atmosphere feedbacks interact with global circulation anomalies, teleconnections, and soil-moisture memory. This fellowship will develop a probabilistic, physics-informed GeoAI framework for 15-day prediction of CONUS daily maximum temperature anomalies and flash-drought-relevant heat risk. The project builds from my conditional-flow-matching (CFM) model, a GraphCast-style icosahedral mesh network trained with PRISM, ERA5, teleconnection indices, topography, seasonal radiation, soil moisture, and global atmospheric context fields.
+
+\section*{Intellectual Merit}
+The project asks how much week-3 predictability is contained in global circulation, land-surface memory, local persistence, and teleconnection state, and whether CFM can extract that signal with calibrated uncertainty. Three aims will: (1) extend deterministic MeshFlowNet into a probabilistic CFM ensemble; (2) diagnose regional and regime-dependent skill using leave-years-out hindcasts for 1981--2023; and (3) evaluate heat-wave and flash-drought-relevant exceedance probabilities against persistence, climatology, and teleconnection baselines. Preliminary hindcasts over 5,332 MJJAS samples show stitched temporal anomaly correlation of 0.1016 versus 0.0735 for persistence, motivating a focused study of where graph-based AI adds physically meaningful subseasonal forecast value.
+
+\section*{Broader Impacts}
+Improved week-3 heat-risk guidance can support public-health planning, water resources, energy operations, and agricultural preparedness. The fellowship will produce reproducible workflows, hindcast diagnostics, teaching modules on trustworthy AI for climate extremes, and mentoring opportunities for students entering climate-data science from geography, environmental engineering, and data science.
+\end{document}

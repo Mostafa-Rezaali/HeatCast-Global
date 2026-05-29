@@ -1,0 +1,106 @@
+The model call is:
+
+```python
+model(x_input, dummy_t, vec_c, global_fields=global_fields)
+```
+
+where `dummy_t = 0.5` is just a constant model-time embedding in deterministic mode.
+
+**Local CONUS grid input: 19 channels**
+
+`x_input = [x_t, x_t-1, x_t-2, spatial_c]`
+
+1. `t2m_prism[t]`
+2. `t2m_prism[t-1]`
+3. `t2m_prism[t-2]`
+4. `geopotential[t]`
+5. `soil_moisture[t]`
+6. `sea_level_pressure[t]`
+7. `temperature_2m[t]`
+8. `specific_humidity_850[t]`
+9. `temperature_850[t]`
+10. `u_wind_850[t]`
+11. `v_wind_850[t]`
+12. `geopotential_300[t]`
+13. topography
+14. latitude
+15. longitude
+16. day-of-year sine at `t`
+17. day-of-year cosine at `t`
+18. TOA insolation at `t`
+19. land mask
+
+**Vector input: 5 channels**
+
+- `CondTrain[:, t]`: your 5 teleconnection indices at time `t`
+
+**Global ERA5/coarse input: 59 channels**
+
+Original 9:
+
+1. `sst`
+2. `olr`
+3. `geopotential_200`
+4. `u_wind_200`
+5. `total_column_water_vapour`
+6. `v_wind_200`
+7. `geopotential_500`
+8. `temperature_850`
+9. `temperature_2m_global`
+
+Extended 50:
+
+10. `era5_z_1000`
+11. `era5_z_925`
+12. `era5_z_850`
+13. `era5_z_700`
+14. `era5_z_500`
+15. `era5_z_300`
+16. `era5_z_250`
+17. `era5_z_200`
+18. `era5_z_100`
+19. `era5_z_10`
+20. `era5_u_1000`
+21. `era5_u_925`
+22. `era5_u_850`
+23. `era5_u_700`
+24. `era5_u_500`
+25. `era5_u_300`
+26. `era5_u_250`
+27. `era5_u_200`
+28. `era5_u_100`
+29. `era5_u_10`
+30. `era5_v_1000`
+31. `era5_v_925`
+32. `era5_v_850`
+33. `era5_v_700`
+34. `era5_v_500`
+35. `era5_v_300`
+36. `era5_v_250`
+37. `era5_v_200`
+38. `era5_v_100`
+39. `era5_v_10`
+40. `era5_t_1000`
+41. `era5_t_925`
+42. `era5_t_850`
+43. `era5_t_700`
+44. `era5_t_500`
+45. `era5_t_300`
+46. `era5_t_250`
+47. `era5_t_200`
+48. `era5_t_100`
+49. `era5_t_10`
+50. `era5_q_1000`
+51. `era5_q_925`
+52. `era5_q_850`
+53. `era5_q_700`
+54. `era5_q_500`
+55. `era5_msl`
+56. `era5_sp`
+57. `era5_sst`
+58. `era5_tcwv`
+59. `era5_t2m`
+
+**Target, not input**
+
+- `t2m_prism[t+15]`, normalized with training-set mean/std.
