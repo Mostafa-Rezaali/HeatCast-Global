@@ -350,6 +350,7 @@ class MeshFlowNet(nn.Module):
         prediction_leads=(15,),
         tube_temporal_heads=4,
         tube_loss_weights=(0.80, 0.10, 0.10),
+        gradient_loss_weight=0.0,
     ):
         super().__init__()
         self.img_channels = img_channels
@@ -363,6 +364,7 @@ class MeshFlowNet(nn.Module):
         self.tube_num_leads = len(self.prediction_leads)
         self.center_lead = 15 if 15 in self.prediction_leads else self.prediction_leads[self.tube_num_leads // 2]
         self.tube_loss_weights = tuple(float(x) for x in tube_loss_weights)
+        self.gradient_loss_weight = float(gradient_loss_weight)
 
         if deterministic:
             grid_input_dim = spatial_cond_channels

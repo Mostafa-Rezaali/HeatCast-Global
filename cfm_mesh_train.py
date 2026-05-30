@@ -286,6 +286,7 @@ class Config:
     TUBE_LOSS_CENTER_WEIGHT = 0.10
     TUBE_LOSS_WEEKLY_WEIGHT = 0.10
     TUBE_TEMPORAL_HEADS = 4
+    GRADIENT_LOSS_WEIGHT = 0.0
     ROLLOUT_STEPS = 1          # Single forward pass at inference
     CONDITION_DIM = 5
 
@@ -469,8 +470,8 @@ def append_training_metrics(row):
         "variance_ratio", "gradient_ratio", "extreme_bias", "correlation",
         "mae", "crps", "mse_skill_vs_persistence", "persistence_r2",
         "persistence_mae", "zero_r2", "train_base_mse",
-        "train_anomaly_corr_loss", "train_extreme_loss", "lr", "early_stop_metric",
-        "early_stop_value", "early_stop_best", "early_stop_failures",
+        "train_anomaly_corr_loss", "train_gradient_loss", "train_extreme_loss", "lr",
+        "early_stop_metric", "early_stop_value", "early_stop_best", "early_stop_failures",
     ]
     exists = os.path.exists(path)
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -619,6 +620,11 @@ def print_config_banner():
             "Training loss: "
             f"{1.0 - Config.ANOMALY_CORR_LOSS_WEIGHT:.2f}*MSE + "
             f"{Config.ANOMALY_CORR_LOSS_WEIGHT:.2f}*spatial anomaly-correlation loss"
+        )
+    if Config.GRADIENT_LOSS_WEIGHT > 0.0:
+        print(
+            "Spatial gradient loss: "
+            f"ON (weight={Config.GRADIENT_LOSS_WEIGHT:.2f}; finite-difference dx/dy)"
         )
     if Config.MULTI_LEAD_TUBE:
         print(
@@ -3627,6 +3633,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
             Config.TUBE_LOSS_CENTER_WEIGHT,
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
+        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
     ).to(device)
 
     if is_main_process():
@@ -3720,6 +3727,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         epoch_extreme_loss = 0.0
         epoch_base_mse_loss = 0.0
         epoch_anom_corr_loss = 0.0
+        epoch_gradient_loss = 0.0
         n_good_batches = 0
         consecutive_skips = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process(),
@@ -3761,6 +3769,12 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
 
                 base_mse_val = 0.0
                 anom_corr_val = 0.0
+                gradient_loss_val = 0.0
+                grad_loss_for_loss = components.get('gradient_loss', None)
+                if grad_loss_for_loss is not None:
+                    gradient_loss_val = grad_loss_for_loss.item()
+                if 'recon_mse' in components:
+                    base_mse_val = components['recon_mse'].item()
                 if Config.MULTI_LEAD_TUBE and 'tube_daily_mse' in components:
                     base_mse_val = components['tube_daily_mse'].item()
                 if Config.USE_ANOMALY_CORR_LOSS:
@@ -3776,8 +3790,12 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                         anom_loss = anomaly_corr_loss(
                             pred_for_corr.float(), y.float(), climo, mask.float()
                         )
+                        base_train_loss = base_mse
+                        if Config.GRADIENT_LOSS_WEIGHT > 0.0 and grad_loss_for_loss is not None:
+                            g = float(Config.GRADIENT_LOSS_WEIGHT)
+                            base_train_loss = (1.0 - g) * base_mse + g * grad_loss_for_loss.float()
                         w = float(Config.ANOMALY_CORR_LOSS_WEIGHT)
-                        loss = (1.0 - w) * base_mse + w * anom_loss
+                        loss = (1.0 - w) * base_train_loss + w * anom_loss
                     base_mse_val = base_mse.item()
                     anom_corr_val = anom_loss.item()
 
@@ -3841,6 +3859,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
             epoch_loss += loss.item()
             epoch_base_mse_loss += base_mse_val
             epoch_anom_corr_loss += anom_corr_val
+            epoch_gradient_loss += gradient_loss_val
             epoch_extreme_loss += ext_loss_val
             n_good_batches += 1
 
@@ -3849,6 +3868,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 if Config.USE_ANOMALY_CORR_LOSS:
                     postfix["mse"] = f"{base_mse_val:.4f}"
                     postfix["ac"] = f"{anom_corr_val:.4f}"
+                if Config.GRADIENT_LOSS_WEIGHT > 0.0:
+                    postfix["grad"] = f"{gradient_loss_val:.4f}"
                 if Config.USE_EXTREME_LOSS:
                     postfix["ext"] = f"{ext_loss_val:.4f}"
                 pbar.set_postfix(postfix)
@@ -3893,14 +3914,19 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 print(f"  Training Loss:     {avg_loss:.6f}")
                 avg_base_mse = epoch_base_mse_loss / max(n_good_batches, 1)
                 avg_anom_corr = epoch_anom_corr_loss / max(n_good_batches, 1)
+                avg_gradient = epoch_gradient_loss / max(n_good_batches, 1)
                 if Config.USE_ANOMALY_CORR_LOSS:
                     print(f"  Train Base MSE:    {avg_base_mse:.6f}")
                     print(f"  Anom Corr Loss:    {avg_anom_corr:.6f}")
                 elif Config.MULTI_LEAD_TUBE:
                     print(f"  Train Daily MSE:   {avg_base_mse:.6f}")
                 else:
-                    avg_base_mse = ""
+                    print(f"  Train Recon MSE:   {avg_base_mse:.6f}")
                     avg_anom_corr = ""
+                if Config.GRADIENT_LOSS_WEIGHT > 0.0:
+                    print(f"  Gradient Loss:     {avg_gradient:.6f}")
+                else:
+                    avg_gradient = ""
                 if Config.USE_EXTREME_LOSS:
                     avg_ext = epoch_extreme_loss / max(n_good_batches, 1)
                     print(f"  Extreme Loss:      {avg_ext:.6f}")
@@ -3998,6 +4024,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "zero_r2": improved_metrics["zero_r2"],
                     "train_base_mse": avg_base_mse,
                     "train_anomaly_corr_loss": avg_anom_corr,
+                    "train_gradient_loss": avg_gradient,
                     "train_extreme_loss": avg_ext,
                     "lr": scheduler.get_last_lr()[0],
                     "early_stop_metric": Config.EARLY_STOP_METRIC,
@@ -4108,6 +4135,8 @@ def main():
                        help='Tube loss weight for same-init weekly-mean MSE.')
     parser.add_argument('--tube_temporal_heads', type=int, default=None,
                        help='Number of attention heads for temporal mesh attention in tube mode.')
+    parser.add_argument('--gradient_loss_weight', type=float, default=None,
+                       help='Blend weight for masked spatial finite-difference gradient loss.')
     parser.add_argument('--dry_run', action='store_true',
                        help='Run a tiny one-GPU smoke/proxy pass: 1 epoch, 2 train batches, 4 validation samples.')
     parser.add_argument('--epochs', type=int, default=None,
@@ -4223,6 +4252,10 @@ def main():
         Config.TUBE_LOSS_WEEKLY_WEIGHT = args.tube_loss_weekly_weight
     if args.tube_temporal_heads is not None:
         Config.TUBE_TEMPORAL_HEADS = args.tube_temporal_heads
+    if args.gradient_loss_weight is not None:
+        if args.gradient_loss_weight < 0.0 or args.gradient_loss_weight >= 1.0:
+            raise ValueError("--gradient_loss_weight must be in [0, 1).")
+        Config.GRADIENT_LOSS_WEIGHT = float(args.gradient_loss_weight)
     if args.mesh_level is not None:
         Config.MESH_REFINEMENT_LEVEL = args.mesh_level
     if args.mesh_rounds is not None:
@@ -4387,6 +4420,7 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
             Config.TUBE_LOSS_CENTER_WEIGHT,
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
+        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
     ).to(device)
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -4580,6 +4614,7 @@ def _test(args):
             Config.TUBE_LOSS_CENTER_WEIGHT,
             Config.TUBE_LOSS_WEEKLY_WEIGHT,
         ),
+        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
     ).to(device)
 
     checkpoint = torch.load(Config.MODEL_SAVE_PATH, map_location=device)

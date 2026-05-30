@@ -57,6 +57,33 @@ def _tube_loss_weights(model):
     return tuple(float(x) for x in getattr(raw, "tube_loss_weights", (0.80, 0.10, 0.10)))
 
 
+def _gradient_loss_weight(model):
+    return float(getattr(_raw_model(model), "gradient_loss_weight", 0.0))
+
+
+def spatial_gradient_loss(pred, target, mask):
+    """Match masked spatial finite-difference gradients."""
+    if pred.shape != target.shape:
+        raise RuntimeError(
+            f"Gradient loss shape mismatch: pred={tuple(pred.shape)}, target={tuple(target.shape)}"
+        )
+
+    mask = mask.to(device=pred.device, dtype=pred.dtype)
+    mask_expanded = mask.expand_as(pred)
+
+    dy_pred = pred[..., 1:, :] - pred[..., :-1, :]
+    dy_true = target[..., 1:, :] - target[..., :-1, :]
+    dx_pred = pred[..., :, 1:] - pred[..., :, :-1]
+    dx_true = target[..., :, 1:] - target[..., :, :-1]
+
+    mask_y = mask_expanded[..., 1:, :] * mask_expanded[..., :-1, :]
+    mask_x = mask_expanded[..., :, 1:] * mask_expanded[..., :, :-1]
+
+    loss_y = ((dy_pred - dy_true).square() * mask_y).sum() / mask_y.sum().clamp_min(1.0)
+    loss_x = ((dx_pred - dx_true).square() * mask_x).sum() / mask_x.sum().clamp_min(1.0)
+    return loss_y + loss_x
+
+
 def _ensure_standard_input(model):
     mode = _input_mode(model)
     if mode != "standard":
@@ -124,6 +151,8 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
 
     raw_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
     pred = x_t + raw_pred if _predicts_persistence_residual(model) else raw_pred
+    gradient_weight = _gradient_loss_weight(model)
+    zero = torch.tensor(0.0, device=device)
 
     if _multi_lead_tube(model):
         if y.ndim != 4:
@@ -146,14 +175,16 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
             center_mse = daily_mse
             weekly_mse = daily_mse
         w_daily, w_center, w_weekly = _tube_loss_weights(model)
-        total_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
-        zero = torch.tensor(0.0, device=device)
+        base_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
+        grad_loss = spatial_gradient_loss(pred, y, mask) if gradient_weight > 0.0 else zero
+        total_loss = (1.0 - gradient_weight) * base_loss + gradient_weight * grad_loss
         return total_loss, {
             "det_loss": total_loss.detach(),
             "recon_mse": daily_mse.detach(),
             "tube_daily_mse": daily_mse.detach(),
             "tube_center_mse": center_mse.detach(),
             "tube_weekly_mse": weekly_mse.detach(),
+            "gradient_loss": grad_loss,
             "residual_abs": raw_pred.detach().abs().mean(),
             "loss_t<0.33": zero,
             "loss_0.33<t<0.67": zero,
@@ -170,10 +201,12 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
         total_loss = pred.sum() * 0.0
         recon_mse = total_loss.detach()
 
-    zero = torch.tensor(0.0, device=device)
+    grad_loss = spatial_gradient_loss(pred, y, mask) if gradient_weight > 0.0 else zero
+    total_loss = (1.0 - gradient_weight) * total_loss + gradient_weight * grad_loss
     return total_loss, {
         "det_loss": total_loss.detach(),
         "recon_mse": recon_mse.detach(),
+        "gradient_loss": grad_loss,
         "residual_abs": raw_pred.detach().abs().mean(),
         "loss_t<0.33": zero,
         "loss_0.33<t<0.67": zero,

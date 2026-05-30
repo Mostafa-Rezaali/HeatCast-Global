@@ -9,6 +9,7 @@
 #SBATCH --partition=hpg-b200
 #SBATCH --qos=nessie
 #SBATCH --gres=gpu:8
+#SBATCH --exclude=c1003a-s15
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mostafarezaali@ufl.edu
 
@@ -45,22 +46,40 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 unset CUDA_VISIBLE_DEVICES
 
 RUN_SUFFIX=pub_weekly7
+FOLDS=${FOLDS:-"0 1 2 3 4"}
+CLEAN_START=${CLEAN_START:-0}
 
-echo "Cleaning old ${RUN_SUFFIX} artifacts only..."
-rm -f ${WORK_DIR}/trained_cfm_direct15_cvfold*_${RUN_SUFFIX}.pth
-rm -f ${WORK_DIR}/trained_cfm_direct15_cvfold*_${RUN_SUFFIX}_best_tac.pth
-rm -f ${WORK_DIR}/trained_cfm_direct15_cvfold*_${RUN_SUFFIX}_best_monitor.pth
-rm -rf ${WORK_DIR}/checkpoints/cvfold*_${RUN_SUFFIX}
-rm -f ${WORK_DIR}/hindcast_stats/hindcast_tac_stats_cvfold*_${RUN_SUFFIX}_test.npz
-rm -f ${WORK_DIR}/hindcast_stats/stitched_5fold_tac_${RUN_SUFFIX}.npz
-rm -f ${WORK_DIR}/training_metrics/fold_epoch_metrics_cvfold*_${RUN_SUFFIX}.csv
-rm -rf ${WORK_DIR}/test_prediction_plots/cvfold*_${RUN_SUFFIX}
-rm -f ${WORK_DIR}/hindcast_paper_data/hindcast_*_cvfold*_${RUN_SUFFIX}_test.npz
+if [ "$CLEAN_START" = "1" ]; then
+    echo "CLEAN_START=1: cleaning old ${RUN_SUFFIX} artifacts for folds: ${FOLDS}"
+    for FOLD in $FOLDS; do
+        RUN_NAME=cvfold${FOLD}_${RUN_SUFFIX}
+        rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
+        rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth
+        rm -f ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth
+        rm -rf ${WORK_DIR}/checkpoints/${RUN_NAME}
+        rm -f ${WORK_DIR}/hindcast_stats/hindcast_tac_stats_${RUN_NAME}_test.npz
+        rm -f ${WORK_DIR}/training_metrics/fold_epoch_metrics_${RUN_NAME}.csv
+        rm -rf ${WORK_DIR}/test_prediction_plots/${RUN_NAME}
+        rm -f ${WORK_DIR}/hindcast_paper_data/hindcast_*_${RUN_NAME}_test.npz
+    done
+    rm -f ${WORK_DIR}/hindcast_stats/stitched_5fold_tac_${RUN_SUFFIX}.npz
+else
+    echo "CLEAN_START=0: preserving existing ${RUN_SUFFIX} checkpoints/exports for resume."
+fi
 rm -rf /dev/shm/cfm_cache
 echo "  Done"
 
-for FOLD in 0 1 2 3 4; do
+for FOLD in $FOLDS; do
     RUN_NAME=cvfold${FOLD}_${RUN_SUFFIX}
+    STAT_FILE=${WORK_DIR}/hindcast_stats/hindcast_tac_stats_${RUN_NAME}_test.npz
+
+    if [ -f "$STAT_FILE" ]; then
+        echo "============================================================"
+        echo "Fold $FOLD already has export stats: $STAT_FILE"
+        echo "Skipping training/export for $RUN_NAME"
+        echo "============================================================"
+        continue
+    fi
 
     echo "============================================================"
     echo "Training fold $FOLD"
@@ -70,8 +89,32 @@ for FOLD in 0 1 2 3 4; do
 
     rm -rf /dev/shm/cfm_cache
 
+    TRAIN_MODE=train
+    CHECKPOINT_ARG=""
+    RESUME_CKPT=$(ls -1t ${WORK_DIR}/checkpoints/${RUN_NAME}/checkpoint_epoch_*.pth 2>/dev/null | head -n 1 || true)
+    if [ -z "$RESUME_CKPT" ]; then
+        for CANDIDATE in \
+            ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_monitor.pth \
+            ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}_best_tac.pth \
+            ${WORK_DIR}/trained_cfm_direct15_${RUN_NAME}.pth
+        do
+            if [ -f "$CANDIDATE" ]; then
+                RESUME_CKPT=$CANDIDATE
+                break
+            fi
+        done
+    fi
+    if [ -n "$RESUME_CKPT" ]; then
+        TRAIN_MODE=resume
+        CHECKPOINT_ARG="--checkpoint $RESUME_CKPT"
+        echo "Resuming fold $FOLD from checkpoint: $RESUME_CKPT"
+    else
+        echo "No existing checkpoint found for fold $FOLD; starting fresh."
+    fi
+
     $TORCHRUN --standalone --nproc_per_node=8 "$SCRIPT" \
-      --mode train \
+      --mode "$TRAIN_MODE" \
+      $CHECKPOINT_ARG \
       --deterministic \
       --cv_fold "$FOLD" \
       --run_name "$RUN_NAME" \
@@ -135,8 +178,19 @@ echo "============================================================"
 echo "All folds trained/exported. Stitching 5-fold TAC."
 echo "============================================================"
 
+STAT_FILES=""
+for FOLD in $FOLDS; do
+    FILE=hindcast_stats/hindcast_tac_stats_cvfold${FOLD}_${RUN_SUFFIX}_test.npz
+    if [ -f "$FILE" ]; then
+        STAT_FILES="$STAT_FILES $FILE"
+    else
+        echo "Missing fold stat file: $FILE"
+        exit 1
+    fi
+done
+
 $PYTHON_EXE -u stitch_hindcast_tac.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_${RUN_SUFFIX}_test.npz \
+  $STAT_FILES \
   --output hindcast_stats/stitched_5fold_tac_${RUN_SUFFIX}.npz
 
 STITCH_STATUS=$?
@@ -150,17 +204,17 @@ echo "Weekly7 diagnostics"
 echo "============================================================"
 
 $PYTHON_EXE -u tac_skill_maps.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_${RUN_SUFFIX}_test.npz \
+  $STAT_FILES \
   --metric weekly7 \
   --output_dir paper_figures/${RUN_SUFFIX}
 
 $PYTHON_EXE -u summarize_hindcast_diagnostics.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_${RUN_SUFFIX}_test.npz \
+  $STAT_FILES \
   --monthly_glob "hindcast_paper_data/hindcast_monthly_stats_cvfold*_${RUN_SUFFIX}_test.npz" \
   --region_data paper_figures/${RUN_SUFFIX}/tac_skill_maps_data.npz
 
 $PYTHON_EXE -u compute_baselines.py \
-  hindcast_stats/hindcast_tac_stats_cvfold*_${RUN_SUFFIX}_test.npz \
+  $STAT_FILES \
   --paper_dir hindcast_paper_data \
   --output_dir paper_figures/${RUN_SUFFIX}
 
