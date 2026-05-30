@@ -2024,6 +2024,18 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     tube_mode = bool(Config.MULTI_LEAD_TUBE)
     tube_leads = prediction_leads(Config)
     tube_center_idx = center_lead_index(Config)
+    if tube_mode and ddp:
+        has_climo = torch.tensor(
+            [1.0 if tac_climatology is not None else 0.0],
+            device=device,
+            dtype=torch.float32,
+        )
+        dist.all_reduce(has_climo, op=dist.ReduceOp.MIN)
+        if has_climo.item() < 0.5:
+            raise RuntimeError(
+                "DDP tube validation requires tac_climatology on every rank "
+                "because weekly7/per-lead statistics are streamed per rank."
+            )
     mask_2d = mask_4d[0, 0, :h, :w].detach().cpu()
     mask_np = mask_2d.numpy()
     stream_tube_stats = tube_mode and tac_climatology is not None
@@ -3861,7 +3873,11 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 ema.ema, val_dataset, device, conus_mask,
                 n_samples=Config.NUM_VALIDATION_SAMPLES,
                 rank=rank, world_size=world_size, ddp=ddp,
-                tac_climatology=tac_climatology if is_main_process() else None
+                tac_climatology=(
+                    tac_climatology
+                    if (is_main_process() or Config.MULTI_LEAD_TUBE)
+                    else None
+                )
             )
 
             current_r2 = improved_metrics.get('r2', -999.0) if improved_metrics else -999.0
