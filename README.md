@@ -331,7 +331,7 @@ The `.gitignore` file is configured to keep the repository code-only.
 
 ## Citation / Paper Framing
 
-A defensible paper framing is:
+Paper framing is:
 
 > A transparent CONUS warm-season day-15 and weekly T2max hindcast benchmark
 > using a GraphCast-style mesh GNN with global teleconnection-aware predictors.
