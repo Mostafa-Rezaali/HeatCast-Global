@@ -34,7 +34,8 @@ jobs:
         python -m py_compile \
           cfm_mesh_train.py mesh_backbone.py mode_dispatch.py icosahedral_mesh.py \
           stitch_hindcast_tac.py tac_skill_maps.py summarize_hindcast_diagnostics.py \
-          compute_baselines.py export_per_year_stats.py bootstrap_significance.py
+          compute_baselines.py export_per_year_stats.py bootstrap_significance.py \
+          exceedance_eval.py
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names

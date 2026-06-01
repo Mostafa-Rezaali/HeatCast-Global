@@ -13,6 +13,7 @@ CORE_SCRIPTS = (
     "compute_baselines.py",
     "export_per_year_stats.py",
     "bootstrap_significance.py",
+    "exceedance_eval.py",
 )
 
 
