@@ -59,7 +59,7 @@ def configure_from_args(args: argparse.Namespace) -> None:
         cfm.Config.MULTI_LEAD_TUBE = False
 
     cfm.Config.GRADIENT_LOSS_WEIGHT = 0.0
-    cfm.set_output_paths(args.run_name)
+    cfm.apply_run_name(args.run_name)
     cfm.apply_extended_global_fields()
     cfm.set_random_seed(int(args.seed))
 
