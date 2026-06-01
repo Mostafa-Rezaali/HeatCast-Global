@@ -47,8 +47,10 @@ def configure_from_args(args: argparse.Namespace) -> None:
     cfm.Config.DETERMINISTIC = True
     cfm.Config.RUN_NAME = args.run_name
     cfm.Config.CV_STRIDE = int(args.cv_stride)
-    cfm.Config.CV_TEST_OFFSETS = (int(args.cv_fold) % int(args.cv_stride),)
-    cfm.Config.CV_VAL_OFFSETS = ((int(args.cv_fold) + 1) % int(args.cv_stride),)
+    fold = int(args.cv_fold) % int(args.cv_stride)
+    cfm.Config.CV_FOLD = fold
+    cfm.Config.CV_TEST_OFFSETS = (fold,)
+    cfm.Config.CV_VAL_OFFSETS = ((fold + 1) % int(args.cv_stride),)
 
     if args.multi_lead_tube or "tube" in args.run_name.lower():
         cfm.Config.MULTI_LEAD_TUBE = True
@@ -127,10 +129,11 @@ def exceedance_cache_path() -> str:
         "_tube" + "-".join(str(x) for x in cfm.prediction_leads(cfm.Config))
         if cfm.Config.MULTI_LEAD_TUBE else ""
     )
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
     return os.path.join(
         cfm.Config.OUTPUT_DIR,
         "data_cache",
-        f"month_q95_sigma_direct15{suffix}_{cfm.cv_split_tag(cfm.Config)}.npz",
+        f"month_q95_sigma_direct15{suffix}_{cfm.cv_split_tag(cfm.Config)}_fold{fold}.npz",
     )
 
 
@@ -236,8 +239,10 @@ def load_or_build_exceedance_stats(shared_data, train_years, norm_stats, climo_b
         try:
             with np.load(path, allow_pickle=True) as data:
                 cached_years = set(np.atleast_1d(data["train_years"]).astype(int).tolist())
+                cached_fold = int(data["cv_fold"]) if "cv_fold" in data.files else None
                 return (
                     cached_years == set(int(y) for y in train_years)
+                    and cached_fold == int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
                     and str(data["cv_split"].item()) == cfm.cv_split_tag(cfm.Config)
                     and abs(float(data["hi_mean"]) - float(norm_stats["hi_mean"])) < 1e-6
                     and abs(float(data["hi_std"]) - float(norm_stats["hi_std"])) < 1e-6
@@ -271,6 +276,7 @@ def load_or_build_exceedance_stats(shared_data, train_years, norm_stats, climo_b
         sigma_clim=sigma_clim.astype(np.float32),
         base_rate=base_rate.astype(np.float32),
         train_years=np.array(sorted(int(y) for y in train_years), dtype=np.int16),
+        cv_fold=np.array(int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0])), dtype=np.int16),
         cv_split=np.array(cfm.cv_split_tag(cfm.Config), dtype=object),
         hi_mean=np.array(float(norm_stats["hi_mean"]), dtype=np.float32),
         hi_std=np.array(float(norm_stats["hi_std"]), dtype=np.float32),
@@ -740,6 +746,15 @@ def evaluate(args: argparse.Namespace) -> None:
             else:
                 mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
                 truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
+            if batch_idx == 0:
+                mu_land = mu_z[mask_np & np.isfinite(mu_z)]
+                if mu_land.size:
+                    p = np.nanpercentile(mu_land, [1, 50, 99])
+                    print(
+                        "First-sample mu_z land range check: "
+                        f"min={np.nanmin(mu_land):+.3f}, p01={p[0]:+.3f}, "
+                        f"p50={p[1]:+.3f}, p99={p[2]:+.3f}, max={np.nanmax(mu_land):+.3f}"
+                    )
 
             q = q95_z[target_month]
             sigma = sigma_clim[target_month]
