@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 import cfm_mesh_train as cfm
 from publication_analysis_utils import NOAA_REGION_BOXES, conus_lat_lon, ensure_dir, region_masks
@@ -577,6 +577,227 @@ class PooledLogistic:
         return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
 
 
+@dataclass
+class ModelOutputLogisticCalibrator:
+    feature_names: Tuple[str, ...]
+    mean: np.ndarray
+    std: np.ndarray
+    coef: np.ndarray
+    intercept: float
+    calibration_split: str
+    n_samples: int
+    event_rate: float
+
+    def predict_features(self, x: np.ndarray) -> np.ndarray:
+        z = (x.astype(np.float32) - self.mean) / (self.std + 1e-8)
+        logits = np.clip(self.intercept + z @ self.coef, -30.0, 30.0)
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+
+    def predict_grid(
+        self,
+        mu_z: np.ndarray,
+        q95: np.ndarray,
+        sigma: np.ndarray,
+        month: int,
+        region_features: Mapping[str, np.ndarray],
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        valid = mask & np.isfinite(mu_z) & np.isfinite(q95) & np.isfinite(sigma)
+        out = np.full(mask.shape, np.nan, dtype=np.float32)
+        flat_idx = np.flatnonzero(valid.ravel())
+        if flat_idx.size == 0:
+            return out
+        x = model_output_calibration_features(mu_z, q95, sigma, month, region_features, flat_idx)
+        out.ravel()[flat_idx] = self.predict_features(x)
+        return out
+
+    def coefficient_rows(self) -> List[Dict[str, object]]:
+        rows = [{
+            "feature": "intercept",
+            "coef": self.intercept,
+            "feature_mean": "",
+            "feature_std": "",
+            "calibration_split": self.calibration_split,
+            "n_samples": self.n_samples,
+            "event_rate": self.event_rate,
+        }]
+        for name, coef, mean, std in zip(self.feature_names, self.coef, self.mean, self.std):
+            rows.append({
+                "feature": name,
+                "coef": float(coef),
+                "feature_mean": float(mean),
+                "feature_std": float(std),
+                "calibration_split": self.calibration_split,
+                "n_samples": self.n_samples,
+                "event_rate": self.event_rate,
+            })
+        return rows
+
+
+def calibration_feature_names(region_names: Sequence[str]) -> Tuple[str, ...]:
+    return (
+        "stage1_logit",
+        "margin_z",
+        "mu_z",
+        "sigma_clim",
+        *[f"month_{m}" for m in MJJAS_MONTHS],
+        *[f"region_{name}" for name in region_names],
+    )
+
+
+def model_output_calibration_features(
+    mu_z: np.ndarray,
+    q95: np.ndarray,
+    sigma: np.ndarray,
+    month: int,
+    region_features: Mapping[str, np.ndarray],
+    flat_idx: np.ndarray,
+) -> np.ndarray:
+    mu = mu_z.ravel()[flat_idx].astype(np.float32)
+    q = q95.ravel()[flat_idx].astype(np.float32)
+    sig = np.maximum(sigma.ravel()[flat_idx].astype(np.float32), 0.1)
+    margin = mu - q
+    stage1_logit = np.clip(margin / sig, -10.0, 10.0)
+    month_flags = np.zeros((flat_idx.size, len(MJJAS_MONTHS)), dtype=np.float32)
+    if int(month) in MJJAS_MONTHS:
+        month_flags[:, MJJAS_MONTHS.index(int(month))] = 1.0
+    region_flags = np.column_stack([
+        rmask.ravel()[flat_idx].astype(np.float32)
+        for rmask in region_features.values()
+    ]) if region_features else np.empty((flat_idx.size, 0), dtype=np.float32)
+    return np.column_stack([
+        stage1_logit,
+        margin,
+        mu,
+        sig,
+        month_flags,
+        region_flags,
+    ]).astype(np.float32)
+
+
+def fit_model_output_logistic_calibrator(
+    features: np.ndarray,
+    labels: np.ndarray,
+    feature_names: Sequence[str],
+    calibration_split: str,
+    steps: int,
+    lr: float,
+    l2: float,
+) -> ModelOutputLogisticCalibrator:
+    x = np.asarray(features, dtype=np.float64)
+    y = np.asarray(labels, dtype=np.float64)
+    valid = np.all(np.isfinite(x), axis=1) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if x.shape[0] < 100 or np.unique(y).size < 2:
+        raise RuntimeError("Not enough valid positive/negative samples to fit calibrated logistic model.")
+
+    mean = x.mean(axis=0)
+    std = x.std(axis=0) + 1e-8
+    z = (x - mean) / std
+    coef = np.zeros(z.shape[1], dtype=np.float64)
+    base = np.clip(y.mean(), 1e-5, 1.0 - 1e-5)
+    intercept = float(math.log(base / (1.0 - base)))
+
+    for _ in range(int(steps)):
+        logits = np.clip(intercept + z @ coef, -30.0, 30.0)
+        p = 1.0 / (1.0 + np.exp(-logits))
+        err = p - y
+        intercept -= float(lr) * float(err.mean())
+        coef -= float(lr) * ((z.T @ err) / z.shape[0] + float(l2) * coef)
+
+    return ModelOutputLogisticCalibrator(
+        feature_names=tuple(feature_names),
+        mean=mean.astype(np.float32),
+        std=std.astype(np.float32),
+        coef=coef.astype(np.float32),
+        intercept=float(intercept),
+        calibration_split=calibration_split,
+        n_samples=int(y.size),
+        event_rate=float(y.mean()),
+    )
+
+
+def resolve_calibration_split(requested: str, eval_split: str) -> str:
+    if requested != "auto":
+        return requested
+    return "val" if eval_split == "test" else "train"
+
+
+def train_model_output_calibrator(
+    model,
+    calibration_dataset,
+    calibration_split: str,
+    q95_z: np.ndarray,
+    sigma_clim: np.ndarray,
+    months: np.ndarray,
+    region_features: Mapping[str, np.ndarray],
+    mask_np: np.ndarray,
+    device,
+    center_idx: int,
+    max_cases: int,
+    max_samples: int,
+    seed: int,
+    steps: int,
+    lr: float,
+    l2: float,
+) -> ModelOutputLogisticCalibrator:
+    rng = np.random.default_rng(seed)
+    n_cases = min(len(calibration_dataset), max(1, int(max_cases)))
+    subset_idx = np.unique(np.linspace(0, len(calibration_dataset) - 1, n_cases, dtype=np.int64))
+    loader = DataLoader(Subset(calibration_dataset, subset_idx.tolist()), batch_size=1, shuffle=False, num_workers=0)
+    per_case = max(1, int(math.ceil(max_samples / max(len(subset_idx), 1))))
+    feature_names = calibration_feature_names(tuple(region_features.keys()))
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+
+    print(
+        "Training calibrated model-output logistic layer: "
+        f"split={calibration_split}, cases={len(subset_idx)}, max_pixels={int(max_samples)}"
+    )
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(loader):
+            mu_z, truth_z, t = predict_center_field(model, batch, device, center_idx, cfm.Config.IMAGE_SIZE)
+            target_t = t + int(cfm.Config.LEAD_TIME)
+            month = int(months[target_t])
+            if month not in MJJAS_MONTHS:
+                continue
+            q = q95_z[month]
+            sigma = sigma_clim[month]
+            valid = mask_np & np.isfinite(mu_z) & np.isfinite(truth_z) & np.isfinite(q) & np.isfinite(sigma)
+            candidates = np.flatnonzero(valid.ravel())
+            if candidates.size == 0:
+                continue
+            chosen = rng.choice(candidates, size=min(per_case, candidates.size), replace=False)
+            xs.append(model_output_calibration_features(mu_z, q, sigma, month, region_features, chosen))
+            truth = (truth_z.ravel()[chosen] > q.ravel()[chosen]).astype(np.float32)
+            ys.append(truth)
+            if sum(x.shape[0] for x in xs) >= max_samples:
+                break
+            if (batch_idx + 1) % 50 == 0:
+                print(f"  calibration cases processed {batch_idx + 1}/{len(subset_idx)}")
+
+    if not xs:
+        raise RuntimeError("No samples collected for calibrated model-output logistic layer.")
+    features = np.concatenate(xs, axis=0)[:max_samples]
+    labels = np.concatenate(ys, axis=0)[:max_samples]
+    calibrator = fit_model_output_logistic_calibrator(
+        features,
+        labels,
+        feature_names,
+        calibration_split=calibration_split,
+        steps=int(steps),
+        lr=float(lr),
+        l2=float(l2),
+    )
+    print(
+        "Calibrated model-output logistic fitted: "
+        f"n={calibrator.n_samples}, event_rate={calibrator.event_rate:.4f}, "
+        f"intercept={calibrator.intercept:.4f}"
+    )
+    return calibrator
+
+
 def train_pooled_logistic_baseline(
     shared_data,
     train_indices: Sequence[int],
@@ -635,6 +856,29 @@ def train_pooled_logistic_baseline(
     return PooledLogistic(mean=mean, std=std, coef=float(coef), intercept=float(intercept))
 
 
+def predict_center_field(model, batch, device, center_idx: int, image_size: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, int]:
+    y, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, t_idx, batch_mask = batch
+    h, w = image_size
+    pred = cfm.predict_direct(
+        model,
+        x_t.to(device),
+        x_tm1.to(device),
+        x_tm2.to(device),
+        spatial_c.to(device),
+        vec_c.to(device),
+        global_fields.to(device),
+        batch_mask.to(device),
+        device,
+    )
+    if cfm.Config.MULTI_LEAD_TUBE:
+        mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
+        truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+    else:
+        mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
+        truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
+    return mu_z, truth_z, int(t_idx.item())
+
+
 def select_dataset(split: str, config, shared_data, norm_stats, climo, train_indices, val_indices, test_indices):
     if split == "train":
         return cfm.ClimateDataset(config, mode="train", train_indices=train_indices, normalization_stats=norm_stats, shared_data=shared_data, target_climatology=climo)
@@ -690,6 +934,42 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Loading checkpoint: {ckpt_path}")
     model = cfm._load_meshflownet_checkpoint(ckpt_path, mesh, device)
 
+    regions = {
+        name: (rmask & mask_np)
+        for name, rmask in region_masks(cfm.Config.IMAGE_SIZE).items()
+    }
+    calibration_split = resolve_calibration_split(args.calibration_split, args.split)
+    split_year_map = {"train": train_years, "val": val_years, "test": test_years}
+    if calibration_split == args.split and args.split != "train" and not args.allow_eval_split_calibration:
+        raise RuntimeError(
+            f"Calibration split '{calibration_split}' matches evaluation split '{args.split}'. "
+            "Use a held-out calibration split, or pass --allow_eval_split_calibration only for diagnostics."
+        )
+    if args.split != "train" and set(split_year_map[calibration_split]) & set(split_years):
+        raise RuntimeError("Calibration leakage check failed: calibration years overlap evaluation years.")
+    calibration_dataset = select_dataset(
+        calibration_split, cfm.Config, shared_data, norm_stats, climo,
+        train_indices, val_indices, test_indices,
+    )
+    model_calibrator = train_model_output_calibrator(
+        model,
+        calibration_dataset,
+        calibration_split,
+        q95_z,
+        sigma_clim,
+        months,
+        regions,
+        mask_np,
+        device,
+        center_idx=cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0,
+        max_cases=int(args.max_calibration_cases),
+        max_samples=int(args.max_calibration_samples),
+        seed=int(args.seed) + 137,
+        steps=int(args.calibration_steps),
+        lr=float(args.calibration_lr),
+        l2=float(args.calibration_l2),
+    )
+
     logistic = train_pooled_logistic_baseline(
         shared_data, train_indices, q95_z, norm_stats, months,
         max_samples=int(args.max_logistic_samples), seed=int(args.seed)
@@ -703,11 +983,8 @@ def evaluate(args: argparse.Namespace) -> None:
         "thresholded_point_model",
         "pooled_logistic_init_margin",
         "stage1_mu_sigma_clim",
+        "calibrated_model_logistic",
     ]
-    regions = {
-        name: (rmask & mask_np)
-        for name, rmask in region_masks(cfm.Config.IMAGE_SIZE).items()
-    }
     acc = EvaluationAccumulator(model_names, regions)
 
     h, w = cfm.Config.IMAGE_SIZE
@@ -762,6 +1039,7 @@ def evaluate(args: argparse.Namespace) -> None:
             truth[~mask_np] = np.nan
             stage1 = normal_cdf((mu_z - q) / np.maximum(sigma, 0.1))
             stage1[~mask_np] = np.nan
+            calibrated = model_calibrator.predict_grid(mu_z, q, sigma, target_month, regions, mask_np)
             monthly_climo = base_rate[target_month]
             thresholded = (mu_z > q).astype(np.float32)
             thresholded[~mask_np] = np.nan
@@ -782,6 +1060,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 "thresholded_point_model": thresholded,
                 "pooled_logistic_init_margin": logistic_prob,
                 "stage1_mu_sigma_clim": stage1,
+                "calibrated_model_logistic": calibrated,
             }
             for window in persistence_windows:
                 forecasts[f"persistence_trailing{window}"] = trailing_exceedance_probability(
@@ -807,15 +1086,19 @@ def evaluate(args: argparse.Namespace) -> None:
     write_csv(out_dir / "exceedance_results.csv", summary_rows)
     write_csv(out_dir / "monthly_exceedance_results.csv", monthly_rows)
     write_csv(out_dir / "regional_exceedance_count_mae.csv", region_rows)
+    write_csv(out_dir / "calibrated_model_logistic_coefficients.csv", model_calibrator.coefficient_rows())
     for name, rows in rel_tables.items():
         write_csv(out_dir / f"reliability_{name}.csv", rows)
     plot_reliability(out_dir / "reliability_diagram.png", rel_tables)
 
     stage1 = next(row for row in summary_rows if row["model"] == "stage1_mu_sigma_clim")
+    calibrated_row = next(row for row in summary_rows if row["model"] == "calibrated_model_logistic")
     thresholded = next(row for row in summary_rows if row["model"] == "thresholded_point_model")
     climo = next(row for row in summary_rows if row["model"] == "monthly_climatology")
     stage1_rel = acc.metrics["stage1_mu_sigma_clim"].rel.table()
+    calibrated_rel = acc.metrics["calibrated_model_logistic"].rel.table()
     bin_02 = next((r for r in stage1_rel if r["lo"] <= 0.2 < r["hi"]), None)
+    calibrated_bin_02 = next((r for r in calibrated_rel if r["lo"] <= 0.2 < r["hi"]), None)
 
     print("\nExceedance evaluation summary")
     print("=============================")
@@ -833,14 +1116,25 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Monthly climatology Brier reference: {climo['brier']:.5f}")
     print(f"Stage 1 BSS vs monthly climatology: {stage1['bss_vs_monthly_climo']:+.4f}")
     print(
+        "Calibrated model-output logistic BSS vs monthly climatology: "
+        f"{calibrated_row['bss_vs_monthly_climo']:+.4f}"
+    )
+    print(
         "Thresholded point-model baseline reported: "
         f"Brier={thresholded['brier']:.5f}, BSS={thresholded['bss_vs_monthly_climo']:+.4f}"
     )
     if bin_02 is not None:
         print(
-            "Reliability 0.2-bin sanity: "
+            "Stage 1 reliability 0.2-bin sanity: "
             f"count={int(bin_02['count'])}, mean_pred={bin_02['mean_pred']:.3f}, "
             f"obs_freq={bin_02['obs_freq']:.3f}"
+        )
+    if calibrated_bin_02 is not None:
+        print(
+            "Calibrated reliability 0.2-bin sanity: "
+            f"count={int(calibrated_bin_02['count'])}, "
+            f"mean_pred={calibrated_bin_02['mean_pred']:.3f}, "
+            f"obs_freq={calibrated_bin_02['obs_freq']:.3f}"
         )
     print(
         "PR-AUC is secondary only; selection/headline metric is BSS with reliability diagnostics."
@@ -860,6 +1154,13 @@ def main() -> None:
     parser.add_argument("--prediction_leads", default="12,13,14,15,16,17,18")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
+    parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="auto")
+    parser.add_argument("--allow_eval_split_calibration", action="store_true")
+    parser.add_argument("--max_calibration_cases", type=int, default=256)
+    parser.add_argument("--max_calibration_samples", type=int, default=250000)
+    parser.add_argument("--calibration_steps", type=int, default=200)
+    parser.add_argument("--calibration_lr", type=float, default=0.1)
+    parser.add_argument("--calibration_l2", type=float, default=1e-4)
     parser.add_argument("--progress_every", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None)
