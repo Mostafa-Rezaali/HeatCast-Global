@@ -13,13 +13,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import math
 import os
+import pickle
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import matplotlib
 
@@ -561,6 +563,256 @@ class ReliabilityStats:
         return slope, ece
 
 
+def reliability_from_arrays(prob: np.ndarray, truth: np.ndarray) -> Tuple[float, float, float]:
+    p = np.asarray(prob, dtype=np.float32).reshape(-1)
+    y = np.asarray(truth, dtype=np.float32).reshape(-1)
+    valid = np.isfinite(p) & np.isfinite(y)
+    if valid.sum() == 0:
+        return float("nan"), float("nan"), float("nan")
+    rel = ReliabilityStats()
+    rel.update(p[valid], y[valid], np.ones(int(valid.sum()), dtype=bool))
+    slope, ece = rel.slope_ece()
+    brier = float(np.mean((np.clip(p[valid], 0.0, 1.0) - y[valid]) ** 2))
+    return slope, ece, brier
+
+
+def _fit_positive_platt_params(
+    x: np.ndarray,
+    y: np.ndarray,
+    steps: int = 600,
+    lr: float = 0.05,
+    l2: float = 1e-4,
+) -> Tuple[float, float]:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 100 or np.unique(y).size < 2:
+        raise RuntimeError("Not enough valid positive/negative samples for Platt calibration.")
+    base = np.clip(float(np.mean(y)), 1e-5, 1.0 - 1e-5)
+    b = math.log(base / (1.0 - base))
+    theta = 0.0  # a = exp(theta), enforcing monotonic increasing calibration.
+    for _ in range(int(steps)):
+        a = math.exp(float(np.clip(theta, -10.0, 10.0)))
+        logits = np.clip(a * x + b, -30.0, 30.0)
+        p = 1.0 / (1.0 + np.exp(-logits))
+        err = p - y
+        grad_b = float(np.mean(err))
+        grad_a = float(np.mean(err * x)) + float(l2) * a
+        b -= float(lr) * grad_b
+        theta -= float(lr) * grad_a * a
+    a = math.exp(float(np.clip(theta, -10.0, 10.0)))
+    return float(a), float(b)
+
+
+def _fit_isotonic_arrays(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 100 or np.unique(y).size < 2:
+        raise RuntimeError("Not enough valid positive/negative samples for isotonic calibration.")
+    order = np.argsort(x)
+    x_sorted = x[order]
+    y_sorted = y[order]
+    try:
+        from sklearn.isotonic import IsotonicRegression
+
+        iso = IsotonicRegression(out_of_bounds="clip")
+        iso.fit(x_sorted, y_sorted)
+        return (
+            np.asarray(iso.X_thresholds_, dtype=np.float32),
+            np.asarray(iso.y_thresholds_, dtype=np.float32),
+        )
+    except Exception:
+        # Minimal PAVA fallback: sufficient for monotonic calibration if sklearn is unavailable.
+        blocks: List[List[float]] = []
+        for val in y_sorted:
+            blocks.append([float(val), 1.0])
+            while len(blocks) >= 2 and blocks[-2][0] > blocks[-1][0]:
+                v1, n1 = blocks.pop()
+                v0, n0 = blocks.pop()
+                blocks.append([(v0 * n0 + v1 * n1) / (n0 + n1), n0 + n1])
+        y_fit = np.empty_like(y_sorted, dtype=np.float64)
+        pos = 0
+        for value, count in blocks:
+            n = int(count)
+            y_fit[pos:pos + n] = value
+            pos += n
+        unique_x, inverse = np.unique(x_sorted, return_inverse=True)
+        y_thr = np.zeros_like(unique_x, dtype=np.float64)
+        counts = np.bincount(inverse)
+        sums = np.bincount(inverse, weights=y_fit)
+        valid_counts = counts > 0
+        y_thr[valid_counts] = sums[valid_counts] / counts[valid_counts]
+        return unique_x.astype(np.float32), np.clip(y_thr, 0.0, 1.0).astype(np.float32)
+
+
+@dataclass
+class MarginMonotonicCalibrator:
+    method: str
+    pooled: Any
+    by_month: Dict[int, Any]
+    calibration_split: str
+    n_samples: int
+    event_rate: float
+    calibration_slope: float
+    calibration_ece: float
+    calibration_brier: float
+
+    def _predict_model(self, model: Any, x: np.ndarray) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=np.float32)
+        if self.method == "platt":
+            a, b = model
+            logits = np.clip(float(a) * x_arr + float(b), -30.0, 30.0)
+            return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+        x_thr, y_thr = model
+        return np.interp(
+            x_arr,
+            np.asarray(x_thr, dtype=np.float32),
+            np.asarray(y_thr, dtype=np.float32),
+            left=float(y_thr[0]),
+            right=float(y_thr[-1]),
+        ).astype(np.float32)
+
+    def predict_scores(self, x: np.ndarray, months: np.ndarray) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=np.float32).reshape(-1)
+        month_arr = np.asarray(months, dtype=np.int16).reshape(-1)
+        out = np.empty_like(x_arr, dtype=np.float32)
+        for month in np.unique(month_arr):
+            mask = month_arr == month
+            model = self.by_month.get(int(month), self.pooled)
+            out[mask] = self._predict_model(model, x_arr[mask])
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    def predict_grid(
+        self,
+        mu_z: np.ndarray,
+        q95: np.ndarray,
+        sigma: np.ndarray,
+        month: int,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        valid = mask & np.isfinite(mu_z) & np.isfinite(q95) & np.isfinite(sigma)
+        out = np.full(mask.shape, np.nan, dtype=np.float32)
+        if not np.any(valid):
+            return out
+        score = (mu_z[valid] - q95[valid]) / np.maximum(sigma[valid], 0.1)
+        out[valid] = self.predict_scores(score, np.full(score.shape, int(month), dtype=np.int16))
+        return out
+
+    def coefficient_rows(self) -> List[Dict[str, object]]:
+        rows = [{
+            "method": self.method,
+            "scope": "pooled",
+            "month": "",
+            "model": repr(self.pooled),
+            "calibration_split": self.calibration_split,
+            "n_samples": self.n_samples,
+            "event_rate": self.event_rate,
+            "calibration_slope": self.calibration_slope,
+            "calibration_ece": self.calibration_ece,
+            "calibration_brier": self.calibration_brier,
+        }]
+        for month, model in sorted(self.by_month.items()):
+            rows.append({
+                "method": self.method,
+                "scope": "month",
+                "month": month,
+                "model": repr(model),
+                "calibration_split": self.calibration_split,
+                "n_samples": self.n_samples,
+                "event_rate": self.event_rate,
+                "calibration_slope": self.calibration_slope,
+                "calibration_ece": self.calibration_ece,
+                "calibration_brier": self.calibration_brier,
+            })
+        return rows
+
+
+def fit_margin_monotonic_calibrator(
+    x: np.ndarray,
+    y: np.ndarray,
+    months: np.ndarray,
+    method: str,
+    calibration_split: str,
+    min_month_samples: int,
+    min_month_positives: int,
+) -> MarginMonotonicCalibrator:
+    x = np.asarray(x, dtype=np.float32).reshape(-1)
+    y = np.asarray(y, dtype=np.float32).reshape(-1)
+    months = np.asarray(months, dtype=np.int16).reshape(-1)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(months)
+    x = x[valid]
+    y = y[valid]
+    months = months[valid]
+    if x.size < 100 or np.unique(y).size < 2:
+        raise RuntimeError(f"Not enough calibration samples for {method}.")
+
+    if method == "platt":
+        pooled = _fit_positive_platt_params(x, y)
+    elif method == "isotonic":
+        pooled = _fit_isotonic_arrays(x, y)
+    else:
+        raise ValueError(f"Unsupported calibrator method: {method}")
+
+    by_month: Dict[int, Any] = {}
+    for month in MJJAS_MONTHS:
+        m = months == int(month)
+        n_pos = int(np.sum(y[m] > 0.5))
+        n_neg = int(np.sum(y[m] <= 0.5))
+        if int(np.sum(m)) < int(min_month_samples) or n_pos < int(min_month_positives) or n_neg < int(min_month_positives):
+            continue
+        try:
+            by_month[int(month)] = (
+                _fit_positive_platt_params(x[m], y[m])
+                if method == "platt"
+                else _fit_isotonic_arrays(x[m], y[m])
+            )
+        except RuntimeError:
+            continue
+
+    cal = MarginMonotonicCalibrator(
+        method=method,
+        pooled=pooled,
+        by_month=by_month,
+        calibration_split=calibration_split,
+        n_samples=int(x.size),
+        event_rate=float(np.mean(y)),
+        calibration_slope=float("nan"),
+        calibration_ece=float("nan"),
+        calibration_brier=float("nan"),
+    )
+    p = cal.predict_scores(x, months)
+    slope, ece, brier = reliability_from_arrays(p, y)
+    cal.calibration_slope = slope
+    cal.calibration_ece = ece
+    cal.calibration_brier = brier
+    return cal
+
+
+def choose_monotonic_calibrator(
+    candidates: Mapping[str, MarginMonotonicCalibrator],
+    requested: str,
+) -> MarginMonotonicCalibrator:
+    available = {k: v for k, v in candidates.items() if v is not None}
+    if requested != "auto":
+        if requested not in available:
+            raise RuntimeError(f"Requested calibrator {requested!r} could not be fit.")
+        return available[requested]
+    if not available:
+        raise RuntimeError("No monotonic calibrator candidates could be fit.")
+    return min(
+        available.values(),
+        key=lambda c: (
+            float(c.calibration_ece) if np.isfinite(c.calibration_ece) else float("inf"),
+            abs(float(c.calibration_slope) - 1.0) if np.isfinite(c.calibration_slope) else float("inf"),
+        ),
+    )
+
+
 @dataclass
 class MetricAccumulator:
     name: str
@@ -975,7 +1227,7 @@ def fit_model_output_logistic_calibrator(
 def resolve_calibration_split(requested: str, eval_split: str) -> str:
     if requested != "auto":
         return requested
-    return "val" if eval_split == "test" else "train"
+    return "val" if eval_split != "val" else "test"
 
 
 def predict_target_field(
@@ -1016,6 +1268,232 @@ def predict_target_field(
             mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
             truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
     return mu_z, truth_z, int(t_idx.item())
+
+
+def monotonic_calibrator_cache_path(
+    target_mode: str,
+    window_leads: Sequence[int],
+    calibration_split: str,
+    requested_calibrator: str,
+    checkpoint_path: str,
+) -> str:
+    suffix = (
+        f"win{lead_list_label(window_leads)}"
+        if target_mode == "window"
+        else f"daily{int(cfm.Config.LEAD_TIME)}"
+    )
+    pred = "tube" + lead_list_label(cfm.prediction_leads(cfm.Config)) if cfm.Config.MULTI_LEAD_TUBE else "single"
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+    ckpt_tag = hashlib.sha1(os.path.abspath(checkpoint_path).encode("utf-8")).hexdigest()[:10]
+    return os.path.join(
+        cfm.Config.OUTPUT_DIR,
+        "data_cache",
+        (
+            f"monotonic_calibrator_{target_mode}_{suffix}_{pred}_"
+            f"{cfm.cv_split_tag(cfm.Config)}_fold{fold}_cal{calibration_split}_"
+            f"{requested_calibrator}_ckpt{ckpt_tag}.pkl"
+        ),
+    )
+
+
+def collect_margin_label_pairs(
+    model,
+    dataset,
+    split_name: str,
+    split_years: Iterable[int],
+    q95_z: np.ndarray,
+    sigma: np.ndarray,
+    months: np.ndarray,
+    years: np.ndarray,
+    mask_np: np.ndarray,
+    device,
+    target_mode: str,
+    lead_indices: Sequence[int],
+    center_idx: int,
+    target_center_lead: int,
+    max_cases: int,
+    max_samples: int,
+    seed: int,
+    progress_every: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    split_year_set = set(int(y) for y in split_years)
+    n_cases = min(len(dataset), max(1, int(max_cases)))
+    subset_idx = np.unique(np.linspace(0, len(dataset) - 1, n_cases, dtype=np.int64))
+    loader = DataLoader(Subset(dataset, subset_idx.tolist()), batch_size=1, shuffle=False, num_workers=0)
+    per_case = max(1, int(math.ceil(max_samples / max(len(subset_idx), 1))))
+    xs: List[np.ndarray] = []
+    ys: List[np.ndarray] = []
+    ms: List[np.ndarray] = []
+    target_year_values: List[np.ndarray] = []
+    print(
+        "Collecting calibration pairs: "
+        f"split={split_name}, cases={len(subset_idx)}, max_pixels={int(max_samples)}, "
+        f"target_mode={target_mode}"
+    )
+    model.eval()
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(loader):
+            mu_z, truth_z, t = predict_target_field(
+                model,
+                batch,
+                device,
+                target_mode=target_mode,
+                lead_indices=lead_indices,
+                center_idx=center_idx,
+                image_size=cfm.Config.IMAGE_SIZE,
+            )
+            target_t = int(t) + int(target_center_lead)
+            month = int(months[target_t])
+            target_year = int(years[target_t])
+            if month not in MJJAS_MONTHS:
+                continue
+            if target_year not in split_year_set:
+                raise RuntimeError(
+                    f"Calibration/eval pair year leakage for split={split_name}: target_year={target_year}"
+                )
+            q = q95_z[month]
+            sig = sigma[month]
+            valid = mask_np & np.isfinite(mu_z) & np.isfinite(truth_z) & np.isfinite(q) & np.isfinite(sig)
+            candidates = np.flatnonzero(valid.ravel())
+            if candidates.size == 0:
+                continue
+            chosen = rng.choice(candidates, size=min(per_case, candidates.size), replace=False)
+            score = ((mu_z.ravel()[chosen] - q.ravel()[chosen]) / np.maximum(sig.ravel()[chosen], 0.1)).astype(np.float32)
+            label = (truth_z.ravel()[chosen] > q.ravel()[chosen]).astype(np.float32)
+            xs.append(score)
+            ys.append(label)
+            ms.append(np.full(score.shape, month, dtype=np.int16))
+            target_year_values.append(np.full(score.shape, target_year, dtype=np.int16))
+            if sum(len(a) for a in xs) >= max_samples:
+                break
+            if (batch_idx + 1) % max(1, int(progress_every)) == 0:
+                print(f"  calibration pairs processed {batch_idx + 1}/{len(subset_idx)}")
+    if not xs:
+        raise RuntimeError(f"No calibration pairs collected for split={split_name}.")
+    return (
+        np.concatenate(xs)[:max_samples].astype(np.float32),
+        np.concatenate(ys)[:max_samples].astype(np.float32),
+        np.concatenate(ms)[:max_samples].astype(np.int16),
+        np.concatenate(target_year_values)[:max_samples].astype(np.int16),
+    )
+
+
+def load_or_fit_monotonic_calibrator(
+    model,
+    calibration_dataset,
+    calibration_split: str,
+    calibration_years: Iterable[int],
+    eval_years: Iterable[int],
+    q95_z: np.ndarray,
+    sigma: np.ndarray,
+    months: np.ndarray,
+    years: np.ndarray,
+    mask_np: np.ndarray,
+    device,
+    target_mode: str,
+    window_leads: Sequence[int],
+    lead_indices: Sequence[int],
+    center_idx: int,
+    target_center_lead: int,
+    checkpoint_path: str,
+    requested_calibrator: str,
+    max_cases: int,
+    max_samples: int,
+    min_month_samples: int,
+    min_month_positives: int,
+    seed: int,
+    progress_every: int,
+) -> Tuple[MarginMonotonicCalibrator, Dict[str, MarginMonotonicCalibrator]]:
+    path = monotonic_calibrator_cache_path(
+        target_mode, window_leads, calibration_split, requested_calibrator, checkpoint_path
+    )
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    calibration_year_set = set(int(y) for y in calibration_years)
+    eval_year_set = set(int(y) for y in eval_years)
+    if calibration_year_set & eval_year_set:
+        raise RuntimeError("Calibration/eval year overlap before fitting calibrator.")
+    src_mtime = _source_mtime([checkpoint_path, cfm.get_norm_stats_path(cfm.Config), cfm.Config.TRAINING_DATA_PATH])
+    if os.path.exists(path) and os.path.getmtime(path) >= src_mtime:
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+            cached_years = set(int(y) for y in payload.get("calibration_years", []))
+            cached_eval_years = set(int(y) for y in payload.get("eval_years", []))
+            if (
+                cached_years == calibration_year_set
+                and cached_eval_years == eval_year_set
+                and tuple(payload.get("window_leads", ())) == tuple(int(x) for x in window_leads)
+                and payload.get("target_mode") == target_mode
+                and payload.get("requested_calibrator") == requested_calibrator
+            ):
+                print(f"Loading held-out monotonic calibrator from {path}")
+                return payload["chosen"], payload["candidates"]
+        except Exception:
+            pass
+
+    x, y, month_arr, pair_years = collect_margin_label_pairs(
+        model,
+        calibration_dataset,
+        calibration_split,
+        calibration_years,
+        q95_z,
+        sigma,
+        months,
+        years,
+        mask_np,
+        device,
+        target_mode,
+        lead_indices,
+        center_idx,
+        target_center_lead,
+        max_cases,
+        max_samples,
+        seed,
+        progress_every,
+    )
+    if set(int(y0) for y0 in np.unique(pair_years)) & eval_year_set:
+        raise RuntimeError("Eval year appeared in calibration pairs.")
+
+    candidates: Dict[str, MarginMonotonicCalibrator] = {}
+    for method in ("platt", "isotonic"):
+        try:
+            candidates[method] = fit_margin_monotonic_calibrator(
+                x,
+                y,
+                month_arr,
+                method=method,
+                calibration_split=calibration_split,
+                min_month_samples=int(min_month_samples),
+                min_month_positives=int(min_month_positives),
+            )
+        except Exception as exc:
+            print(f"  {method} calibrator failed to fit: {exc}")
+
+    chosen = choose_monotonic_calibrator(candidates, requested_calibrator)
+    print("Held-out monotonic calibration candidates")
+    print("----------------------------------------")
+    for name, cal in candidates.items():
+        print(
+            f"{name:8s} calibration ECE={cal.calibration_ece:.4f}, "
+            f"slope={cal.calibration_slope:.3f}, Brier={cal.calibration_brier:.5f}, "
+            f"month_models={len(cal.by_month)}"
+        )
+    print(f"Chosen calibrator: {chosen.method}")
+
+    with open(path, "wb") as f:
+        pickle.dump({
+            "chosen": chosen,
+            "candidates": candidates,
+            "calibration_years": sorted(calibration_year_set),
+            "eval_years": sorted(eval_year_set),
+            "window_leads": tuple(int(x) for x in window_leads),
+            "target_mode": target_mode,
+            "requested_calibrator": requested_calibrator,
+            "checkpoint_path": os.path.abspath(checkpoint_path),
+        }, f)
+    print(f"  Saved held-out monotonic calibrator to {path}")
+    return chosen, candidates
 
 
 def train_model_output_calibrator(
@@ -1204,6 +1682,9 @@ def select_dataset(split: str, config, shared_data, norm_stats, climo, train_ind
 def evaluate(args: argparse.Namespace) -> None:
     configure_from_args(args)
     target_mode = str(args.target_mode).lower()
+    eval_split = args.eval_split if args.eval_split is not None else (args.split if args.split is not None else "test")
+    if eval_split not in {"train", "val", "test"}:
+        raise ValueError(f"Unsupported eval split: {eval_split}")
     predicted_leads = cfm.prediction_leads(cfm.Config)
     window_leads = parse_int_list(args.window_leads) if args.window_leads else predicted_leads
     lead_indices: Tuple[int, ...] = ()
@@ -1212,7 +1693,7 @@ def evaluate(args: argparse.Namespace) -> None:
             raise RuntimeError("--target_mode window requires --multi_lead_tube or a tube run_name.")
         lead_indices = window_lead_indices(predicted_leads, window_leads)
         target_center_lead = window_center_lead(window_leads)
-        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / args.split / f"window_{lead_list_label(window_leads)}")
+        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / eval_split / f"window_{lead_list_label(window_leads)}")
         print(
             "Windowed exceedance mode: "
             f"window_leads={window_leads}, predicted_leads={predicted_leads}, "
@@ -1220,7 +1701,7 @@ def evaluate(args: argparse.Namespace) -> None:
         )
     else:
         target_center_lead = int(cfm.Config.LEAD_TIME)
-        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / args.split)
+        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / eval_split)
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda":
@@ -1236,8 +1717,8 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Val years: {sorted(val_years)}")
     print(f"Test years: {sorted(test_years)}")
 
-    split_years = {"train": train_years, "val": val_years, "test": test_years}[args.split]
-    if set(split_years) & set(train_years) and args.split != "train":
+    split_years = {"train": train_years, "val": val_years, "test": test_years}[eval_split]
+    if set(split_years) & set(train_years) and eval_split != "train":
         raise RuntimeError("Leakage check failed: evaluation split overlaps training years.")
 
     norm_stats = load_norm_stats()
@@ -1252,7 +1733,7 @@ def evaluate(args: argparse.Namespace) -> None:
             raise RuntimeError(f"Train exceedance rate for month {month} is not near 5%: {rate:.4f}")
 
     dataset = select_dataset(
-        args.split, cfm.Config, shared_data, norm_stats, climo,
+        eval_split, cfm.Config, shared_data, norm_stats, climo,
         train_indices, val_indices, test_indices,
     )
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
@@ -1302,39 +1783,103 @@ def evaluate(args: argparse.Namespace) -> None:
         name: (rmask & mask_np)
         for name, rmask in region_masks(cfm.Config.IMAGE_SIZE).items()
     }
-    calibration_split = resolve_calibration_split(args.calibration_split, args.split)
+    center_idx = cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0
+
     split_year_map = {"train": train_years, "val": val_years, "test": test_years}
-    if calibration_split == args.split and args.split != "train" and not args.allow_eval_split_calibration:
+    calibration_split = resolve_calibration_split(args.calibration_split, eval_split)
+    calibration_years = split_year_map[calibration_split]
+    train_year_set = set(int(y) for y in train_years)
+    calibration_year_set = set(int(y) for y in calibration_years)
+    eval_year_set = set(int(y) for y in split_years)
+    if train_year_set & calibration_year_set:
         raise RuntimeError(
-            f"Calibration split '{calibration_split}' matches evaluation split '{args.split}'. "
-            "Use a held-out calibration split, or pass --allow_eval_split_calibration only for diagnostics."
+            f"Disjointness assert failed: calibration split '{calibration_split}' overlaps model-training years."
         )
-    if args.split != "train" and set(split_year_map[calibration_split]) & set(split_years):
-        raise RuntimeError("Calibration leakage check failed: calibration years overlap evaluation years.")
+    if train_year_set & eval_year_set:
+        raise RuntimeError(
+            f"Disjointness assert failed: eval split '{eval_split}' overlaps model-training years."
+        )
+    if calibration_year_set & eval_year_set:
+        raise RuntimeError(
+            f"Disjointness assert failed: calibration split '{calibration_split}' overlaps eval split '{eval_split}'."
+        )
+    print(
+        "Disjoint split roles: "
+        f"model_train={len(train_year_set)} years, "
+        f"calibration={calibration_split} ({len(calibration_year_set)} years), "
+        f"eval={eval_split} ({len(eval_year_set)} years)"
+    )
+
     calibration_dataset = select_dataset(
         calibration_split, cfm.Config, shared_data, norm_stats, climo,
         train_indices, val_indices, test_indices,
     )
-    model_calibrator = train_model_output_calibrator(
+    monotonic_calibrator, monotonic_candidates = load_or_fit_monotonic_calibrator(
         model,
         calibration_dataset,
         calibration_split,
+        calibration_years,
+        split_years,
         q95_z,
         sigma_clim,
         months,
-        regions,
+        years,
         mask_np,
         device,
-        center_idx=cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0,
-        target_mode=target_mode,
-        lead_indices=lead_indices,
-        target_center_lead=target_center_lead,
+        target_mode,
+        window_leads,
+        lead_indices,
+        center_idx,
+        target_center_lead,
+        ckpt_path,
+        requested_calibrator=str(args.calibrator),
         max_cases=int(args.max_calibration_cases),
         max_samples=int(args.max_calibration_samples),
         seed=int(args.seed) + 137,
-        steps=int(args.calibration_steps),
-        lr=float(args.calibration_lr),
-        l2=float(args.calibration_l2),
+        min_month_samples=int(args.min_calibration_samples_per_month),
+        min_month_positives=int(args.min_calibration_positives_per_month),
+        progress_every=int(args.progress_every),
+    )
+
+    train_dataset_for_old_logistic = select_dataset(
+        "train", cfm.Config, shared_data, norm_stats, climo,
+        train_indices, val_indices, test_indices,
+    )
+    train_x, train_y, train_months, _ = collect_margin_label_pairs(
+        model,
+        train_dataset_for_old_logistic,
+        "train",
+        train_years,
+        q95_z,
+        sigma_clim,
+        months,
+        years,
+        mask_np,
+        device,
+        target_mode,
+        lead_indices,
+        center_idx,
+        target_center_lead,
+        max_cases=min(int(args.max_calibration_cases), 512),
+        max_samples=int(args.max_calibration_samples),
+        seed=int(args.seed) + 503,
+        progress_every=int(args.progress_every),
+    )
+    old_train_calibrator = fit_margin_monotonic_calibrator(
+        train_x,
+        train_y,
+        train_months,
+        method="platt",
+        calibration_split="train",
+        min_month_samples=10**12,
+        min_month_positives=10**12,
+    )
+    print(
+        "Old train-fitted single-logistic diagnostic: "
+        f"ECE={old_train_calibrator.calibration_ece:.4f}, "
+        f"slope={old_train_calibrator.calibration_slope:.3f}, "
+        f"Brier={old_train_calibrator.calibration_brier:.5f}, "
+        f"n={old_train_calibrator.n_samples}"
     )
 
     logistic = train_pooled_logistic_baseline(
@@ -1351,13 +1896,13 @@ def evaluate(args: argparse.Namespace) -> None:
         thresholded_name = "thresholded_window_mean"
         pooled_name = "pooled_logistic_window_init_margin"
         analytic_name = "windowed_mu_sigma_error"
-        calibrated_name = "windowed_calibrated_logistic"
     else:
         reference_name = "monthly_climatology"
         thresholded_name = "thresholded_point_model"
         pooled_name = "pooled_logistic_init_margin"
         analytic_name = "stage1_mu_sigma_clim"
-        calibrated_name = "calibrated_model_logistic"
+    old_calibrated_name = "old_train_logistic_margin"
+    calibrated_name = "heldout_monotonic_calibrator"
     model_names = [
         reference_name,
         "persistence_init",
@@ -1365,6 +1910,7 @@ def evaluate(args: argparse.Namespace) -> None:
         thresholded_name,
         pooled_name,
         analytic_name,
+        old_calibrated_name,
         calibrated_name,
     ]
     acc = EvaluationAccumulator(model_names, regions)
@@ -1374,9 +1920,8 @@ def evaluate(args: argparse.Namespace) -> None:
     )
 
     h, w = cfm.Config.IMAGE_SIZE
-    center_idx = cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0
     heat = shared_data["heat_index"]
-    print(f"Evaluating split={args.split}, samples={len(dataset)}")
+    print(f"Evaluating split={eval_split}, samples={len(dataset)}")
     leakage_ok = True
     causal_ok = True
 
@@ -1388,7 +1933,7 @@ def evaluate(args: argparse.Namespace) -> None:
             target_month = int(months[target_t])
             if target_month not in MJJAS_MONTHS:
                 continue
-            if int(years[target_t]) in train_years and args.split != "train":
+            if int(years[target_t]) in train_years and eval_split != "train":
                 leakage_ok = False
 
             x_t_dev = x_t.to(device)
@@ -1436,7 +1981,8 @@ def evaluate(args: argparse.Namespace) -> None:
             truth[~mask_np] = np.nan
             stage1 = normal_cdf((mu_z - q) / np.maximum(sigma, 0.1))
             stage1[~mask_np] = np.nan
-            calibrated = model_calibrator.predict_grid(mu_z, q, sigma, target_month, regions, mask_np)
+            old_train_calibrated = old_train_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
+            calibrated = monotonic_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
             monthly_climo = base_rate[target_month]
             thresholded = (mu_z > q).astype(np.float32)
             thresholded[~mask_np] = np.nan
@@ -1454,6 +2000,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 thresholded_name: thresholded,
                 pooled_name: logistic_prob,
                 analytic_name: stage1,
+                old_calibrated_name: old_train_calibrated,
                 calibrated_name: calibrated,
             }
             if target_mode == "window":
@@ -1511,12 +2058,31 @@ def evaluate(args: argparse.Namespace) -> None:
     write_csv(out_dir / "exceedance_results.csv", summary_rows)
     write_csv(out_dir / "monthly_exceedance_results.csv", monthly_rows)
     write_csv(out_dir / "regional_exceedance_count_mae.csv", region_rows)
-    write_csv(out_dir / "calibrated_model_logistic_coefficients.csv", model_calibrator.coefficient_rows())
+    write_csv(out_dir / "old_train_logistic_margin_coefficients.csv", old_train_calibrator.coefficient_rows())
+    write_csv(out_dir / "heldout_monotonic_calibrator_coefficients.csv", monotonic_calibrator.coefficient_rows())
+    write_csv(
+        out_dir / "heldout_monotonic_calibrator_candidates.csv",
+        [
+            {
+                "candidate": name,
+                "selected": name == monotonic_calibrator.method,
+                "calibration_split": cal.calibration_split,
+                "n_samples": cal.n_samples,
+                "event_rate": cal.event_rate,
+                "calibration_slope": cal.calibration_slope,
+                "calibration_ece": cal.calibration_ece,
+                "calibration_brier": cal.calibration_brier,
+                "month_models": len(cal.by_month),
+            }
+            for name, cal in sorted(monotonic_candidates.items())
+        ],
+    )
     for name, rows in rel_tables.items():
         write_csv(out_dir / f"reliability_{name}.csv", rows)
     plot_reliability(out_dir / "reliability_diagram.png", rel_tables)
 
     stage1 = next(row for row in summary_rows if row["model"] == analytic_name)
+    old_train_row = next(row for row in summary_rows if row["model"] == old_calibrated_name)
     calibrated_row = next(row for row in summary_rows if row["model"] == calibrated_name)
     thresholded = next(row for row in summary_rows if row["model"] == thresholded_name)
     climo = next(row for row in summary_rows if row["model"] == reference_name)
@@ -1544,9 +2110,20 @@ def evaluate(args: argparse.Namespace) -> None:
         )
     print("\nAcceptance checks")
     print("=================")
-    print("Leakage asserts: PASS (train-only thresholds/stats; eval years held out)")
+    print(
+        "Disjointness asserts: PASS "
+        f"(train={len(train_year_set)} years, calibration={calibration_split}, eval={eval_split})"
+    )
+    print("Leakage asserts: PASS (train-only thresholds/stats; calibration/eval years held out)")
     print("Causal persistence asserts: PASS (history windows end at init day)")
     print(f"{reference_name} Brier reference: {climo['brier']:.5f}")
+    print("Held-out monotonic calibration candidates:")
+    for name, cal in sorted(monotonic_candidates.items()):
+        selected = "selected" if name == monotonic_calibrator.method else "candidate"
+        print(
+            f"  {name}: ECE={cal.calibration_ece:.4f}, "
+            f"slope={cal.calibration_slope:.3f}, Brier={cal.calibration_brier:.5f} ({selected})"
+        )
     if target_mode == "window":
         print(
             f"Windowed BSS vs windowed climatology: {stage1['bss_vs_monthly_climo']:+.4f} "
@@ -1555,7 +2132,11 @@ def evaluate(args: argparse.Namespace) -> None:
     else:
         print(f"Stage 1 BSS vs monthly climatology: {stage1['bss_vs_monthly_climo']:+.4f}")
     print(
-        f"Calibrated model-output logistic BSS vs {reference_name}: "
+        f"Old train-logistic BSS vs {reference_name}: "
+        f"{old_train_row['bss_vs_monthly_climo']:+.4f}"
+    )
+    print(
+        f"Held-out monotonic BSS vs {reference_name}: "
         f"{calibrated_row['bss_vs_monthly_climo']:+.4f}"
     )
     print(
@@ -1570,15 +2151,21 @@ def evaluate(args: argparse.Namespace) -> None:
         )
     if calibrated_bin_02 is not None:
         print(
-            "Calibrated reliability 0.2-bin sanity: "
+            "Held-out calibrated reliability 0.2-bin sanity: "
             f"count={int(calibrated_bin_02['count'])}, "
             f"mean_pred={calibrated_bin_02['mean_pred']:.3f}, "
             f"obs_freq={calibrated_bin_02['obs_freq']:.3f}"
         )
         print(
-            "Calibrated reliability summary: "
+            "Held-out calibrated reliability summary: "
             f"slope={calibrated_row['reliability_slope']:.3f}, ECE={calibrated_row['ece']:.4f}"
         )
+    auc_diff = abs(float(calibrated_row["roc_auc"]) - float(stage1["roc_auc"]))
+    print(
+        "Monotonic AUC check: "
+        f"analytic={stage1['roc_auc']:.4f}, heldout={calibrated_row['roc_auc']:.4f}, "
+        f"abs_diff={auc_diff:.4g}"
+    )
     print(
         "PR-AUC is secondary only; selection/headline metric is BSS with reliability diagnostics."
     )
@@ -1589,7 +2176,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run_name", required=True)
     parser.add_argument("--cv_fold", type=int, required=True)
-    parser.add_argument("--split", choices=["train", "val", "test"], default="val")
+    parser.add_argument("--split", choices=["train", "val", "test"], default=None, help="Backward-compatible alias for --eval_split.")
+    parser.add_argument("--eval_split", choices=["train", "val", "test"], default=None)
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--output_dir", default="exceedance_eval")
     parser.add_argument("--cv_stride", type=int, default=5)
@@ -1599,10 +2187,13 @@ def main() -> None:
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
-    parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="auto")
+    parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="val")
+    parser.add_argument("--calibrator", choices=["platt", "isotonic", "auto"], default="auto")
     parser.add_argument("--allow_eval_split_calibration", action="store_true")
-    parser.add_argument("--max_calibration_cases", type=int, default=256)
+    parser.add_argument("--max_calibration_cases", type=int, default=1000000)
     parser.add_argument("--max_calibration_samples", type=int, default=250000)
+    parser.add_argument("--min_calibration_samples_per_month", type=int, default=20000)
+    parser.add_argument("--min_calibration_positives_per_month", type=int, default=100)
     parser.add_argument("--calibration_steps", type=int, default=200)
     parser.add_argument("--calibration_lr", type=float, default=0.1)
     parser.add_argument("--calibration_l2", type=float, default=1e-4)
