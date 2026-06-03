@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Fold-safe daily heat-exceedance evaluation for existing HeatCast checkpoints.
+"""Fold-safe heat-exceedance evaluation for existing HeatCast checkpoints.
 
-Stage 1 only: no architecture, training-loop, or loss changes. This script
-derives daily exceedance probabilities from the existing point forecast mean
-using month-specific train-year q95 thresholds and climatological anomaly
-spread, then evaluates probabilistic exceedance skill.
+Evaluation only: no architecture, training-loop, or loss changes. The default
+daily mode derives center-lead exceedance probabilities from the existing point
+forecast mean using month-specific train-year q95 thresholds and climatological
+anomaly spread. Window mode evaluates exceedance of a configurable multi-lead
+mean forecast with its own train-year windowed q95 threshold and forecast-error
+spread.
 """
 
 from __future__ import annotations
@@ -43,6 +45,29 @@ def parse_int_list(text: str) -> Tuple[int, ...]:
     return tuple(int(x.strip()) for x in str(text).split(",") if x.strip())
 
 
+def lead_list_label(leads: Sequence[int]) -> str:
+    return "-".join(str(int(x)) for x in leads)
+
+
+def window_center_lead(window_leads: Sequence[int]) -> int:
+    if not window_leads:
+        raise ValueError("Window lead list cannot be empty.")
+    med = float(np.median(np.asarray(window_leads, dtype=np.float64)))
+    return int(math.floor(med + 0.5))
+
+
+def window_lead_indices(predicted_leads: Sequence[int], window_leads: Sequence[int]) -> Tuple[int, ...]:
+    pred = tuple(int(x) for x in predicted_leads)
+    missing = [int(x) for x in window_leads if int(x) not in pred]
+    if missing:
+        raise RuntimeError(
+            "Requested --window_leads are not all present in the model prediction tube. "
+            f"Requested={tuple(int(x) for x in window_leads)}, predicted={pred}, missing={tuple(missing)}. "
+            "A wider-tube retrain is required for this window."
+        )
+    return tuple(pred.index(int(lead)) for lead in window_leads)
+
+
 def configure_from_args(args: argparse.Namespace) -> None:
     cfm.Config.DETERMINISTIC = True
     cfm.Config.RUN_NAME = args.run_name
@@ -52,7 +77,7 @@ def configure_from_args(args: argparse.Namespace) -> None:
     cfm.Config.CV_TEST_OFFSETS = (fold,)
     cfm.Config.CV_VAL_OFFSETS = ((fold + 1) % int(args.cv_stride),)
 
-    if args.multi_lead_tube or "tube" in args.run_name.lower():
+    if args.multi_lead_tube or "tube" in args.run_name.lower() or getattr(args, "target_mode", "daily") == "window":
         cfm.Config.MULTI_LEAD_TUBE = True
         cfm.Config.PREDICTION_LEADS = parse_int_list(args.prediction_leads)
     else:
@@ -137,6 +162,22 @@ def exceedance_cache_path() -> str:
     )
 
 
+def window_exceedance_cache_path(window_leads: Sequence[int]) -> str:
+    suffix = (
+        "_tube" + lead_list_label(cfm.prediction_leads(cfm.Config))
+        if cfm.Config.MULTI_LEAD_TUBE else ""
+    )
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+    return os.path.join(
+        cfm.Config.OUTPUT_DIR,
+        "data_cache",
+        (
+            f"window_q95_sigma_direct15{suffix}_win{lead_list_label(window_leads)}_"
+            f"{cfm.cv_split_tag(cfm.Config)}_fold{fold}.npz"
+        ),
+    )
+
+
 def _normalize_field(field: np.ndarray, norm_stats: Mapping[str, torch.Tensor]) -> np.ndarray:
     hi_mean = float(norm_stats["hi_mean"])
     hi_std = float(norm_stats["hi_std"])
@@ -145,6 +186,20 @@ def _normalize_field(field: np.ndarray, norm_stats: Mapping[str, torch.Tensor]) 
     out[valid] = (out[valid] - hi_mean) / (hi_std + 1e-8)
     out[~valid] = np.nan
     return out
+
+
+def window_mean_z_from_shared(
+    heat: np.ndarray,
+    init_t: int,
+    window_leads: Sequence[int],
+    norm_stats: Mapping[str, torch.Tensor],
+) -> np.ndarray:
+    fields = [
+        _normalize_field(np.asarray(heat[:, :, int(init_t) + int(lead)]), norm_stats)
+        for lead in window_leads
+    ]
+    with np.errstate(all="ignore"):
+        return np.nanmean(np.stack(fields, axis=0), axis=0).astype(np.float32)
 
 
 def build_month_q95(shared_data, train_year_mask, norm_stats) -> np.ndarray:
@@ -286,6 +341,161 @@ def load_or_build_exceedance_stats(shared_data, train_years, norm_stats, climo_b
     )
     print(f"  Saved exceedance stats to {path}")
     return q95_z, sigma_clim, base_rate
+
+
+def load_or_build_window_exceedance_stats(
+    model,
+    train_dataset,
+    shared_data,
+    train_years,
+    norm_stats,
+    climo_by_doy,
+    months: np.ndarray,
+    years: np.ndarray,
+    window_leads: Sequence[int],
+    lead_indices: Sequence[int],
+    mask_np: np.ndarray,
+    device,
+    checkpoint_path: str,
+    progress_every: int = 100,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Train-year windowed q95/base-rate and forecast-error spread.
+
+    The threshold is built on the exact windowed-mean truth quantity being
+    evaluated. The spread is built from train-year forecast errors
+    truth_week - mu_week, so it is checkpoint-dependent.
+    """
+    path = window_exceedance_cache_path(window_leads)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    norm_path = cfm.get_norm_stats_path(cfm.Config)
+    climo_path = cfm.get_climatology_cache_path(cfm.Config)
+    src_mtime = _source_mtime([norm_path, climo_path, cfm.Config.TRAINING_DATA_PATH, checkpoint_path])
+    center_lead = window_center_lead(window_leads)
+    train_year_set = set(int(y) for y in train_years)
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+
+    def _cache_ok() -> bool:
+        if not os.path.exists(path):
+            return False
+        if os.path.getmtime(path) < src_mtime:
+            return False
+        try:
+            with np.load(path, allow_pickle=True) as data:
+                cached_years = set(np.atleast_1d(data["train_years"]).astype(int).tolist())
+                cached_leads = tuple(np.atleast_1d(data["window_leads"]).astype(int).tolist())
+                cached_pred_leads = tuple(np.atleast_1d(data["prediction_leads"]).astype(int).tolist())
+                return (
+                    cached_years == train_year_set
+                    and cached_leads == tuple(int(x) for x in window_leads)
+                    and cached_pred_leads == cfm.prediction_leads(cfm.Config)
+                    and int(data["cv_fold"]) == fold
+                    and str(data["cv_split"].item()) == cfm.cv_split_tag(cfm.Config)
+                    and abs(float(data["hi_mean"]) - float(norm_stats["hi_mean"])) < 1e-6
+                    and abs(float(data["hi_std"]) - float(norm_stats["hi_std"])) < 1e-6
+                )
+        except Exception:
+            return False
+
+    if _cache_ok():
+        print(f"Loading fold-safe windowed exceedance stats from {path}")
+        with np.load(path, allow_pickle=False) as data:
+            return (
+                np.asarray(data["q95_z"], dtype=np.float32),
+                np.asarray(data["sigma_error"], dtype=np.float32),
+                np.asarray(data["base_rate"], dtype=np.float32),
+            )
+
+    print(
+        "Building train-year-only windowed q95/base-rate/sigma stats "
+        f"for leads {tuple(int(x) for x in window_leads)}..."
+    )
+    h, w = cfm.Config.IMAGE_SIZE
+    truth_by_month: Dict[int, List[np.ndarray]] = defaultdict(list)
+    err_by_month: Dict[int, List[np.ndarray]] = defaultdict(list)
+    loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(loader):
+            mu_week, truth_week, t = predict_target_field(
+                model,
+                batch,
+                device,
+                target_mode="window",
+                lead_indices=tuple(lead_indices),
+                center_idx=cfm.center_lead_index(cfm.Config),
+                image_size=cfm.Config.IMAGE_SIZE,
+            )
+            center_t = int(t) + int(center_lead)
+            month = int(months[center_t])
+            if month not in MJJAS_MONTHS:
+                continue
+            if int(years[center_t]) not in train_year_set:
+                raise RuntimeError("Windowed stats builder leaked outside train years.")
+            truth_week = truth_week.astype(np.float32)
+            mu_week = mu_week.astype(np.float32)
+            truth_week[~mask_np] = np.nan
+            mu_week[~mask_np] = np.nan
+            truth_by_month[month].append(truth_week)
+            err_by_month[month].append(truth_week - mu_week)
+            if (batch_idx + 1) % max(1, int(progress_every)) == 0:
+                print(f"  window stats train inference processed {batch_idx + 1}/{len(train_dataset)}")
+
+    q95_z = np.full((12, h, w), np.nan, dtype=np.float32)
+    sigma_error = np.full((12, h, w), np.nan, dtype=np.float32)
+    base_rate = np.full((12, h, w), np.nan, dtype=np.float32)
+    for month in MJJAS_MONTHS:
+        if not truth_by_month[month]:
+            print(f"  Windowed train build check month={month}: no center-month samples")
+            continue
+        truth_stack = np.stack(truth_by_month[month], axis=2).astype(np.float32)
+        with np.errstate(all="ignore"):
+            q = np.nanpercentile(truth_stack, 95.0, axis=2).astype(np.float32)
+        q[~mask_np] = np.nan
+        valid = np.isfinite(truth_stack) & np.isfinite(q[:, :, None])
+        exceed = truth_stack > q[:, :, None]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            rate = exceed.sum(axis=2).astype(np.float32) / np.maximum(valid.sum(axis=2), 1)
+        rate[~mask_np] = np.nan
+
+        err_stack = np.stack(err_by_month[month], axis=2).astype(np.float32)
+        with np.errstate(all="ignore"):
+            sig = np.nanstd(err_stack, axis=2).astype(np.float32)
+        sig = np.where(np.isfinite(sig), sig, np.nan)
+        sig[mask_np] = np.maximum(sig[mask_np], 0.1)
+        sig[~mask_np] = np.nan
+
+        q95_z[month] = q
+        base_rate[month] = rate.astype(np.float32)
+        sigma_error[month] = sig.astype(np.float32)
+        mean_rate = float(np.nanmean(rate))
+        print(f"  Windowed train build check month={month}: mean exceedance rate={mean_rate:.4f}")
+        if not (0.025 <= mean_rate <= 0.075):
+            raise RuntimeError(
+                f"Windowed train exceedance rate for month {month} is not near 5%: {mean_rate:.4f}"
+            )
+        del truth_stack, err_stack
+
+    np.savez_compressed(
+        path,
+        q95_z=q95_z.astype(np.float32),
+        sigma_error=sigma_error.astype(np.float32),
+        base_rate=base_rate.astype(np.float32),
+        train_years=np.array(sorted(train_year_set), dtype=np.int16),
+        cv_fold=np.array(fold, dtype=np.int16),
+        cv_split=np.array(cfm.cv_split_tag(cfm.Config), dtype=object),
+        prediction_leads=np.array(cfm.prediction_leads(cfm.Config), dtype=np.int16),
+        window_leads=np.array(tuple(int(x) for x in window_leads), dtype=np.int16),
+        center_lead=np.array(center_lead, dtype=np.int16),
+        hi_mean=np.array(float(norm_stats["hi_mean"]), dtype=np.float32),
+        hi_std=np.array(float(norm_stats["hi_std"]), dtype=np.float32),
+        months=np.array(MJJAS_MONTHS, dtype=np.int8),
+        norm_stats_mtime=np.array(os.path.getmtime(norm_path) if os.path.exists(norm_path) else 0.0),
+        climo_mtime=np.array(os.path.getmtime(climo_path) if os.path.exists(climo_path) else 0.0),
+        checkpoint_mtime=np.array(os.path.getmtime(checkpoint_path) if os.path.exists(checkpoint_path) else 0.0),
+    )
+    print(f"  Saved windowed exceedance stats to {path}")
+    return q95_z, sigma_error, base_rate
 
 
 def normal_cdf(x: np.ndarray) -> np.ndarray:
@@ -564,6 +774,50 @@ def trailing_exceedance_probability(
     return out.astype(np.float32)
 
 
+def trailing_windowed_exceedance_probability(
+    heat: np.ndarray,
+    t: int,
+    history_windows: int,
+    run_start: int,
+    q95_z: np.ndarray,
+    months: np.ndarray,
+    norm_stats: Mapping[str, torch.Tensor],
+    land_mask: np.ndarray,
+    window_leads: Sequence[int],
+    center_lead: int,
+) -> np.ndarray:
+    latest_hist_init = int(t) - max(int(x) for x in window_leads)
+    if latest_hist_init < run_start:
+        out = np.zeros_like(land_mask, dtype=np.float32)
+        out[~land_mask] = np.nan
+        return out
+    lo = max(run_start, latest_hist_init - int(history_windows) + 1)
+    hist_inits = np.arange(lo, latest_hist_init + 1, dtype=np.int64)
+    if hist_inits.size == 0:
+        out = np.zeros_like(land_mask, dtype=np.float32)
+        out[~land_mask] = np.nan
+        return out
+    if max(int(h) + max(int(x) for x in window_leads) for h in hist_inits) > int(t):
+        raise RuntimeError("Windowed persistence attempted to use post-init information.")
+
+    count = np.zeros(land_mask.shape, dtype=np.float32)
+    exceed = np.zeros(land_mask.shape, dtype=np.float32)
+    for hist_t in hist_inits:
+        center_t = int(hist_t) + int(center_lead)
+        month = int(months[center_t])
+        if month not in MJJAS_MONTHS:
+            continue
+        field_z = window_mean_z_from_shared(heat, int(hist_t), window_leads, norm_stats)
+        threshold = q95_z[month]
+        valid = land_mask & np.isfinite(field_z) & np.isfinite(threshold)
+        count[valid] += 1.0
+        exceed[valid] += (field_z[valid] > threshold[valid]).astype(np.float32)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = exceed / np.maximum(count, 1.0)
+    out[~land_mask] = np.nan
+    return out.astype(np.float32)
+
+
 @dataclass
 class PooledLogistic:
     mean: float
@@ -724,6 +978,46 @@ def resolve_calibration_split(requested: str, eval_split: str) -> str:
     return "val" if eval_split == "test" else "train"
 
 
+def predict_target_field(
+    model,
+    batch,
+    device,
+    target_mode: str,
+    lead_indices: Sequence[int],
+    center_idx: int,
+    image_size: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    y, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, t_idx, batch_mask = batch
+    h, w = image_size
+    pred = cfm.predict_direct(
+        model,
+        x_t.to(device),
+        x_tm1.to(device),
+        x_tm2.to(device),
+        spatial_c.to(device),
+        vec_c.to(device),
+        global_fields.to(device),
+        batch_mask.to(device),
+        device,
+    )
+    if target_mode == "window":
+        if not cfm.Config.MULTI_LEAD_TUBE:
+            raise RuntimeError("--target_mode window requires a multi-lead tube checkpoint.")
+        if not lead_indices:
+            raise RuntimeError("--target_mode window requires at least one lead index.")
+        idx = torch.as_tensor(tuple(int(i) for i in lead_indices), device=pred.device, dtype=torch.long)
+        mu_z = pred[0].index_select(0, idx)[:, :h, :w].mean(dim=0).detach().cpu().numpy().astype(np.float32)
+        truth_z = y[0].index_select(0, idx.cpu())[:, :h, :w].mean(dim=0).numpy().astype(np.float32)
+    else:
+        if cfm.Config.MULTI_LEAD_TUBE:
+            mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
+            truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+        else:
+            mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
+            truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
+    return mu_z, truth_z, int(t_idx.item())
+
+
 def train_model_output_calibrator(
     model,
     calibration_dataset,
@@ -735,6 +1029,9 @@ def train_model_output_calibrator(
     mask_np: np.ndarray,
     device,
     center_idx: int,
+    target_mode: str,
+    lead_indices: Sequence[int],
+    target_center_lead: int,
     max_cases: int,
     max_samples: int,
     seed: int,
@@ -757,8 +1054,16 @@ def train_model_output_calibrator(
     )
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
-            mu_z, truth_z, t = predict_center_field(model, batch, device, center_idx, cfm.Config.IMAGE_SIZE)
-            target_t = t + int(cfm.Config.LEAD_TIME)
+            mu_z, truth_z, t = predict_target_field(
+                model,
+                batch,
+                device,
+                target_mode=target_mode,
+                lead_indices=lead_indices,
+                center_idx=center_idx,
+                image_size=cfm.Config.IMAGE_SIZE,
+            )
+            target_t = t + int(target_center_lead)
             month = int(months[target_t])
             if month not in MJJAS_MONTHS:
                 continue
@@ -804,6 +1109,9 @@ def train_pooled_logistic_baseline(
     q95_z: np.ndarray,
     norm_stats: Mapping[str, torch.Tensor],
     months: np.ndarray,
+    target_mode: str,
+    window_leads: Sequence[int],
+    target_center_lead: int,
     max_samples: int,
     seed: int,
 ) -> PooledLogistic:
@@ -816,13 +1124,17 @@ def train_pooled_logistic_baseline(
     xs = []
     ys = []
     for t in train_indices:
-        target_t = int(t) + int(cfm.Config.LEAD_TIME)
+        target_t = int(t) + int(target_center_lead)
         month = int(months[target_t])
         if month not in MJJAS_MONTHS:
             continue
         chosen = rng.choice(land_flat, size=min(per_time, land_flat.size), replace=False)
         x_t_z = _normalize_field(np.asarray(heat[:, :, int(t)]), norm_stats).ravel()
-        y_z = _normalize_field(np.asarray(heat[:, :, target_t]), norm_stats).ravel()
+        if target_mode == "window":
+            truth_field = window_mean_z_from_shared(heat, int(t), window_leads, norm_stats)
+            y_z = truth_field.ravel()
+        else:
+            y_z = _normalize_field(np.asarray(heat[:, :, target_t]), norm_stats).ravel()
         q = q95_z[month].ravel()
         valid = np.isfinite(x_t_z[chosen]) & np.isfinite(y_z[chosen]) & np.isfinite(q[chosen])
         if np.any(valid):
@@ -891,7 +1203,24 @@ def select_dataset(split: str, config, shared_data, norm_stats, climo, train_ind
 
 def evaluate(args: argparse.Namespace) -> None:
     configure_from_args(args)
-    out_dir = ensure_dir(Path(args.output_dir) / args.run_name / args.split)
+    target_mode = str(args.target_mode).lower()
+    predicted_leads = cfm.prediction_leads(cfm.Config)
+    window_leads = parse_int_list(args.window_leads) if args.window_leads else predicted_leads
+    lead_indices: Tuple[int, ...] = ()
+    if target_mode == "window":
+        if not cfm.Config.MULTI_LEAD_TUBE:
+            raise RuntimeError("--target_mode window requires --multi_lead_tube or a tube run_name.")
+        lead_indices = window_lead_indices(predicted_leads, window_leads)
+        target_center_lead = window_center_lead(window_leads)
+        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / args.split / f"window_{lead_list_label(window_leads)}")
+        print(
+            "Windowed exceedance mode: "
+            f"window_leads={window_leads}, predicted_leads={predicted_leads}, "
+            f"center_month_lead={target_center_lead}"
+        )
+    else:
+        target_center_lead = int(cfm.Config.LEAD_TIME)
+        out_dir = ensure_dir(Path(args.output_dir) / args.run_name / args.split)
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda":
@@ -913,13 +1242,13 @@ def evaluate(args: argparse.Namespace) -> None:
 
     norm_stats = load_norm_stats()
     climo = cfm.load_or_build_train_climatology(shared_data, train_indices, norm_stats, cfm.Config, ddp=False)
-    q95_z, sigma_clim, base_rate = load_or_build_exceedance_stats(
+    daily_q95_z, daily_sigma_clim, daily_base_rate = load_or_build_exceedance_stats(
         shared_data, train_years, norm_stats, climo
     )
     for month in MJJAS_MONTHS:
-        rate = float(np.nanmean(base_rate[month]))
-        print(f"Build check month={month}: train-year mean exceedance rate={rate:.4f}")
-        if not (0.025 <= rate <= 0.075):
+        rate = float(np.nanmean(daily_base_rate[month]))
+        print(f"Daily build check month={month}: train-year mean exceedance rate={rate:.4f}")
+        if np.isfinite(rate) and not (0.025 <= rate <= 0.075):
             raise RuntimeError(f"Train exceedance rate for month {month} is not near 5%: {rate:.4f}")
 
     dataset = select_dataset(
@@ -930,9 +1259,44 @@ def evaluate(args: argparse.Namespace) -> None:
     conus_mask = cfm.load_conus_mask(cfm.Config)
     mask_np = conus_mask.numpy() > 0.5
     mesh = cfm.build_mesh_once(cfm.Config, conus_mask, device, ddp=False)
-    ckpt_path = checkpoint_path_for(args.run_name, args.checkpoint)
+    checkpoint_request = args.checkpoint or ("best_tac" if target_mode == "window" else "best_monitor")
+    ckpt_path = checkpoint_path_for(args.run_name, checkpoint_request)
     print(f"Loading checkpoint: {ckpt_path}")
     model = cfm._load_meshflownet_checkpoint(ckpt_path, mesh, device)
+
+    if target_mode == "window":
+        train_dataset_for_stats = select_dataset(
+            "train", cfm.Config, shared_data, norm_stats, climo,
+            train_indices, val_indices, test_indices,
+        )
+        q95_z, sigma_clim, base_rate = load_or_build_window_exceedance_stats(
+            model,
+            train_dataset_for_stats,
+            shared_data,
+            train_years,
+            norm_stats,
+            climo,
+            months,
+            years,
+            window_leads,
+            lead_indices,
+            mask_np,
+            device,
+            ckpt_path,
+            progress_every=int(args.progress_every),
+        )
+        for month in MJJAS_MONTHS:
+            rate = float(np.nanmean(base_rate[month]))
+            if np.isfinite(rate):
+                print(f"Windowed build check month={month}: train-year mean exceedance rate={rate:.4f}")
+                if not (0.025 <= rate <= 0.075):
+                    raise RuntimeError(
+                        f"Windowed train exceedance rate for month {month} is not near 5%: {rate:.4f}"
+                    )
+            else:
+                print(f"Windowed build check month={month}: no center-month samples")
+    else:
+        q95_z, sigma_clim, base_rate = daily_q95_z, daily_sigma_clim, daily_base_rate
 
     regions = {
         name: (rmask & mask_np)
@@ -962,6 +1326,9 @@ def evaluate(args: argparse.Namespace) -> None:
         mask_np,
         device,
         center_idx=cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0,
+        target_mode=target_mode,
+        lead_indices=lead_indices,
+        target_center_lead=target_center_lead,
         max_cases=int(args.max_calibration_cases),
         max_samples=int(args.max_calibration_samples),
         seed=int(args.seed) + 137,
@@ -972,20 +1339,39 @@ def evaluate(args: argparse.Namespace) -> None:
 
     logistic = train_pooled_logistic_baseline(
         shared_data, train_indices, q95_z, norm_stats, months,
+        target_mode=target_mode,
+        window_leads=window_leads,
+        target_center_lead=target_center_lead,
         max_samples=int(args.max_logistic_samples), seed=int(args.seed)
     )
 
     persistence_windows = parse_int_list(args.persistence_windows)
+    if target_mode == "window":
+        reference_name = "windowed_climatology"
+        thresholded_name = "thresholded_window_mean"
+        pooled_name = "pooled_logistic_window_init_margin"
+        analytic_name = "windowed_mu_sigma_error"
+        calibrated_name = "windowed_calibrated_logistic"
+    else:
+        reference_name = "monthly_climatology"
+        thresholded_name = "thresholded_point_model"
+        pooled_name = "pooled_logistic_init_margin"
+        analytic_name = "stage1_mu_sigma_clim"
+        calibrated_name = "calibrated_model_logistic"
     model_names = [
-        "monthly_climatology",
+        reference_name,
         "persistence_init",
         *[f"persistence_trailing{w}" for w in persistence_windows],
-        "thresholded_point_model",
-        "pooled_logistic_init_margin",
-        "stage1_mu_sigma_clim",
-        "calibrated_model_logistic",
+        thresholded_name,
+        pooled_name,
+        analytic_name,
+        calibrated_name,
     ]
     acc = EvaluationAccumulator(model_names, regions)
+    daily_compare_acc = (
+        EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
+        if target_mode == "window" else None
+    )
 
     h, w = cfm.Config.IMAGE_SIZE
     center_idx = cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0
@@ -998,7 +1384,7 @@ def evaluate(args: argparse.Namespace) -> None:
         for batch_idx, batch in enumerate(loader):
             y, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, t_idx, batch_mask = batch
             t = int(t_idx.item())
-            target_t = t + int(cfm.Config.LEAD_TIME)
+            target_t = t + int(target_center_lead)
             target_month = int(months[target_t])
             if target_month not in MJJAS_MONTHS:
                 continue
@@ -1017,12 +1403,23 @@ def evaluate(args: argparse.Namespace) -> None:
                 model, x_t_dev, x_tm1_dev, x_tm2_dev,
                 spatial_c_dev, vec_c_dev, global_fields_dev, mask_dev, device,
             )
-            if cfm.Config.MULTI_LEAD_TUBE:
+            if target_mode == "window":
+                idx = torch.as_tensor(lead_indices, device=pred.device, dtype=torch.long)
+                cpu_idx = torch.as_tensor(lead_indices, dtype=torch.long)
+                mu_z = pred[0].index_select(0, idx)[:, :h, :w].mean(dim=0).detach().cpu().numpy().astype(np.float32)
+                truth_z = y[0].index_select(0, cpu_idx)[:, :h, :w].mean(dim=0).numpy().astype(np.float32)
+                center_mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
+                center_truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+            elif cfm.Config.MULTI_LEAD_TUBE:
                 mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
                 truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+                center_mu_z = mu_z
+                center_truth_z = truth_z
             else:
                 mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
                 truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
+                center_mu_z = mu_z
+                center_truth_z = truth_z
             if batch_idx == 0:
                 mu_land = mu_z[mask_np & np.isfinite(mu_z)]
                 if mu_land.size:
@@ -1048,27 +1445,55 @@ def evaluate(args: argparse.Namespace) -> None:
             logistic_prob = logistic.predict(init_margin)
             logistic_prob[~mask_np] = np.nan
 
-            init_prob = (x_t[0, 0].numpy().astype(np.float32) > q).astype(np.float32)
-            init_prob[~mask_np] = np.nan
             run_start = find_run_start(runs, t)
             if t >= target_t:
                 causal_ok = False
 
             forecasts = {
-                "monthly_climatology": monthly_climo,
-                "persistence_init": init_prob,
-                "thresholded_point_model": thresholded,
-                "pooled_logistic_init_margin": logistic_prob,
-                "stage1_mu_sigma_clim": stage1,
-                "calibrated_model_logistic": calibrated,
+                reference_name: monthly_climo,
+                thresholded_name: thresholded,
+                pooled_name: logistic_prob,
+                analytic_name: stage1,
+                calibrated_name: calibrated,
             }
-            for window in persistence_windows:
-                forecasts[f"persistence_trailing{window}"] = trailing_exceedance_probability(
-                    heat, t, target_t, window, run_start, q95_z, months, norm_stats, mask_np
+            if target_mode == "window":
+                forecasts["persistence_init"] = trailing_windowed_exceedance_probability(
+                    heat, t, 1, run_start, q95_z, months, norm_stats, mask_np,
+                    window_leads, target_center_lead,
                 )
+                for window in persistence_windows:
+                    forecasts[f"persistence_trailing{window}"] = trailing_windowed_exceedance_probability(
+                        heat, t, window, run_start, q95_z, months, norm_stats, mask_np,
+                        window_leads, target_center_lead,
+                    )
+            else:
+                init_prob = (x_t[0, 0].numpy().astype(np.float32) > q).astype(np.float32)
+                init_prob[~mask_np] = np.nan
+                forecasts["persistence_init"] = init_prob
+                for window in persistence_windows:
+                    forecasts[f"persistence_trailing{window}"] = trailing_exceedance_probability(
+                        heat, t, target_t, window, run_start, q95_z, months, norm_stats, mask_np
+                    )
 
             for name, prob in forecasts.items():
                 acc.update(name, prob, truth, mask_np, target_month)
+
+            if daily_compare_acc is not None:
+                daily_target_t = t + int(cfm.Config.LEAD_TIME)
+                daily_month = int(months[daily_target_t])
+                if daily_month in MJJAS_MONTHS:
+                    qd = daily_q95_z[daily_month]
+                    sigd = daily_sigma_clim[daily_month]
+                    daily_truth = (center_truth_z > qd).astype(np.float32)
+                    daily_truth[~mask_np] = np.nan
+                    daily_stage1 = normal_cdf((center_mu_z - qd) / np.maximum(sigd, 0.1))
+                    daily_stage1[~mask_np] = np.nan
+                    daily_compare_acc.update(
+                        "monthly_climatology", daily_base_rate[daily_month], daily_truth, mask_np, daily_month
+                    )
+                    daily_compare_acc.update(
+                        "stage1_mu_sigma_clim", daily_stage1, daily_truth, mask_np, daily_month
+                    )
 
             if (batch_idx + 1) % max(1, int(args.progress_every)) == 0:
                 print(f"  processed {batch_idx + 1}/{len(dataset)} samples")
@@ -1078,8 +1503,8 @@ def evaluate(args: argparse.Namespace) -> None:
     if not causal_ok:
         raise RuntimeError("Causality assert failed for persistence baseline.")
 
-    summary_rows = acc.summary_rows("monthly_climatology")
-    monthly_rows = acc.monthly_rows("monthly_climatology")
+    summary_rows = acc.summary_rows(reference_name)
+    monthly_rows = acc.monthly_rows(reference_name)
     region_rows = acc.region_rows()
     rel_tables = {name: metric.rel.table() for name, metric in acc.metrics.items()}
 
@@ -1091,14 +1516,22 @@ def evaluate(args: argparse.Namespace) -> None:
         write_csv(out_dir / f"reliability_{name}.csv", rows)
     plot_reliability(out_dir / "reliability_diagram.png", rel_tables)
 
-    stage1 = next(row for row in summary_rows if row["model"] == "stage1_mu_sigma_clim")
-    calibrated_row = next(row for row in summary_rows if row["model"] == "calibrated_model_logistic")
-    thresholded = next(row for row in summary_rows if row["model"] == "thresholded_point_model")
-    climo = next(row for row in summary_rows if row["model"] == "monthly_climatology")
-    stage1_rel = acc.metrics["stage1_mu_sigma_clim"].rel.table()
-    calibrated_rel = acc.metrics["calibrated_model_logistic"].rel.table()
+    stage1 = next(row for row in summary_rows if row["model"] == analytic_name)
+    calibrated_row = next(row for row in summary_rows if row["model"] == calibrated_name)
+    thresholded = next(row for row in summary_rows if row["model"] == thresholded_name)
+    climo = next(row for row in summary_rows if row["model"] == reference_name)
+    stage1_rel = acc.metrics[analytic_name].rel.table()
+    calibrated_rel = acc.metrics[calibrated_name].rel.table()
     bin_02 = next((r for r in stage1_rel if r["lo"] <= 0.2 < r["hi"]), None)
     calibrated_bin_02 = next((r for r in calibrated_rel if r["lo"] <= 0.2 < r["hi"]), None)
+    daily_stage1_bss = float("nan")
+    if daily_compare_acc is not None:
+        daily_rows = daily_compare_acc.summary_rows("monthly_climatology")
+        daily_stage1_bss = next(
+            row["bss_vs_monthly_climo"]
+            for row in daily_rows
+            if row["model"] == "stage1_mu_sigma_clim"
+        )
 
     print("\nExceedance evaluation summary")
     print("=============================")
@@ -1113,10 +1546,16 @@ def evaluate(args: argparse.Namespace) -> None:
     print("=================")
     print("Leakage asserts: PASS (train-only thresholds/stats; eval years held out)")
     print("Causal persistence asserts: PASS (history windows end at init day)")
-    print(f"Monthly climatology Brier reference: {climo['brier']:.5f}")
-    print(f"Stage 1 BSS vs monthly climatology: {stage1['bss_vs_monthly_climo']:+.4f}")
+    print(f"{reference_name} Brier reference: {climo['brier']:.5f}")
+    if target_mode == "window":
+        print(
+            f"Windowed BSS vs windowed climatology: {stage1['bss_vs_monthly_climo']:+.4f} "
+            f"(daily Stage 1 BSS same checkpoint: {daily_stage1_bss:+.4f})"
+        )
+    else:
+        print(f"Stage 1 BSS vs monthly climatology: {stage1['bss_vs_monthly_climo']:+.4f}")
     print(
-        "Calibrated model-output logistic BSS vs monthly climatology: "
+        f"Calibrated model-output logistic BSS vs {reference_name}: "
         f"{calibrated_row['bss_vs_monthly_climo']:+.4f}"
     )
     print(
@@ -1125,7 +1564,7 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     if bin_02 is not None:
         print(
-            "Stage 1 reliability 0.2-bin sanity: "
+            f"{analytic_name} reliability 0.2-bin sanity: "
             f"count={int(bin_02['count'])}, mean_pred={bin_02['mean_pred']:.3f}, "
             f"obs_freq={bin_02['obs_freq']:.3f}"
         )
@@ -1135,6 +1574,10 @@ def evaluate(args: argparse.Namespace) -> None:
             f"count={int(calibrated_bin_02['count'])}, "
             f"mean_pred={calibrated_bin_02['mean_pred']:.3f}, "
             f"obs_freq={calibrated_bin_02['obs_freq']:.3f}"
+        )
+        print(
+            "Calibrated reliability summary: "
+            f"slope={calibrated_row['reliability_slope']:.3f}, ECE={calibrated_row['ece']:.4f}"
         )
     print(
         "PR-AUC is secondary only; selection/headline metric is BSS with reliability diagnostics."
@@ -1147,11 +1590,13 @@ def main() -> None:
     parser.add_argument("--run_name", required=True)
     parser.add_argument("--cv_fold", type=int, required=True)
     parser.add_argument("--split", choices=["train", "val", "test"], default="val")
-    parser.add_argument("--checkpoint", default="best_monitor")
+    parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--output_dir", default="exceedance_eval")
     parser.add_argument("--cv_stride", type=int, default=5)
     parser.add_argument("--multi_lead_tube", action="store_true")
     parser.add_argument("--prediction_leads", default="12,13,14,15,16,17,18")
+    parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
+    parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
     parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="auto")
