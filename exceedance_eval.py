@@ -86,6 +86,10 @@ def configure_from_args(args: argparse.Namespace) -> None:
         cfm.Config.MULTI_LEAD_TUBE = False
 
     cfm.Config.GRADIENT_LOSS_WEIGHT = 0.0
+    if getattr(args, "use_model_sigma", False):
+        cfm.Config.DISTRIBUTIONAL_HEAD = True
+        cfm.Config.IMAGE_CHANNELS = 2
+        cfm.Config.SIGMA_FLOOR = 0.1
     cfm.apply_run_name(args.run_name)
     cfm.apply_extended_global_fields()
     cfm.set_random_seed(int(args.seed))
@@ -1385,7 +1389,8 @@ def predict_target_field(
     lead_indices: Sequence[int],
     center_idx: int,
     image_size: Tuple[int, int],
-) -> Tuple[np.ndarray, np.ndarray, int]:
+    return_sigma: bool = False,
+):
     y, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, t_idx, batch_mask = batch
     h, w = image_size
     pred = cfm.predict_direct(
@@ -1399,6 +1404,9 @@ def predict_target_field(
         batch_mask.to(device),
         device,
     )
+    raw_model = model.module if hasattr(model, "module") else model
+    sigma_pred = getattr(raw_model, "last_sigma", None)
+    sigma_z = None
     if target_mode == "window":
         if not cfm.Config.MULTI_LEAD_TUBE:
             raise RuntimeError("--target_mode window requires a multi-lead tube checkpoint.")
@@ -1407,13 +1415,24 @@ def predict_target_field(
         idx = torch.as_tensor(tuple(int(i) for i in lead_indices), device=pred.device, dtype=torch.long)
         mu_z = pred[0].index_select(0, idx)[:, :h, :w].mean(dim=0).detach().cpu().numpy().astype(np.float32)
         truth_z = y[0].index_select(0, idx.cpu())[:, :h, :w].mean(dim=0).numpy().astype(np.float32)
+        if sigma_pred is not None:
+            sig = sigma_pred[0].index_select(0, idx)[:, :h, :w].float()
+            sigma_z = (torch.sqrt(sig.square().sum(dim=0).clamp_min(1e-8)) / max(len(lead_indices), 1)).detach().cpu().numpy().astype(np.float32)
     else:
         if cfm.Config.MULTI_LEAD_TUBE:
             mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
             truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+            if sigma_pred is not None:
+                sigma_z = sigma_pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
         else:
             mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
             truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
+            if sigma_pred is not None:
+                sigma_z = sigma_pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
+    if return_sigma:
+        if sigma_z is None:
+            raise RuntimeError("--use_model_sigma requested, but checkpoint/model did not emit last_sigma.")
+        return mu_z, truth_z, int(t_idx.item()), sigma_z
     return mu_z, truth_z, int(t_idx.item())
 
 
@@ -1423,6 +1442,7 @@ def monotonic_calibrator_cache_path(
     calibration_split: str,
     requested_calibrator: str,
     checkpoint_path: str,
+    use_model_sigma: bool = False,
 ) -> str:
     suffix = (
         f"win{lead_list_label(window_leads)}"
@@ -1432,11 +1452,12 @@ def monotonic_calibrator_cache_path(
     pred = "tube" + lead_list_label(cfm.prediction_leads(cfm.Config)) if cfm.Config.MULTI_LEAD_TUBE else "single"
     fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
     ckpt_tag = hashlib.sha1(os.path.abspath(checkpoint_path).encode("utf-8")).hexdigest()[:10]
+    sigma_tag = "modelsigma" if use_model_sigma else "cachedsigma"
     return os.path.join(
         cfm.Config.OUTPUT_DIR,
         "data_cache",
         (
-            f"monotonic_calibrator_v2_{target_mode}_{suffix}_{pred}_"
+            f"monotonic_calibrator_v2_{target_mode}_{suffix}_{sigma_tag}_{pred}_"
             f"{cfm.cv_split_tag(cfm.Config)}_fold{fold}_cal{calibration_split}_"
             f"{requested_calibrator}_ckpt{ckpt_tag}.pkl"
         ),
@@ -1462,6 +1483,7 @@ def collect_margin_label_pairs(
     max_samples: int,
     seed: int,
     progress_every: int,
+    use_model_sigma: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     split_year_set = set(int(y) for y in split_years)
@@ -1481,15 +1503,28 @@ def collect_margin_label_pairs(
     model.eval()
     with torch.inference_mode():
         for batch_idx, batch in enumerate(loader):
-            mu_z, truth_z, t = predict_target_field(
-                model,
-                batch,
-                device,
-                target_mode=target_mode,
-                lead_indices=lead_indices,
-                center_idx=center_idx,
-                image_size=cfm.Config.IMAGE_SIZE,
-            )
+            if use_model_sigma:
+                mu_z, truth_z, t, sigma_model = predict_target_field(
+                    model,
+                    batch,
+                    device,
+                    target_mode=target_mode,
+                    lead_indices=lead_indices,
+                    center_idx=center_idx,
+                    image_size=cfm.Config.IMAGE_SIZE,
+                    return_sigma=True,
+                )
+            else:
+                mu_z, truth_z, t = predict_target_field(
+                    model,
+                    batch,
+                    device,
+                    target_mode=target_mode,
+                    lead_indices=lead_indices,
+                    center_idx=center_idx,
+                    image_size=cfm.Config.IMAGE_SIZE,
+                )
+                sigma_model = None
             target_t = int(t) + int(target_center_lead)
             month = int(months[target_t])
             target_year = int(years[target_t])
@@ -1500,7 +1535,7 @@ def collect_margin_label_pairs(
                     f"Calibration/eval pair year leakage for split={split_name}: target_year={target_year}"
                 )
             q = q95_z[month]
-            sig = sigma[month]
+            sig = sigma_model if use_model_sigma else sigma[month]
             valid = mask_np & np.isfinite(mu_z) & np.isfinite(truth_z) & np.isfinite(q) & np.isfinite(sig)
             candidates = np.flatnonzero(valid.ravel())
             if candidates.size == 0:
@@ -1551,9 +1586,11 @@ def load_or_fit_monotonic_calibrator(
     min_month_positives: int,
     seed: int,
     progress_every: int,
+    use_model_sigma: bool = False,
 ) -> Tuple[MarginMonotonicCalibrator, Dict[str, MarginMonotonicCalibrator], List[Dict[str, object]], str]:
     path = monotonic_calibrator_cache_path(
-        target_mode, window_leads, calibration_split, requested_calibrator, checkpoint_path
+        target_mode, window_leads, calibration_split, requested_calibrator, checkpoint_path,
+        use_model_sigma=use_model_sigma,
     )
     os.makedirs(os.path.dirname(path), exist_ok=True)
     calibration_year_set = set(int(y) for y in calibration_years)
@@ -1574,6 +1611,7 @@ def load_or_fit_monotonic_calibrator(
                 and payload.get("target_mode") == target_mode
                 and payload.get("requested_calibrator") == requested_calibrator
                 and payload.get("selector_version") == 2
+                and bool(payload.get("use_model_sigma", False)) == bool(use_model_sigma)
             ):
                 print(f"Loading held-out monotonic calibrator from {path}")
                 return (
@@ -1604,6 +1642,7 @@ def load_or_fit_monotonic_calibrator(
         max_samples,
         seed,
         progress_every,
+        use_model_sigma=use_model_sigma,
     )
     if set(int(y0) for y0 in np.unique(pair_years)) & eval_year_set:
         raise RuntimeError("Eval year appeared in calibration pairs.")
@@ -1647,6 +1686,7 @@ def load_or_fit_monotonic_calibrator(
             "requested_calibrator": requested_calibrator,
             "checkpoint_path": os.path.abspath(checkpoint_path),
             "selector_version": 2,
+            "use_model_sigma": bool(use_model_sigma),
             "inner_selection_rows": inner_selection_rows,
             "selection_reason": selection_reason,
         }, f)
@@ -1857,9 +1897,13 @@ def evaluate(args: argparse.Namespace) -> None:
             f"window_leads={window_leads}, predicted_leads={predicted_leads}, "
             f"center_month_lead={target_center_lead}"
         )
+        if args.use_model_sigma:
+            print("Exceedance probability sigma source: model-predicted distributional sigma")
     else:
         target_center_lead = int(cfm.Config.LEAD_TIME)
         out_dir = ensure_dir(Path(args.output_dir) / args.run_name / eval_split)
+        if args.use_model_sigma:
+            print("Exceedance probability sigma source: model-predicted distributional sigma")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     if device.type == "cuda":
@@ -1997,7 +2041,40 @@ def evaluate(args: argparse.Namespace) -> None:
         min_month_samples=int(args.min_calibration_samples_per_month),
         min_month_positives=int(args.min_calibration_positives_per_month),
         progress_every=int(args.progress_every),
+        use_model_sigma=bool(args.use_model_sigma),
     )
+    fixed_sigma_calibrator = None
+    fixed_sigma_candidates = {}
+    fixed_inner_selection_rows: List[Dict[str, object]] = []
+    fixed_selection_reason = ""
+    if args.use_model_sigma:
+        fixed_sigma_calibrator, fixed_sigma_candidates, fixed_inner_selection_rows, fixed_selection_reason = load_or_fit_monotonic_calibrator(
+            model,
+            calibration_dataset,
+            calibration_split,
+            calibration_years,
+            split_years,
+            q95_z,
+            sigma_clim,
+            months,
+            years,
+            mask_np,
+            device,
+            target_mode,
+            window_leads,
+            lead_indices,
+            center_idx,
+            target_center_lead,
+            ckpt_path,
+            requested_calibrator=str(args.calibrator),
+            max_cases=int(args.max_calibration_cases),
+            max_samples=int(args.max_calibration_samples),
+            seed=int(args.seed) + 907,
+            min_month_samples=int(args.min_calibration_samples_per_month),
+            min_month_positives=int(args.min_calibration_positives_per_month),
+            progress_every=int(args.progress_every),
+            use_model_sigma=False,
+        )
 
     train_dataset_for_old_logistic = select_dataset(
         "train", cfm.Config, shared_data, norm_stats, climo,
@@ -2022,6 +2099,7 @@ def evaluate(args: argparse.Namespace) -> None:
         max_samples=int(args.max_calibration_samples),
         seed=int(args.seed) + 503,
         progress_every=int(args.progress_every),
+        use_model_sigma=bool(args.use_model_sigma),
     )
     old_train_calibrator = fit_margin_monotonic_calibrator(
         train_x,
@@ -2061,6 +2139,8 @@ def evaluate(args: argparse.Namespace) -> None:
         analytic_name = "stage1_mu_sigma_clim"
     old_calibrated_name = "old_train_logistic_margin"
     calibrated_name = "heldout_monotonic_calibrator"
+    fixed_sigma_analytic_name = f"{analytic_name}_cached_sigma"
+    fixed_sigma_calibrated_name = "heldout_monotonic_cached_sigma"
     model_names = [
         reference_name,
         "persistence_init",
@@ -2071,6 +2151,8 @@ def evaluate(args: argparse.Namespace) -> None:
         old_calibrated_name,
         calibrated_name,
     ]
+    if args.use_model_sigma:
+        model_names.extend([fixed_sigma_analytic_name, fixed_sigma_calibrated_name])
     acc = EvaluationAccumulator(model_names, regions)
     daily_compare_acc = (
         EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
@@ -2108,6 +2190,8 @@ def evaluate(args: argparse.Namespace) -> None:
                 model, x_t_dev, x_tm1_dev, x_tm2_dev,
                 spatial_c_dev, vec_c_dev, global_fields_dev, mask_dev, device,
             )
+            raw_model = model.module if hasattr(model, "module") else model
+            sigma_pred = getattr(raw_model, "last_sigma", None)
             if target_mode == "window":
                 idx = torch.as_tensor(lead_indices, device=pred.device, dtype=torch.long)
                 cpu_idx = torch.as_tensor(lead_indices, dtype=torch.long)
@@ -2115,16 +2199,35 @@ def evaluate(args: argparse.Namespace) -> None:
                 truth_z = y[0].index_select(0, cpu_idx)[:, :h, :w].mean(dim=0).numpy().astype(np.float32)
                 center_mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
                 center_truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
+                if args.use_model_sigma:
+                    if sigma_pred is None:
+                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                    sig = sigma_pred[0].index_select(0, idx)[:, :h, :w].float()
+                    sigma_model_z = (torch.sqrt(sig.square().sum(dim=0).clamp_min(1e-8)) / max(len(lead_indices), 1)).detach().cpu().numpy().astype(np.float32)
+                else:
+                    sigma_model_z = None
             elif cfm.Config.MULTI_LEAD_TUBE:
                 mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
                 truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
                 center_mu_z = mu_z
                 center_truth_z = truth_z
+                if args.use_model_sigma:
+                    if sigma_pred is None:
+                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                    sigma_model_z = sigma_pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
+                else:
+                    sigma_model_z = None
             else:
                 mu_z = pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
                 truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
                 center_mu_z = mu_z
                 center_truth_z = truth_z
+                if args.use_model_sigma:
+                    if sigma_pred is None:
+                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                    sigma_model_z = sigma_pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
+                else:
+                    sigma_model_z = None
             if batch_idx == 0:
                 mu_land = mu_z[mask_np & np.isfinite(mu_z)]
                 if mu_land.size:
@@ -2136,11 +2239,18 @@ def evaluate(args: argparse.Namespace) -> None:
                     )
 
             q = q95_z[target_month]
-            sigma = sigma_clim[target_month]
+            sigma = sigma_model_z if args.use_model_sigma else sigma_clim[target_month]
+            fixed_sigma = sigma_clim[target_month]
             truth = (truth_z > q).astype(np.float32)
             truth[~mask_np] = np.nan
             stage1 = normal_cdf((mu_z - q) / np.maximum(sigma, 0.1))
             stage1[~mask_np] = np.nan
+            fixed_stage1 = None
+            fixed_calibrated = None
+            if args.use_model_sigma:
+                fixed_stage1 = normal_cdf((mu_z - q) / np.maximum(fixed_sigma, 0.1))
+                fixed_stage1[~mask_np] = np.nan
+                fixed_calibrated = fixed_sigma_calibrator.predict_grid(mu_z, q, fixed_sigma, target_month, mask_np)
             old_train_calibrated = old_train_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
             calibrated = monotonic_calibrator.predict_grid(mu_z, q, sigma, target_month, mask_np)
             stage1_valid = mask_np & np.isfinite(stage1) & np.isfinite(truth)
@@ -2181,6 +2291,11 @@ def evaluate(args: argparse.Namespace) -> None:
                 old_calibrated_name: stage1,
                 calibrated_name: stage1,
             }
+            if args.use_model_sigma:
+                forecasts[fixed_sigma_analytic_name] = fixed_stage1
+                forecasts[fixed_sigma_calibrated_name] = fixed_calibrated
+                auc_scores[fixed_sigma_analytic_name] = fixed_stage1
+                auc_scores[fixed_sigma_calibrated_name] = fixed_stage1
             if target_mode == "window":
                 forecasts["persistence_init"] = trailing_windowed_exceedance_probability(
                     heat, t, 1, run_start, q95_z, months, norm_stats, mask_np,
@@ -2262,6 +2377,27 @@ def evaluate(args: argparse.Namespace) -> None:
         ],
     )
     write_csv(out_dir / "heldout_monotonic_inner_selection.csv", inner_selection_rows)
+    if args.use_model_sigma and fixed_sigma_calibrator is not None:
+        write_csv(out_dir / "heldout_monotonic_cached_sigma_coefficients.csv", fixed_sigma_calibrator.coefficient_rows())
+        write_csv(
+            out_dir / "heldout_monotonic_cached_sigma_candidates.csv",
+            [
+                {
+                    "candidate": name,
+                    "selected": name == fixed_sigma_calibrator.method,
+                    "selection_reason": fixed_selection_reason if name == fixed_sigma_calibrator.method else "",
+                    "calibration_split": cal.calibration_split,
+                    "n_samples": cal.n_samples,
+                    "event_rate": cal.event_rate,
+                    "calibration_slope": cal.calibration_slope,
+                    "calibration_ece": cal.calibration_ece,
+                    "calibration_brier": cal.calibration_brier,
+                    "month_models": len(cal.by_month),
+                }
+                for name, cal in sorted(fixed_sigma_candidates.items())
+            ],
+        )
+        write_csv(out_dir / "heldout_monotonic_cached_sigma_inner_selection.csv", fixed_inner_selection_rows)
     for name, rows in rel_tables.items():
         write_csv(out_dir / f"reliability_{name}.csv", rows)
     plot_reliability(out_dir / "reliability_diagram.png", rel_tables)
@@ -2269,6 +2405,8 @@ def evaluate(args: argparse.Namespace) -> None:
     stage1 = next(row for row in summary_rows if row["model"] == analytic_name)
     old_train_row = next(row for row in summary_rows if row["model"] == old_calibrated_name)
     calibrated_row = next(row for row in summary_rows if row["model"] == calibrated_name)
+    fixed_stage1_row = next((row for row in summary_rows if row["model"] == fixed_sigma_analytic_name), None)
+    fixed_calibrated_row = next((row for row in summary_rows if row["model"] == fixed_sigma_calibrated_name), None)
     thresholded = next(row for row in summary_rows if row["model"] == thresholded_name)
     climo = next(row for row in summary_rows if row["model"] == reference_name)
     stage1_rel = acc.metrics[analytic_name].rel.table()
@@ -2337,6 +2475,17 @@ def evaluate(args: argparse.Namespace) -> None:
         f"Held-out monotonic BSS vs {reference_name}: "
         f"{calibrated_row['bss_vs_monthly_climo']:+.4f}"
     )
+    if args.use_model_sigma and fixed_stage1_row is not None and fixed_calibrated_row is not None:
+        print(
+            "Cached-sigma analytic comparison: "
+            f"BSS={fixed_stage1_row['bss_vs_monthly_climo']:+.4f}, "
+            f"slope={fixed_stage1_row['reliability_slope']:.3f}, ECE={fixed_stage1_row['ece']:.4f}"
+        )
+        print(
+            "Cached-sigma held-out monotonic comparison: "
+            f"BSS={fixed_calibrated_row['bss_vs_monthly_climo']:+.4f}, "
+            f"slope={fixed_calibrated_row['reliability_slope']:.3f}, ECE={fixed_calibrated_row['ece']:.4f}"
+        )
     print(
         "Thresholded point-model baseline reported: "
         f"Brier={thresholded['brier']:.5f}, BSS={thresholded['bss_vs_monthly_climo']:+.4f}"
@@ -2388,6 +2537,7 @@ def main() -> None:
     parser.add_argument("--prediction_leads", default="12,13,14,15,16,17,18")
     parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
+    parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
     parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="val")

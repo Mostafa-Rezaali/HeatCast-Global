@@ -353,6 +353,8 @@ class MeshFlowNet(nn.Module):
         gradient_loss_weight=0.0,
         enable_exceedance_head=False,
         exceedance_initial_logit=-2.9444389791664403,
+        distributional_head=False,
+        sigma_floor=0.1,
     ):
         super().__init__()
         self.img_channels = img_channels
@@ -368,6 +370,8 @@ class MeshFlowNet(nn.Module):
         self.tube_loss_weights = tuple(float(x) for x in tube_loss_weights)
         self.gradient_loss_weight = float(gradient_loss_weight)
         self.enable_exceedance_head = bool(enable_exceedance_head)
+        self.distributional_head = bool(distributional_head)
+        self.sigma_floor = float(sigma_floor)
         self.last_exceedance_logits = None
 
         if deterministic:
@@ -435,13 +439,14 @@ class MeshFlowNet(nn.Module):
         # large-scale mesh signal. The final layer starts at zero so old
         # checkpoints load safely and begin with identical behavior.
         refine_dim = max(16, min(64, latent_dim // 4))
+        self.refine_channels = 1 if self.distributional_head else img_channels
         self.grid_refiner = nn.Sequential(
-            nn.Conv2d(img_channels, refine_dim, kernel_size=3, padding=1),
+            nn.Conv2d(self.refine_channels, refine_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
             nn.Conv2d(refine_dim, refine_dim, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(refine_dim, img_channels, kernel_size=3, padding=1),
+            nn.Conv2d(refine_dim, self.refine_channels, kernel_size=3, padding=1),
         )
         nn.init.zeros_(self.grid_refiner[-1].weight)
         nn.init.zeros_(self.grid_refiner[-1].bias)
@@ -528,6 +533,11 @@ class MeshFlowNet(nn.Module):
                                     mesh.m2g_edge_index_t, mesh.m2g_edge_attr_t,
                                     t_emb=flat_t_emb)
             out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
+            if self.distributional_head:
+                mean_raw = out[:, :1]
+                var_raw = out[:, 1:2]
+                out = torch.cat([mean_raw + self.grid_refiner(mean_raw), var_raw], dim=1)
+                return out.reshape(B, self.tube_num_leads, self.img_channels, H, W)
             out = out + self.grid_refiner(out)
             return out.reshape(B, self.tube_num_leads, self.img_channels, H, W).squeeze(2)
 
@@ -538,6 +548,11 @@ class MeshFlowNet(nn.Module):
 
         # Phase 3: Reconstruct directly to (H, W). No padding restoration.
         out = flat_to_grid(grid_out, mesh.grid_node_indices, (H, W), fill_value=0.0)
+        if self.distributional_head:
+            mean_raw = out[:, :1]
+            var_raw = out[:, 1:2]
+            out = torch.cat([mean_raw + self.grid_refiner(mean_raw), var_raw], dim=1)
+            return out
         out = out + self.grid_refiner(out)
         return out
 

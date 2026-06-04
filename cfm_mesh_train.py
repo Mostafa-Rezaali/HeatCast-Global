@@ -291,6 +291,10 @@ class Config:
     TUBE_LOSS_WEEKLY_WEIGHT = 0.10
     TUBE_TEMPORAL_HEADS = 4
     GRADIENT_LOSS_WEIGHT = 0.0
+    DISTRIBUTIONAL_HEAD = False
+    CRPS_LOSS = False
+    SIGMA_FLOOR = 0.1
+    MSE_ANCHOR_WEIGHT = 0.0
     ENABLE_EXCEEDANCE_HEAD = False
     EXCEEDANCE_BCE_WEIGHT = 0.0
     EXCEEDANCE_COUNT_WEIGHT = 0.0
@@ -469,7 +473,7 @@ def append_training_metrics(row):
     )
     fieldnames = [
         "run_name", "fold", "epoch", "train_loss", "val_mse", "val_rmse",
-        "val_ssim", "val_r2", "val_tac", "persistence_tac",
+        "val_ssim", "val_r2", "val_tac", "val_sigma_min", "persistence_tac",
         "weekly7_tac", "weekly7_persistence_tac", "weekly7_n_samples",
         "weekly7_mse", "weekly7_persistence_mse",
         "tube_weekly7_tac", "tube_weekly7_persistence_tac", "tube_weekly7_n_samples",
@@ -485,7 +489,7 @@ def append_training_metrics(row):
         "mae", "crps", "mse_skill_vs_persistence", "persistence_r2",
         "persistence_mae", "zero_r2", "train_base_mse",
         "train_anomaly_corr_loss", "train_gradient_loss", "train_exceedance_bce_loss",
-        "train_exceedance_count_loss", "train_extreme_loss", "lr",
+        "train_exceedance_count_loss", "train_extreme_loss", "train_sigma_min", "lr",
         "early_stop_metric", "early_stop_value", "early_stop_best", "early_stop_failures",
     ]
     exists = os.path.exists(path)
@@ -642,11 +646,18 @@ def print_config_banner():
             f"ON (weight={Config.GRADIENT_LOSS_WEIGHT:.2f}; finite-difference dx/dy)"
         )
     if Config.MULTI_LEAD_TUBE:
+        loss_name = "CRPS" if Config.DISTRIBUTIONAL_HEAD and Config.CRPS_LOSS else "MSE"
         print(
             "Tube training loss: "
-            f"{Config.TUBE_LOSS_DAILY_WEIGHT:.2f}*mean_daily_MSE + "
-            f"{Config.TUBE_LOSS_CENTER_WEIGHT:.2f}*center_t+{Config.LEAD_TIME}_MSE + "
-            f"{Config.TUBE_LOSS_WEEKLY_WEIGHT:.2f}*same_init_weekly7_MSE"
+            f"{Config.TUBE_LOSS_DAILY_WEIGHT:.2f}*mean_daily_{loss_name} + "
+            f"{Config.TUBE_LOSS_CENTER_WEIGHT:.2f}*center_t+{Config.LEAD_TIME}_{loss_name} + "
+            f"{Config.TUBE_LOSS_WEEKLY_WEIGHT:.2f}*same_init_weekly7_{loss_name}"
+        )
+    if Config.DISTRIBUTIONAL_HEAD:
+        print(
+            "Distributional head: ON "
+            f"(Gaussian CRPS={Config.CRPS_LOSS}, sigma_floor={Config.SIGMA_FLOOR:.3f}, "
+            f"MSE anchor={Config.MSE_ANCHOR_WEIGHT:.3f})"
         )
     if Config.ENABLE_EXCEEDANCE_HEAD:
         print(
@@ -2111,12 +2122,19 @@ def predict_direct(model, x_t, x_tm1, x_tm2, spatial_c, vec_c, global_fields, ma
     """
     h, w = Config.IMAGE_SIZE
     if Config.DETERMINISTIC:
-        from mode_dispatch import _deterministic_input, _set_exceedance_logits_from_prediction
+        from mode_dispatch import (
+            _deterministic_input,
+            _set_exceedance_logits_from_prediction,
+            split_distributional_prediction,
+        )
         x_input = _deterministic_input(model, x_t, x_tm1, x_tm2, spatial_c)
         dummy_t = torch.full((x_t.shape[0],), 0.5, device=device)
         raw_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
         raw_model = model.module if hasattr(model, "module") else model
-        if getattr(raw_model, "predict_persistence_residual", False):
+        if getattr(raw_model, "distributional_head", False):
+            pred, sigma = split_distributional_prediction(model, raw_pred, x_t)
+            raw_model.last_sigma = sigma.detach()
+        elif getattr(raw_model, "predict_persistence_residual", False):
             pred = x_t + raw_pred
         else:
             pred = raw_pred
@@ -2229,6 +2247,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     month_values = compute_month_array(val_dataset.time_values) if exceedance_enabled else None
 
     all_preds = []
+    all_sigmas = []
     all_truth = []
     all_persist = []
     all_target_doys = []
@@ -2253,9 +2272,13 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         # Single forward pass
         pred = predict_direct(model, x_t_dev, x_tm1_dev, x_tm2_dev,
                               spatial_c_dev, vec_c_dev, global_fields_dev, mask_dev, device)
+        raw_model = model.module if hasattr(model, "module") else model
+        sigma_pred = getattr(raw_model, "last_sigma", None)
 
         if tube_mode:
             all_preds.append(pred[0, tube_center_idx, :h, :w].cpu())
+            if sigma_pred is not None:
+                all_sigmas.append(sigma_pred[0, tube_center_idx, :h, :w].cpu())
             all_truth.append(y[tube_center_idx, :h, :w].cpu())
             center_truth_for_exceedance = y[tube_center_idx, :h, :w]
             if stream_tube_stats:
@@ -2300,6 +2323,8 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
                 tube_weekly7_samples += 1
         else:
             all_preds.append(pred[0, 0, :h, :w].cpu())
+            if sigma_pred is not None:
+                all_sigmas.append(sigma_pred[0, 0, :h, :w].cpu())
             all_truth.append(y[0, :h, :w].cpu())
             center_truth_for_exceedance = y[0, :h, :w]
         if exceedance_enabled:
@@ -2332,6 +2357,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         all_target_doys.append(int(val_dataset.doy_values[target_time_idx]))
 
     local_preds = torch.stack(all_preds)
+    local_sigmas = torch.stack(all_sigmas) if all_sigmas else None
     local_truth = torch.stack(all_truth)
     local_persist = torch.stack(all_persist)
     local_target_doys = torch.tensor(all_target_doys, dtype=torch.long)
@@ -2340,6 +2366,8 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
 
     if ddp:
         local_preds = local_preds.to(device)
+        if local_sigmas is not None:
+            local_sigmas = local_sigmas.to(device)
         local_truth = local_truth.to(device)
         local_persist = local_persist.to(device)
         local_target_doys = local_target_doys.to(device)
@@ -2347,6 +2375,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         local_init_time_indices = local_init_time_indices.to(device)
 
         gathered_preds = [torch.zeros_like(local_preds) for _ in range(world_size)]
+        gathered_sigmas = [torch.zeros_like(local_sigmas) for _ in range(world_size)] if local_sigmas is not None else None
         gathered_truth = [torch.zeros_like(local_truth) for _ in range(world_size)]
         gathered_persist = [torch.zeros_like(local_persist) for _ in range(world_size)]
         gathered_target_doys = [torch.zeros_like(local_target_doys) for _ in range(world_size)]
@@ -2358,6 +2387,8 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         ]
 
         dist.all_gather(gathered_preds, local_preds)
+        if local_sigmas is not None:
+            dist.all_gather(gathered_sigmas, local_sigmas)
         dist.all_gather(gathered_truth, local_truth)
         dist.all_gather(gathered_persist, local_persist)
         dist.all_gather(gathered_target_doys, local_target_doys)
@@ -2365,6 +2396,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         dist.all_gather(gathered_init_time_indices, local_init_time_indices)
 
         all_preds = torch.cat(gathered_preds, dim=0).cpu()
+        all_sigmas = torch.cat(gathered_sigmas, dim=0).cpu() if gathered_sigmas is not None else None
         all_truth = torch.cat(gathered_truth, dim=0).cpu()
         all_persist = torch.cat(gathered_persist, dim=0).cpu()
         all_target_doys = torch.cat(gathered_target_doys, dim=0).cpu().numpy()
@@ -2372,6 +2404,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         all_init_time_indices = torch.cat(gathered_init_time_indices, dim=0).cpu().numpy()
     else:
         all_preds = local_preds.cpu()
+        all_sigmas = local_sigmas.cpu() if local_sigmas is not None else None
         all_truth = local_truth.cpu()
         all_persist = local_persist.cpu()
         all_target_doys = local_target_doys.cpu().numpy()
@@ -2412,9 +2445,13 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         return 0.0, 0.0, 0.0, {}
 
     all_preds = all_preds.unsqueeze(1)
+    if all_sigmas is not None:
+        all_sigmas = all_sigmas.unsqueeze(1)
     all_truth = all_truth.unsqueeze(1)
     all_persist = all_persist.unsqueeze(1)
     all_preds = torch.nan_to_num(all_preds, nan=0.0, posinf=0.0, neginf=0.0)
+    if all_sigmas is not None:
+        all_sigmas = torch.nan_to_num(all_sigmas, nan=float(Config.SIGMA_FLOOR), posinf=float(Config.SIGMA_FLOOR), neginf=float(Config.SIGMA_FLOOR))
     all_truth = torch.nan_to_num(all_truth, nan=0.0, posinf=0.0, neginf=0.0)
     all_persist = torch.nan_to_num(all_persist, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -2449,6 +2486,17 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
     ).item()
 
     improved = calculate_improved_metrics(all_preds_eval, all_truth_eval, mask=mask_2d)
+    if all_sigmas is not None:
+        sigma_eval = torch.clamp(all_sigmas.to(dtype=all_preds_eval.dtype), min=float(Config.SIGMA_FLOOR))
+        mask_eval = mask_2d.unsqueeze(0).unsqueeze(0).expand_as(all_preds_eval)
+        w_crps = (all_truth_eval - all_preds_eval) / sigma_eval
+        phi = torch.exp(-0.5 * w_crps.square()) / math.sqrt(2.0 * math.pi)
+        Phi = 0.5 * (1.0 + torch.erf(w_crps / math.sqrt(2.0)))
+        crps_map = sigma_eval * (w_crps * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / math.sqrt(math.pi))
+        improved["crps"] = float((crps_map * mask_eval).sum().item() / mask_eval.sum().clamp_min(1.0).item())
+        improved["sigma_min"] = float(sigma_eval.min().item())
+    else:
+        improved["sigma_min"] = float("nan")
     persistence = calculate_improved_metrics(all_persist, all_truth_eval, mask=mask_2d)
     zero_baseline = calculate_improved_metrics(torch.zeros_like(all_truth_eval), all_truth_eval, mask=mask_2d)
     persistence_mse = masked_mse_value(all_persist, all_truth_eval, mask=mask_2d)
@@ -2560,6 +2608,7 @@ def calculate_validation_metrics_cfm(model, val_dataset, device, mask,
         'r2':                improved['r2'],
         'mae':               improved['mae'],
         'crps':              improved['crps'],
+        'sigma_min':         improved.get('sigma_min', float("nan")),
         'pred_spatial_std':  improved['pred_spatial_std'],
         'truth_spatial_std': improved['truth_spatial_std'],
         'persistence_r2':    persistence['r2'],
@@ -3890,7 +3939,11 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
             float(Config.EXCEEDANCE_INITIAL_PROB)
             / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
         ),
+        distributional_head=Config.DISTRIBUTIONAL_HEAD,
+        sigma_floor=Config.SIGMA_FLOOR,
     ).to(device)
+    model.crps_loss = bool(Config.CRPS_LOSS)
+    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
     model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
     model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
     model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
@@ -3992,6 +4045,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         epoch_gradient_loss = 0.0
         epoch_exceedance_bce_loss = 0.0
         epoch_exceedance_count_loss = 0.0
+        epoch_sigma_min = float("inf")
         n_good_batches = 0
         consecutive_skips = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", disable=not is_main_process(),
@@ -4048,10 +4102,17 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     exceedance_bce_val = components['exceedance_bce_loss'].item()
                 if components.get('exceedance_count_loss', None) is not None:
                     exceedance_count_val = components['exceedance_count_loss'].item()
+                if components.get('sigma_min', None) is not None:
+                    try:
+                        epoch_sigma_min = min(epoch_sigma_min, float(components['sigma_min'].item()))
+                    except Exception:
+                        pass
                 if 'recon_mse' in components:
                     base_mse_val = components['recon_mse'].item()
                 if Config.MULTI_LEAD_TUBE and 'tube_daily_mse' in components:
                     base_mse_val = components['tube_daily_mse'].item()
+                if Config.DISTRIBUTIONAL_HEAD and 'tube_daily_crps' in components:
+                    base_mse_val = components['tube_daily_crps'].item()
                 if Config.USE_ANOMALY_CORR_LOSS:
                     pred_for_corr = components.get('pred', None)
                     climo = batch_target_climatology(t_indices, train_dataset, device)
@@ -4149,6 +4210,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     postfix["grad"] = f"{gradient_loss_val:.4f}"
                 if Config.ENABLE_EXCEEDANCE_HEAD:
                     postfix["bce"] = f"{exceedance_bce_val:.4f}"
+                if Config.DISTRIBUTIONAL_HEAD and np.isfinite(epoch_sigma_min):
+                    postfix["sigmin"] = f"{epoch_sigma_min:.3f}"
                 if Config.USE_EXTREME_LOSS:
                     postfix["ext"] = f"{ext_loss_val:.4f}"
                 pbar.set_postfix(postfix)
@@ -4160,6 +4223,11 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
 
         if n_good_batches == 0 and is_main_process():
             print(f"\n  *** ALERT: Epoch {epoch+1} - ALL batches had NaN/Inf loss! ***")
+
+        if Config.DISTRIBUTIONAL_HEAD and ddp:
+            sigma_tensor = torch.tensor([epoch_sigma_min], device=device, dtype=torch.float32)
+            dist.all_reduce(sigma_tensor, op=dist.ReduceOp.MIN)
+            epoch_sigma_min = float(sigma_tensor.item())
 
         if (epoch + 1) % Config.CHECKPOINT_FREQ == 0:
             torch.cuda.empty_cache()
@@ -4202,10 +4270,14 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     print(f"  Train Base MSE:    {avg_base_mse:.6f}")
                     print(f"  Anom Corr Loss:    {avg_anom_corr:.6f}")
                 elif Config.MULTI_LEAD_TUBE:
-                    print(f"  Train Daily MSE:   {avg_base_mse:.6f}")
+                    train_metric_name = "CRPS" if Config.DISTRIBUTIONAL_HEAD and Config.CRPS_LOSS else "MSE"
+                    print(f"  Train Daily {train_metric_name}:   {avg_base_mse:.6f}")
                 else:
-                    print(f"  Train Recon MSE:   {avg_base_mse:.6f}")
+                    train_metric_name = "CRPS" if Config.DISTRIBUTIONAL_HEAD and Config.CRPS_LOSS else "MSE"
+                    print(f"  Train Recon {train_metric_name}:   {avg_base_mse:.6f}")
                     avg_anom_corr = ""
+                if Config.DISTRIBUTIONAL_HEAD:
+                    print(f"  Min Sigma:         {epoch_sigma_min:.6f}")
                 if Config.GRADIENT_LOSS_WEIGHT > 0.0:
                     print(f"  Gradient Loss:     {avg_gradient:.6f}")
                 else:
@@ -4247,6 +4319,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     print(f"  Exceedance Rate:   truth={improved_metrics['exceedance_base_rate']:.4f}, pred={improved_metrics['exceedance_pred_rate']:.4f}")
                 print(f"  MAE:               {improved_metrics['mae']:.4f}")
                 print(f"  CRPS:              {improved_metrics['crps']:.4f}")
+                if Config.DISTRIBUTIONAL_HEAD:
+                    print(f"  Val Min Sigma:     {improved_metrics['sigma_min']:.6f}")
                 print(f"  LR:                {scheduler.get_last_lr()[0]:.2e}")
 
                 val_r2 = improved_metrics["r2"]
@@ -4290,6 +4364,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "val_ssim": val_ssim,
                     "val_r2": improved_metrics["r2"],
                     "val_tac": val_tac,
+                    "val_sigma_min": improved_metrics.get("sigma_min", ""),
                     "persistence_tac": improved_metrics["persistence_tac"],
                     "weekly7_tac": improved_metrics["weekly7_tac"],
                     "weekly7_persistence_tac": improved_metrics["weekly7_persistence_tac"],
@@ -4326,6 +4401,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "train_exceedance_bce_loss": avg_exceedance_bce,
                     "train_exceedance_count_loss": avg_exceedance_count,
                     "train_extreme_loss": avg_ext,
+                    "train_sigma_min": epoch_sigma_min if Config.DISTRIBUTIONAL_HEAD else "",
                     "lr": scheduler.get_last_lr()[0],
                     "early_stop_metric": Config.EARLY_STOP_METRIC,
                     "early_stop_value": monitor_value,
@@ -4349,6 +4425,10 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "early_stop_metric": Config.EARLY_STOP_METRIC,
                     "early_stop_best": early_stop_best,
                     "early_stop_failures": early_stop_failures,
+                    "distributional_head": bool(Config.DISTRIBUTIONAL_HEAD),
+                    "crps_loss": bool(Config.CRPS_LOSS),
+                    "sigma_floor": float(Config.SIGMA_FLOOR),
+                    "image_channels": int(Config.IMAGE_CHANNELS),
                 }
                 torch.save(ckpt, os.path.join(Config.CHECKPOINT_DIR,
                                                f"checkpoint_epoch_{epoch+1:04d}.pth"))
@@ -4437,6 +4517,14 @@ def main():
                        help='Number of attention heads for temporal mesh attention in tube mode.')
     parser.add_argument('--gradient_loss_weight', type=float, default=None,
                        help='Blend weight for masked spatial finite-difference gradient loss.')
+    parser.add_argument('--distributional_head', action='store_true',
+                       help='Use a two-channel mean/sigma head for deterministic direct prediction.')
+    parser.add_argument('--crps_loss', action='store_true',
+                       help='Train the distributional head with closed-form Gaussian CRPS.')
+    parser.add_argument('--sigma_floor', type=float, default=None,
+                       help='Minimum predictive sigma in z-units for the distributional head.')
+    parser.add_argument('--mse_anchor_weight', type=float, default=None,
+                       help='Optional MSE anchor weight on the distributional mean; default 0.')
     parser.add_argument('--enable_exceedance_head', action='store_true',
                        help='Enable Stage 2 month-q95 exceedance logit head and exceedance validation.')
     parser.add_argument('--exceedance_bce_weight', type=float, default=None,
@@ -4568,6 +4656,19 @@ def main():
         if args.gradient_loss_weight < 0.0 or args.gradient_loss_weight >= 1.0:
             raise ValueError("--gradient_loss_weight must be in [0, 1).")
         Config.GRADIENT_LOSS_WEIGHT = float(args.gradient_loss_weight)
+    if args.distributional_head:
+        Config.DISTRIBUTIONAL_HEAD = True
+        Config.IMAGE_CHANNELS = 2
+    if args.crps_loss:
+        Config.CRPS_LOSS = True
+    if args.sigma_floor is not None:
+        if args.sigma_floor <= 0.0:
+            raise ValueError("--sigma_floor must be positive.")
+        Config.SIGMA_FLOOR = float(args.sigma_floor)
+    if args.mse_anchor_weight is not None:
+        if args.mse_anchor_weight < 0.0:
+            raise ValueError("--mse_anchor_weight must be non-negative.")
+        Config.MSE_ANCHOR_WEIGHT = float(args.mse_anchor_weight)
     if args.enable_exceedance_head:
         Config.ENABLE_EXCEEDANCE_HEAD = True
     if args.exceedance_bce_weight is not None:
@@ -4643,6 +4744,17 @@ def main():
             raise ValueError("--exceedance_focal_gamma must be non-negative.")
         if not (0.0 < Config.EXCEEDANCE_INITIAL_PROB < 1.0):
             raise ValueError("--exceedance_initial_prob must be in (0, 1).")
+    if Config.CRPS_LOSS and not Config.DISTRIBUTIONAL_HEAD:
+        raise RuntimeError("--crps_loss requires --distributional_head.")
+    if Config.DISTRIBUTIONAL_HEAD:
+        if not Config.DETERMINISTIC:
+            raise RuntimeError("--distributional_head is deterministic-direct only.")
+        if Config.ENABLE_EXCEEDANCE_HEAD:
+            raise RuntimeError("--distributional_head cannot be combined with --enable_exceedance_head.")
+        if Config.IMAGE_CHANNELS != 2:
+            raise RuntimeError("Distributional head requires Config.IMAGE_CHANNELS=2.")
+        if Config.SIGMA_FLOOR <= 0.0:
+            raise ValueError("SIGMA_FLOOR must be positive.")
     if str(Config.EARLY_STOP_METRIC).lower() == "exceedance_bss" and not Config.ENABLE_EXCEEDANCE_HEAD:
         raise RuntimeError("--early_stop_metric exceedance_bss requires --enable_exceedance_head.")
 
@@ -4658,6 +4770,13 @@ def main():
             "PREDICT_PERSISTENCE_RESIDUAL requires the full daily z-score target. "
             "Set TRAIN_ON_CLIMATOLOGY_ANOMALIES=False."
         )
+    if Config.DISTRIBUTIONAL_HEAD and Config.CRPS_LOSS:
+        from mode_dispatch import gaussian_crps_numerical_check
+        crps_err = gaussian_crps_numerical_check(num_points=16, num_samples=50000, seed=Config.SEED, device="cpu")
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+            print(f"Gaussian CRPS numerical check abs error: {crps_err:.6f}")
+        if crps_err > 1e-4:
+            raise RuntimeError(f"Gaussian CRPS numerical check failed: abs error {crps_err:.6f} > 1e-4")
     print_config_banner()
     if args.dry_run and is_main_process():
         print("Dry run: 1 epoch, batch size 1, 2 train batches, 4 validation samples.")
@@ -4735,6 +4854,12 @@ def _checkpoint_list(primary_checkpoint, ensemble_checkpoints, ensemble_top_k=3)
 
 
 def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if bool(checkpoint.get("distributional_head", False)) or int(checkpoint.get("image_channels", Config.IMAGE_CHANNELS)) == 2:
+        Config.DISTRIBUTIONAL_HEAD = True
+        Config.IMAGE_CHANNELS = 2
+        Config.CRPS_LOSS = bool(checkpoint.get("crps_loss", Config.CRPS_LOSS))
+        Config.SIGMA_FLOOR = float(checkpoint.get("sigma_floor", Config.SIGMA_FLOOR))
     model = MeshFlowNet(
         img_channels=Config.IMAGE_CHANNELS,
         spatial_cond_channels=Config.NUM_SPATIAL_CONDITIONS,
@@ -4763,13 +4888,16 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
             float(Config.EXCEEDANCE_INITIAL_PROB)
             / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
         ),
+        distributional_head=Config.DISTRIBUTIONAL_HEAD,
+        sigma_floor=Config.SIGMA_FLOOR,
     ).to(device)
+    model.crps_loss = bool(Config.CRPS_LOSS)
+    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
     model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
     model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
     model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
     model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
     state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
     if state_dict is None:
         raise KeyError(f"Checkpoint {checkpoint_path} has no model_state_dict or ema_state_dict")
@@ -4937,6 +5065,12 @@ def _test(args):
     conus_mask = load_conus_mask(Config)
 
     mesh = build_mesh_once(Config, conus_mask, device, ddp=False)
+    checkpoint = torch.load(Config.MODEL_SAVE_PATH, map_location=device)
+    if bool(checkpoint.get("distributional_head", False)) or int(checkpoint.get("image_channels", Config.IMAGE_CHANNELS)) == 2:
+        Config.DISTRIBUTIONAL_HEAD = True
+        Config.IMAGE_CHANNELS = 2
+        Config.CRPS_LOSS = bool(checkpoint.get("crps_loss", Config.CRPS_LOSS))
+        Config.SIGMA_FLOOR = float(checkpoint.get("sigma_floor", Config.SIGMA_FLOOR))
 
     model = MeshFlowNet(
         img_channels=Config.IMAGE_CHANNELS,
@@ -4966,13 +5100,16 @@ def _test(args):
             float(Config.EXCEEDANCE_INITIAL_PROB)
             / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
         ),
+        distributional_head=Config.DISTRIBUTIONAL_HEAD,
+        sigma_floor=Config.SIGMA_FLOOR,
     ).to(device)
+    model.crps_loss = bool(Config.CRPS_LOSS)
+    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
     model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
     model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
     model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
     model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
 
-    checkpoint = torch.load(Config.MODEL_SAVE_PATH, map_location=device)
     state_dict = checkpoint.get('ema_state_dict', checkpoint['model_state_dict'])
     if list(state_dict.keys())[0].startswith('module.'):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}

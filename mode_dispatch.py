@@ -61,6 +61,22 @@ def _gradient_loss_weight(model):
     return float(getattr(_raw_model(model), "gradient_loss_weight", 0.0))
 
 
+def _distributional_head(model):
+    return bool(getattr(_raw_model(model), "distributional_head", False))
+
+
+def _crps_loss_enabled(model):
+    return bool(getattr(_raw_model(model), "crps_loss", False))
+
+
+def _sigma_floor(model):
+    return float(getattr(_raw_model(model), "sigma_floor", 0.1))
+
+
+def _mse_anchor_weight(model):
+    return float(getattr(_raw_model(model), "mse_anchor_weight", 0.0))
+
+
 def _enable_exceedance_head(model):
     return bool(getattr(_raw_model(model), "enable_exceedance_head", False))
 
@@ -96,6 +112,72 @@ def spatial_gradient_loss(pred, target, mask):
     loss_y = ((dy_pred - dy_true).square() * mask_y).sum() / mask_y.sum().clamp_min(1.0)
     loss_x = ((dx_pred - dx_true).square() * mask_x).sum() / mask_x.sum().clamp_min(1.0)
     return loss_y + loss_x
+
+
+def split_distributional_prediction(model, raw_pred, x_t):
+    """Return persistence-adjusted mean and positive sigma from a two-channel raw output."""
+    floor = _sigma_floor(model)
+    if raw_pred.ndim == 5:
+        if raw_pred.shape[2] != 2:
+            raise RuntimeError(f"Distributional tube output must be (B,L,2,H,W), got {tuple(raw_pred.shape)}")
+        mean_raw = raw_pred[:, :, 0]
+        sigma_raw = raw_pred[:, :, 1]
+        persistence = x_t if x_t.ndim == 4 else x_t.unsqueeze(1)
+        mean = persistence + mean_raw if _predicts_persistence_residual(model) else mean_raw
+    elif raw_pred.ndim == 4:
+        if raw_pred.shape[1] != 2:
+            raise RuntimeError(f"Distributional output must be (B,2,H,W), got {tuple(raw_pred.shape)}")
+        mean_raw = raw_pred[:, 0:1]
+        sigma_raw = raw_pred[:, 1:2]
+        mean = x_t + mean_raw if _predicts_persistence_residual(model) else mean_raw
+    else:
+        raise RuntimeError(f"Unsupported distributional output shape: {tuple(raw_pred.shape)}")
+    sigma = F.softplus(sigma_raw) + float(floor)
+    raw = _raw_model(model)
+    raw.last_sigma = sigma.detach()
+    raw.last_sigma_min = float(sigma.detach().amin().item())
+    return mean, sigma
+
+
+def gaussian_crps(mean, sigma, target, mask):
+    """Closed-form Gaussian CRPS, masked to land pixels."""
+    sigma = sigma.clamp_min(1e-6)
+    target = target.to(device=mean.device, dtype=mean.dtype)
+    mask_expanded = mask.to(device=mean.device, dtype=mean.dtype).expand_as(mean)
+    valid = mask_expanded > 0.5
+    if not valid.any():
+        return mean.sum() * 0.0
+    w = (target - mean) / sigma
+    phi = torch.exp(-0.5 * w.square()) / np.sqrt(2.0 * np.pi)
+    Phi = 0.5 * (1.0 + torch.erf(w / np.sqrt(2.0)))
+    crps = sigma * (w * (2.0 * Phi - 1.0) + 2.0 * phi - 1.0 / np.sqrt(np.pi))
+    return (crps * mask_expanded).sum() / mask_expanded.sum().clamp_min(1.0)
+
+
+def gaussian_crps_numerical_check(num_points=16, num_samples=40001, seed=123, device="cpu"):
+    """Deterministic quadrature check for random scalar Gaussian CRPS."""
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed))
+    mean = torch.randn(int(num_points), device=device, generator=gen)
+    sigma = F.softplus(torch.randn(int(num_points), device=device, generator=gen)) + 0.1
+    y = torch.randn(int(num_points), device=device, generator=gen)
+    analytic = gaussian_crps(
+        mean.view(1, 1, -1),
+        sigma.view(1, 1, -1),
+        y.view(1, 1, -1),
+        torch.ones(1, 1, int(num_points), device=device),
+    )
+    vals = []
+    n = int(num_samples)
+    for i in range(int(num_points)):
+        lo = min(float(mean[i] - 10.0 * sigma[i]), float(y[i] - 10.0 * sigma[i]))
+        hi = max(float(mean[i] + 10.0 * sigma[i]), float(y[i] + 10.0 * sigma[i]))
+        grid = torch.linspace(lo, hi, n, device=device)
+        cdf = 0.5 * (1.0 + torch.erf((grid - mean[i]) / (sigma[i] * np.sqrt(2.0))))
+        obs = (grid >= y[i]).to(dtype=grid.dtype)
+        vals.append(torch.trapz((cdf - obs).square(), grid))
+    brute = torch.stack(vals).mean()
+    return float((analytic - brute).abs().item())
 
 
 def exceedance_losses(model, y, mask, exceedance_thresholds):
@@ -252,9 +334,15 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
     dummy_t = torch.full((y.shape[0],), 0.5, device=device)
 
     raw_pred = model(x_input, dummy_t, vec_c, global_fields=global_fields)
-    pred = x_t + raw_pred if _predicts_persistence_residual(model) else raw_pred
+    if _distributional_head(model):
+        pred, sigma = split_distributional_prediction(model, raw_pred, x_t)
+    else:
+        pred = x_t + raw_pred if _predicts_persistence_residual(model) else raw_pred
+        sigma = None
     _set_exceedance_logits_from_prediction(model, pred)
     gradient_weight = _gradient_loss_weight(model)
+    use_crps = _distributional_head(model) and _crps_loss_enabled(model)
+    mse_anchor_weight = _mse_anchor_weight(model)
     exceedance_enabled = _enable_exceedance_head(model)
     exceedance_bce_weight, exceedance_count_weight, _, _ = _exceedance_loss_weights(model)
     zero = torch.tensor(0.0, device=device)
@@ -266,21 +354,40 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
         valid = mask_expanded > 0.5
         if valid.any():
             daily_mse = ((pred - y).square() * mask_expanded).sum() / mask_expanded.sum().clamp_min(1.0)
+            daily_crps = gaussian_crps(pred, sigma, y, mask) if use_crps else daily_mse
             center_idx = _tube_center_index(model)
             center_pred = pred[:, center_idx:center_idx + 1]
             center_truth = y[:, center_idx:center_idx + 1]
             center_mask = mask.expand_as(center_pred)
             center_mse = ((center_pred - center_truth).square() * center_mask).sum() / center_mask.sum().clamp_min(1.0)
+            center_crps = (
+                gaussian_crps(center_pred, sigma[:, center_idx:center_idx + 1], center_truth, mask)
+                if use_crps else center_mse
+            )
             weekly_pred = pred.mean(dim=1, keepdim=True)
             weekly_truth = y.mean(dim=1, keepdim=True)
             weekly_mask = mask.expand_as(weekly_pred)
             weekly_mse = ((weekly_pred - weekly_truth).square() * weekly_mask).sum() / weekly_mask.sum().clamp_min(1.0)
+            if use_crps:
+                n_leads = max(int(sigma.shape[1]), 1)
+                weekly_sigma = torch.sqrt((sigma.square().mean(dim=1, keepdim=True) / n_leads).clamp_min(1e-8))
+                weekly_crps = gaussian_crps(weekly_pred, weekly_sigma, weekly_truth, mask)
+            else:
+                weekly_crps = weekly_mse
         else:
             daily_mse = pred.sum() * 0.0
+            daily_crps = daily_mse
             center_mse = daily_mse
+            center_crps = daily_mse
             weekly_mse = daily_mse
+            weekly_crps = daily_mse
         w_daily, w_center, w_weekly = _tube_loss_weights(model)
-        base_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
+        if use_crps:
+            base_loss = w_daily * daily_crps + w_center * center_crps + w_weekly * weekly_crps
+            if mse_anchor_weight > 0.0:
+                base_loss = base_loss + mse_anchor_weight * daily_mse
+        else:
+            base_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
         grad_loss = spatial_gradient_loss(pred, y, mask) if gradient_weight > 0.0 else zero
         total_loss = (1.0 - gradient_weight) * base_loss + gradient_weight * grad_loss
         exceedance_bce = zero
@@ -298,21 +405,28 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
             "tube_daily_mse": daily_mse.detach(),
             "tube_center_mse": center_mse.detach(),
             "tube_weekly_mse": weekly_mse.detach(),
+            "tube_daily_crps": daily_crps.detach(),
+            "tube_center_crps": center_crps.detach(),
+            "tube_weekly_crps": weekly_crps.detach(),
             "gradient_loss": grad_loss,
             "exceedance_bce_loss": exceedance_bce,
             "exceedance_count_loss": exceedance_count,
             "residual_abs": raw_pred.detach().abs().mean(),
+            "sigma_min": sigma.detach().amin() if sigma is not None else zero,
             "loss_t<0.33": zero,
             "loss_0.33<t<0.67": zero,
             "loss_t>0.67": zero,
             "pred": pred,
+            "sigma": sigma,
         }
 
     mask_expanded = mask.expand_as(pred)
     valid = mask_expanded > 0.5
     if valid.any():
-        total_loss = F.huber_loss(pred[valid], y[valid], delta=2.0)
+        total_loss = gaussian_crps(pred, sigma, y, mask) if use_crps else F.huber_loss(pred[valid], y[valid], delta=2.0)
         recon_mse = F.mse_loss(pred[valid], y[valid])
+        if use_crps and mse_anchor_weight > 0.0:
+            total_loss = total_loss + mse_anchor_weight * recon_mse
     else:
         total_loss = pred.sum() * 0.0
         recon_mse = total_loss.detach()
@@ -335,10 +449,12 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
         "exceedance_bce_loss": exceedance_bce,
         "exceedance_count_loss": exceedance_count,
         "residual_abs": raw_pred.detach().abs().mean(),
+        "sigma_min": sigma.detach().amin() if sigma is not None else zero,
         "loss_t<0.33": zero,
         "loss_0.33<t<0.67": zero,
         "loss_t>0.67": zero,
         "pred": pred,  # prediction tensor for extreme loss
+        "sigma": sigma,
     }
 
 
@@ -351,9 +467,15 @@ def generate_deterministic_sample(model, spatial_c, vec_c, x_t, x_tm1, x_tm2,
     dummy_t = torch.full((1,), 0.5, device=device)
 
     raw_hat = model(x_input, dummy_t, vec_c, global_fields=global_fields)
-    y_hat = x_t + raw_hat if _predicts_persistence_residual(model) else raw_hat
+    if _distributional_head(model):
+        y_hat, sigma = split_distributional_prediction(model, raw_hat, x_t)
+    else:
+        y_hat = x_t + raw_hat if _predicts_persistence_residual(model) else raw_hat
+        sigma = None
     y_hat = y_hat * mask + OCEAN_FILL * (1 - mask)
     y_hat = y_hat.clamp(-4.0, 4.0)
+    if sigma is not None:
+        _raw_model(model).last_sigma = sigma.detach()
 
     if _multi_lead_tube(model):
         center_idx = _tube_center_index(model)
