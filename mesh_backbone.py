@@ -56,7 +56,16 @@ class ContinuousTimeEmbedding(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, num_layers=2, residual=True, dropout=0.0):
+    def __init__(
+        self,
+        in_dim,
+        hidden_dim,
+        out_dim,
+        num_layers=2,
+        residual=True,
+        dropout=0.0,
+        final_norm=True,
+    ):
         super().__init__()
         self.residual = residual and (in_dim == out_dim)
         layers = []
@@ -68,9 +77,9 @@ class MLP(nn.Module):
                 if dropout > 0:
                     layers.append(nn.Dropout(dropout))
         self.net = nn.Sequential(*layers)
-        # LayerNorm(1) kills the output (normalizes a scalar to 0).
-        # Skip it for 1-d outputs (i.e. the final prediction head).
-        self.norm = nn.LayerNorm(out_dim) if out_dim > 1 else nn.Identity()
+        # Prediction heads must remain unconstrained: normalizing a two-channel
+        # mean/variance output couples the channels and creates mesh-shaped flips.
+        self.norm = nn.LayerNorm(out_dim) if final_norm and out_dim > 1 else nn.Identity()
 
     def forward(self, x):
         out = self.net(x)
@@ -247,7 +256,15 @@ class Mesh2GridDecoder(nn.Module):
             )
         else:
             self.time_film = None
-        self.output_mlp = MLP(latent_dim, hidden_dim, output_dim, num_layers=2, residual=False, dropout=dropout)
+        self.output_mlp = MLP(
+            latent_dim,
+            hidden_dim,
+            output_dim,
+            num_layers=2,
+            residual=False,
+            dropout=dropout,
+            final_norm=False,
+        )
 
     def forward(self, mesh_features, grid_skip, m2g_edge_index, m2g_edge_attr, t_emb=None):
         B = mesh_features.shape[0]
