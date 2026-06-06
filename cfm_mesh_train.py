@@ -4429,6 +4429,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     "crps_loss": bool(Config.CRPS_LOSS),
                     "sigma_floor": float(Config.SIGMA_FLOOR),
                     "image_channels": int(Config.IMAGE_CHANNELS),
+                    "multi_lead_tube": bool(Config.MULTI_LEAD_TUBE),
+                    "prediction_leads": tuple(int(x) for x in prediction_leads(Config)),
                 }
                 torch.save(ckpt, os.path.join(Config.CHECKPOINT_DIR,
                                                f"checkpoint_epoch_{epoch+1:04d}.pth"))
@@ -4855,6 +4857,32 @@ def _checkpoint_list(primary_checkpoint, ensemble_checkpoints, ensemble_top_k=3)
 
 def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
+    if state_dict is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} has no model_state_dict or ema_state_dict")
+    first_key = next(iter(state_dict))
+    if first_key.startswith('module.'):
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+    checkpoint_tube = bool(checkpoint.get("multi_lead_tube", False))
+    if not checkpoint_tube:
+        checkpoint_tube = any(
+            key.startswith(("lead_embedding.", "lead_time_proj.", "tube_temporal_"))
+            for key in state_dict
+        )
+    if checkpoint_tube:
+        Config.MULTI_LEAD_TUBE = True
+        saved_leads = checkpoint.get("prediction_leads")
+        if saved_leads is not None:
+            Config.PREDICTION_LEADS = tuple(int(x) for x in saved_leads)
+        lead_weight = state_dict.get("lead_embedding.weight")
+        if lead_weight is not None and len(prediction_leads(Config)) != int(lead_weight.shape[0]):
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} contains {int(lead_weight.shape[0])} tube leads, "
+                f"but configured prediction leads are {prediction_leads(Config)}. "
+                "Pass the checkpoint's exact --prediction_leads."
+            )
+
     if bool(checkpoint.get("distributional_head", False)) or int(checkpoint.get("image_channels", Config.IMAGE_CHANNELS)) == 2:
         Config.DISTRIBUTIONAL_HEAD = True
         Config.IMAGE_CHANNELS = 2
@@ -4898,12 +4926,6 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
     model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
     model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
 
-    state_dict = checkpoint.get('ema_state_dict', checkpoint.get('model_state_dict'))
-    if state_dict is None:
-        raise KeyError(f"Checkpoint {checkpoint_path} has no model_state_dict or ema_state_dict")
-    first_key = next(iter(state_dict))
-    if first_key.startswith('module.'):
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if Config.MULTI_LEAD_TUBE and any(
         key.startswith(("lead_", "tube_")) for key in missing

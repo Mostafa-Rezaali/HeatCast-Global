@@ -115,6 +115,47 @@ def checkpoint_path_for(run_name: str, checkpoint: str) -> str:
     )
 
 
+def configure_structure_from_checkpoint(checkpoint_path: str, prediction_leads_arg: str) -> None:
+    """Apply checkpoint architecture metadata before building datasets and cache paths."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("ema_state_dict", checkpoint.get("model_state_dict"))
+    if state_dict is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} has no model_state_dict or ema_state_dict")
+    keys = tuple(k.removeprefix("module.") for k in state_dict)
+    checkpoint_tube = bool(checkpoint.get("multi_lead_tube", False)) or any(
+        key.startswith(("lead_embedding.", "lead_time_proj.", "tube_temporal_"))
+        for key in keys
+    )
+    if checkpoint_tube:
+        cfm.Config.MULTI_LEAD_TUBE = True
+        saved_leads = checkpoint.get("prediction_leads")
+        cfm.Config.PREDICTION_LEADS = (
+            tuple(int(x) for x in saved_leads)
+            if saved_leads is not None
+            else parse_int_list(prediction_leads_arg)
+        )
+        clean_state = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        lead_weight = clean_state.get("lead_embedding.weight")
+        if lead_weight is not None and len(cfm.prediction_leads(cfm.Config)) != int(lead_weight.shape[0]):
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} contains {int(lead_weight.shape[0])} tube leads, "
+                f"but configured prediction leads are {cfm.prediction_leads(cfm.Config)}. "
+                "Pass the checkpoint's exact --prediction_leads."
+            )
+        print(f"Checkpoint structure: tube leads {cfm.prediction_leads(cfm.Config)}")
+    elif cfm.Config.MULTI_LEAD_TUBE:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is single-lead, but tube evaluation was requested."
+        )
+
+    if bool(checkpoint.get("distributional_head", False)) or int(
+        checkpoint.get("image_channels", cfm.Config.IMAGE_CHANNELS)
+    ) == 2:
+        cfm.Config.DISTRIBUTIONAL_HEAD = True
+        cfm.Config.IMAGE_CHANNELS = 2
+        cfm.Config.SIGMA_FLOOR = float(checkpoint.get("sigma_floor", cfm.Config.SIGMA_FLOOR))
+
+
 def split_indices_for_config(shared_data: Mapping[str, np.ndarray]):
     time_values = np.asarray(shared_data["time_values"])
     runs = cfm.detect_continuous_runs(time_values)
@@ -1883,6 +1924,9 @@ def evaluate(args: argparse.Namespace) -> None:
     eval_split = args.eval_split if args.eval_split is not None else (args.split if args.split is not None else "test")
     if eval_split not in {"train", "val", "test"}:
         raise ValueError(f"Unsupported eval split: {eval_split}")
+    checkpoint_request = args.checkpoint or ("best_tac" if target_mode == "window" else "best_monitor")
+    ckpt_path = checkpoint_path_for(args.run_name, checkpoint_request)
+    configure_structure_from_checkpoint(ckpt_path, args.prediction_leads)
     predicted_leads = cfm.prediction_leads(cfm.Config)
     window_leads = parse_int_list(args.window_leads) if args.window_leads else predicted_leads
     lead_indices: Tuple[int, ...] = ()
@@ -1942,8 +1986,6 @@ def evaluate(args: argparse.Namespace) -> None:
     conus_mask = cfm.load_conus_mask(cfm.Config)
     mask_np = conus_mask.numpy() > 0.5
     mesh = cfm.build_mesh_once(cfm.Config, conus_mask, device, ddp=False)
-    checkpoint_request = args.checkpoint or ("best_tac" if target_mode == "window" else "best_monitor")
-    ckpt_path = checkpoint_path_for(args.run_name, checkpoint_request)
     print(f"Loading checkpoint: {ckpt_path}")
     model = cfm._load_meshflownet_checkpoint(ckpt_path, mesh, device)
 
