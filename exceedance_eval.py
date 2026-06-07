@@ -1477,6 +1477,157 @@ def predict_target_field(
     return mu_z, truth_z, int(t_idx.item())
 
 
+INCREMENTAL_SKILL_SPECS: Dict[str, Tuple[str, ...]] = {
+    "incremental_A_init_margin": ("init_margin",),
+    "incremental_B_forecast_margin": ("forecast_margin",),
+    "incremental_C_init_plus_forecast": ("init_margin", "forecast_margin"),
+    "incremental_D_init_forecast_sigma": ("init_margin", "forecast_margin", "predicted_sigma"),
+}
+
+
+def collect_incremental_skill_pairs(
+    model,
+    dataset,
+    split_name: str,
+    split_years: Iterable[int],
+    q95_z: np.ndarray,
+    months: np.ndarray,
+    years: np.ndarray,
+    mask_np: np.ndarray,
+    device,
+    target_mode: str,
+    lead_indices: Sequence[int],
+    center_idx: int,
+    target_center_lead: int,
+    max_cases: int,
+    max_samples: int,
+    seed: int,
+    progress_every: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Collect held-out init/forecast/sigma features without touching eval years."""
+    rng = np.random.default_rng(seed)
+    split_year_set = set(int(y) for y in split_years)
+    n_cases = min(len(dataset), max(1, int(max_cases)))
+    subset_idx = np.unique(np.linspace(0, len(dataset) - 1, n_cases, dtype=np.int64))
+    loader = DataLoader(Subset(dataset, subset_idx.tolist()), batch_size=1, shuffle=False, num_workers=0)
+    per_case = max(1, int(math.ceil(max_samples / max(len(subset_idx), 1))))
+    features: List[np.ndarray] = []
+    labels: List[np.ndarray] = []
+    pair_years: List[np.ndarray] = []
+    include_sigma = bool(cfm.Config.DISTRIBUTIONAL_HEAD)
+    print(
+        "Collecting incremental-skill pairs: "
+        f"split={split_name}, cases={len(subset_idx)}, max_pixels={int(max_samples)}, "
+        f"target_mode={target_mode}, predicted_sigma={include_sigma}"
+    )
+    model.eval()
+    with torch.inference_mode():
+        for batch_idx, batch in enumerate(loader):
+            if include_sigma:
+                mu_z, truth_z, t, sigma_model = predict_target_field(
+                    model,
+                    batch,
+                    device,
+                    target_mode=target_mode,
+                    lead_indices=lead_indices,
+                    center_idx=center_idx,
+                    image_size=cfm.Config.IMAGE_SIZE,
+                    return_sigma=True,
+                )
+            else:
+                mu_z, truth_z, t = predict_target_field(
+                    model,
+                    batch,
+                    device,
+                    target_mode=target_mode,
+                    lead_indices=lead_indices,
+                    center_idx=center_idx,
+                    image_size=cfm.Config.IMAGE_SIZE,
+                )
+                sigma_model = np.full_like(mu_z, np.nan, dtype=np.float32)
+            target_t = int(t) + int(target_center_lead)
+            month = int(months[target_t])
+            target_year = int(years[target_t])
+            if month not in MJJAS_MONTHS:
+                continue
+            if target_year not in split_year_set:
+                raise RuntimeError(
+                    f"Incremental-skill pair year leakage for split={split_name}: target_year={target_year}"
+                )
+            q = q95_z[month]
+            init_z = batch[1][0, 0, : q.shape[0], : q.shape[1]].numpy().astype(np.float32)
+            valid = mask_np & np.isfinite(init_z) & np.isfinite(mu_z) & np.isfinite(truth_z) & np.isfinite(q)
+            candidates = np.flatnonzero(valid.ravel())
+            if candidates.size == 0:
+                continue
+            chosen = rng.choice(candidates, size=min(per_case, candidates.size), replace=False)
+            features.append(np.column_stack([
+                init_z.ravel()[chosen] - q.ravel()[chosen],
+                mu_z.ravel()[chosen] - q.ravel()[chosen],
+                sigma_model.ravel()[chosen],
+            ]).astype(np.float32))
+            labels.append((truth_z.ravel()[chosen] > q.ravel()[chosen]).astype(np.float32))
+            pair_years.append(np.full(chosen.size, target_year, dtype=np.int16))
+            if (batch_idx + 1) % max(1, int(progress_every)) == 0:
+                print(f"  incremental-skill pairs processed {batch_idx + 1}/{len(subset_idx)}")
+    if not features:
+        raise RuntimeError("No incremental-skill calibration pairs were collected.")
+    x = np.concatenate(features, axis=0)[:max_samples]
+    y = np.concatenate(labels, axis=0)[:max_samples]
+    py = np.concatenate(pair_years, axis=0)[:max_samples]
+    if not set(int(v) for v in np.unique(py)).issubset(split_year_set):
+        raise RuntimeError("Incremental-skill calibration pairs contain years outside the calibration split.")
+    return x, y, py
+
+
+def fit_incremental_skill_models(
+    features: np.ndarray,
+    labels: np.ndarray,
+    calibration_split: str,
+    steps: int,
+    lr: float,
+    l2: float,
+) -> Dict[str, ModelOutputLogisticCalibrator]:
+    column_index = {"init_margin": 0, "forecast_margin": 1, "predicted_sigma": 2}
+    models: Dict[str, ModelOutputLogisticCalibrator] = {}
+    for model_name, feature_names in INCREMENTAL_SKILL_SPECS.items():
+        if "predicted_sigma" in feature_names and not np.any(np.isfinite(features[:, 2])):
+            print(f"Skipping {model_name}: checkpoint does not provide predicted sigma.")
+            continue
+        idx = [column_index[name] for name in feature_names]
+        models[model_name] = fit_model_output_logistic_calibrator(
+            features[:, idx],
+            labels,
+            feature_names,
+            calibration_split=calibration_split,
+            steps=steps,
+            lr=lr,
+            l2=l2,
+        )
+        print(
+            f"Fitted {model_name} on {calibration_split}: "
+            f"features={feature_names}, n={models[model_name].n_samples}, "
+            f"event_rate={models[model_name].event_rate:.4f}"
+        )
+    return models
+
+
+def predict_incremental_skill_grid(
+    calibrator: ModelOutputLogisticCalibrator,
+    feature_fields: Mapping[str, np.ndarray],
+    mask: np.ndarray,
+) -> np.ndarray:
+    fields = [np.asarray(feature_fields[name], dtype=np.float32) for name in calibrator.feature_names]
+    valid = mask.copy()
+    for field in fields:
+        valid &= np.isfinite(field)
+    out = np.full(mask.shape, np.nan, dtype=np.float32)
+    if np.any(valid):
+        x = np.column_stack([field[valid] for field in fields]).astype(np.float32)
+        out[valid] = calibrator.predict_features(x)
+    return out
+
+
 def monotonic_calibrator_cache_path(
     target_mode: str,
     window_leads: Sequence[int],
@@ -2118,6 +2269,38 @@ def evaluate(args: argparse.Namespace) -> None:
             use_model_sigma=False,
         )
 
+    incremental_models: Dict[str, ModelOutputLogisticCalibrator] = {}
+    if args.incremental_skill_diagnostic:
+        incremental_x, incremental_y, incremental_years = collect_incremental_skill_pairs(
+            model,
+            calibration_dataset,
+            calibration_split,
+            calibration_years,
+            q95_z,
+            months,
+            years,
+            mask_np,
+            device,
+            target_mode,
+            lead_indices,
+            center_idx,
+            target_center_lead,
+            max_cases=int(args.max_calibration_cases),
+            max_samples=int(args.max_calibration_samples),
+            seed=int(args.seed) + 1709,
+            progress_every=int(args.progress_every),
+        )
+        if set(int(v) for v in np.unique(incremental_years)) & eval_year_set:
+            raise RuntimeError("Incremental-skill fitting leaked evaluation years.")
+        incremental_models = fit_incremental_skill_models(
+            incremental_x,
+            incremental_y,
+            calibration_split=calibration_split,
+            steps=int(args.calibration_steps),
+            lr=float(args.calibration_lr),
+            l2=float(args.calibration_l2),
+        )
+
     train_dataset_for_old_logistic = select_dataset(
         "train", cfm.Config, shared_data, norm_stats, climo,
         train_indices, val_indices, test_indices,
@@ -2195,6 +2378,7 @@ def evaluate(args: argparse.Namespace) -> None:
     ]
     if args.use_model_sigma:
         model_names.extend([fixed_sigma_analytic_name, fixed_sigma_calibrated_name])
+    model_names.extend(incremental_models)
     acc = EvaluationAccumulator(model_names, regions)
     daily_compare_acc = (
         EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
@@ -2241,11 +2425,14 @@ def evaluate(args: argparse.Namespace) -> None:
                 truth_z = y[0].index_select(0, cpu_idx)[:, :h, :w].mean(dim=0).numpy().astype(np.float32)
                 center_mu_z = pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
                 center_truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
-                if args.use_model_sigma:
+                if args.use_model_sigma or args.incremental_skill_diagnostic:
                     if sigma_pred is None:
-                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
-                    sig = sigma_pred[0].index_select(0, idx)[:, :h, :w].float()
-                    sigma_model_z = (torch.sqrt(sig.square().sum(dim=0).clamp_min(1e-8)) / max(len(lead_indices), 1)).detach().cpu().numpy().astype(np.float32)
+                        if args.use_model_sigma:
+                            raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                        sigma_model_z = None
+                    else:
+                        sig = sigma_pred[0].index_select(0, idx)[:, :h, :w].float()
+                        sigma_model_z = (torch.sqrt(sig.square().sum(dim=0).clamp_min(1e-8)) / max(len(lead_indices), 1)).detach().cpu().numpy().astype(np.float32)
                 else:
                     sigma_model_z = None
             elif cfm.Config.MULTI_LEAD_TUBE:
@@ -2253,10 +2440,13 @@ def evaluate(args: argparse.Namespace) -> None:
                 truth_z = y[0, center_idx, :h, :w].numpy().astype(np.float32)
                 center_mu_z = mu_z
                 center_truth_z = truth_z
-                if args.use_model_sigma:
+                if args.use_model_sigma or args.incremental_skill_diagnostic:
                     if sigma_pred is None:
-                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
-                    sigma_model_z = sigma_pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
+                        if args.use_model_sigma:
+                            raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                        sigma_model_z = None
+                    else:
+                        sigma_model_z = sigma_pred[0, center_idx, :h, :w].detach().cpu().numpy().astype(np.float32)
                 else:
                     sigma_model_z = None
             else:
@@ -2264,10 +2454,13 @@ def evaluate(args: argparse.Namespace) -> None:
                 truth_z = y[0, 0, :h, :w].numpy().astype(np.float32)
                 center_mu_z = mu_z
                 center_truth_z = truth_z
-                if args.use_model_sigma:
+                if args.use_model_sigma or args.incremental_skill_diagnostic:
                     if sigma_pred is None:
-                        raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
-                    sigma_model_z = sigma_pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
+                        if args.use_model_sigma:
+                            raise RuntimeError("--use_model_sigma requested, but model.last_sigma is missing.")
+                        sigma_model_z = None
+                    else:
+                        sigma_model_z = sigma_pred[0, 0, :h, :w].detach().cpu().numpy().astype(np.float32)
                 else:
                     sigma_model_z = None
             if batch_idx == 0:
@@ -2315,6 +2508,21 @@ def evaluate(args: argparse.Namespace) -> None:
             init_margin = x_t[0, 0].numpy().astype(np.float32) - q
             logistic_prob = logistic.predict(init_margin)
             logistic_prob[~mask_np] = np.nan
+            incremental_probs: Dict[str, np.ndarray] = {}
+            if incremental_models:
+                incremental_feature_fields = {
+                    "init_margin": init_margin,
+                    "forecast_margin": mu_z - q,
+                    "predicted_sigma": (
+                        sigma_model_z
+                        if sigma_model_z is not None
+                        else np.full_like(mu_z, np.nan, dtype=np.float32)
+                    ),
+                }
+                incremental_probs = {
+                    name: predict_incremental_skill_grid(calibrator, incremental_feature_fields, mask_np)
+                    for name, calibrator in incremental_models.items()
+                }
 
             run_start = find_run_start(runs, t)
             if t >= target_t:
@@ -2338,6 +2546,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 forecasts[fixed_sigma_calibrated_name] = fixed_calibrated
                 auc_scores[fixed_sigma_analytic_name] = fixed_stage1
                 auc_scores[fixed_sigma_calibrated_name] = fixed_stage1
+            forecasts.update(incremental_probs)
             if target_mode == "window":
                 forecasts["persistence_init"] = trailing_windowed_exceedance_probability(
                     heat, t, 1, run_start, q95_z, months, norm_stats, mask_np,
@@ -2419,6 +2628,15 @@ def evaluate(args: argparse.Namespace) -> None:
         ],
     )
     write_csv(out_dir / "heldout_monotonic_inner_selection.csv", inner_selection_rows)
+    if incremental_models:
+        write_csv(
+            out_dir / "incremental_skill_coefficients.csv",
+            [
+                {"diagnostic_model": model_name, **row}
+                for model_name, calibrator in incremental_models.items()
+                for row in calibrator.coefficient_rows()
+            ],
+        )
     if args.use_model_sigma and fixed_sigma_calibrator is not None:
         write_csv(out_dir / "heldout_monotonic_cached_sigma_coefficients.csv", fixed_sigma_calibrator.coefficient_rows())
         write_csv(
@@ -2502,6 +2720,47 @@ def evaluate(args: argparse.Namespace) -> None:
                 f"Brier={float(row['inner_selection_brier']):.5f}"
             )
     print(f"Calibrator selection: {monotonic_calibrator.method} ({selection_reason})")
+    if incremental_models:
+        incremental_rows = {
+            row["model"]: row
+            for row in summary_rows
+            if row["model"] in incremental_models
+        }
+        init_bss = incremental_rows["incremental_A_init_margin"]["bss_vs_monthly_climo"]
+        print("Incremental-skill diagnostic (fit on calibration split, scored on eval split):")
+        for name in INCREMENTAL_SKILL_SPECS:
+            if name not in incremental_rows:
+                continue
+            row = incremental_rows[name]
+            print(
+                f"  {name}: BSS={row['bss_vs_monthly_climo']:+.4f}, "
+                f"delta_vs_A={row['bss_vs_monthly_climo'] - init_bss:+.4f}, "
+                f"ROC-AUC={row['roc_auc']:.3f}, ECE={row['ece']:.4f}"
+            )
+        forecast_models = [
+            name for name in (
+                "incremental_B_forecast_margin",
+                "incremental_C_init_plus_forecast",
+                "incremental_D_init_forecast_sigma",
+            )
+            if name in incremental_rows
+        ]
+        best_forecast_name = max(
+            forecast_models,
+            key=lambda name: incremental_rows[name]["bss_vs_monthly_climo"],
+        )
+        best_forecast_delta = (
+            incremental_rows[best_forecast_name]["bss_vs_monthly_climo"] - init_bss
+        )
+        verdict = "PASS" if best_forecast_delta > 0.0 else "FAIL"
+        print(
+            f"Incremental-skill verdict: {verdict} "
+            f"(best={best_forecast_name}, delta_BSS_vs_init={best_forecast_delta:+.4f})"
+        )
+        print(
+            "Incremental-skill leakage assert: PASS "
+            f"(fit={calibration_split}, eval={eval_split}, disjoint years)"
+        )
     if target_mode == "window":
         print(
             f"Windowed BSS vs windowed climatology: {stage1['bss_vs_monthly_climo']:+.4f} "
@@ -2580,6 +2839,7 @@ def main() -> None:
     parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")
+    parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-D init/forecast/sigma logistic diagnostics on calibration years and score on eval years.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
     parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="val")
