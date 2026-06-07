@@ -47,6 +47,10 @@ def parse_int_list(text: str) -> Tuple[int, ...]:
     return tuple(int(x.strip()) for x in str(text).split(",") if x.strip())
 
 
+def parse_float_list(text: str) -> Tuple[float, ...]:
+    return tuple(float(x.strip()) for x in str(text).split(",") if x.strip())
+
+
 def lead_list_label(leads: Sequence[int]) -> str:
     return "-".join(str(int(x)) for x in leads)
 
@@ -1144,11 +1148,136 @@ class EvaluationAccumulator:
         return rows
 
 
+def _roc_auc_from_hist(pos_hist: np.ndarray, neg_hist: np.ndarray) -> float:
+    pos_total = float(np.sum(pos_hist))
+    neg_total = float(np.sum(neg_hist))
+    if pos_total <= 0.0 or neg_total <= 0.0:
+        return float("nan")
+    tp = np.cumsum(np.asarray(pos_hist, dtype=np.float64)[::-1])
+    fp = np.cumsum(np.asarray(neg_hist, dtype=np.float64)[::-1])
+    tpr = np.r_[0.0, tp / pos_total, 1.0]
+    fpr = np.r_[0.0, fp / neg_total, 1.0]
+    return float(np.trapz(tpr, fpr))
+
+
+def year_block_bootstrap_incremental_comparison(
+    by_year: Mapping[int, EvaluationAccumulator],
+    reference_name: str,
+    baseline_name: str,
+    candidate_name: str,
+    reps: int,
+    seed: int,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    """Bootstrap whole test years for candidate-minus-baseline BSS and ROC-AUC."""
+    year_values = np.array(sorted(int(year) for year in by_year), dtype=np.int16)
+    if year_values.size < 2:
+        raise RuntimeError("Year-block bootstrap requires at least two evaluation years.")
+    model_names = (reference_name, baseline_name, candidate_name)
+    per_year_rows: List[Dict[str, object]] = []
+    for year in year_values:
+        rows = {
+            row["model"]: row
+            for row in by_year[int(year)].summary_rows(reference_name)
+        }
+        per_year_rows.append({
+            "year": int(year),
+            "baseline_bss": rows[baseline_name]["bss_vs_monthly_climo"],
+            "candidate_bss": rows[candidate_name]["bss_vs_monthly_climo"],
+            "delta_bss_candidate_minus_baseline": (
+                rows[candidate_name]["bss_vs_monthly_climo"]
+                - rows[baseline_name]["bss_vs_monthly_climo"]
+            ),
+            "baseline_roc_auc": rows[baseline_name]["roc_auc"],
+            "candidate_roc_auc": rows[candidate_name]["roc_auc"],
+            "delta_roc_auc_candidate_minus_baseline": (
+                rows[candidate_name]["roc_auc"] - rows[baseline_name]["roc_auc"]
+            ),
+            "valid_count": rows[candidate_name]["valid_count"],
+        })
+
+    brier_sum = {
+        name: np.array(
+            [by_year[int(year)].metrics[name].brier_sum for year in year_values],
+            dtype=np.float64,
+        )
+        for name in model_names
+    }
+    counts = {
+        name: np.array(
+            [by_year[int(year)].metrics[name].count for year in year_values],
+            dtype=np.float64,
+        )
+        for name in model_names
+    }
+    auc_pos = {
+        name: np.stack(
+            [by_year[int(year)].metrics[name].auc_hist_pos for year in year_values],
+            axis=0,
+        )
+        for name in (baseline_name, candidate_name)
+    }
+    auc_neg = {
+        name: np.stack(
+            [by_year[int(year)].metrics[name].auc_hist_neg for year in year_values],
+            axis=0,
+        )
+        for name in (baseline_name, candidate_name)
+    }
+
+    def compare(weights: np.ndarray) -> Tuple[float, float]:
+        brier = {
+            name: float(weights @ brier_sum[name]) / max(float(weights @ counts[name]), 1.0)
+            for name in model_names
+        }
+        ref = brier[reference_name]
+        delta_bss = (
+            (1.0 - brier[candidate_name] / ref)
+            - (1.0 - brier[baseline_name] / ref)
+        )
+        auc = {
+            name: _roc_auc_from_hist(
+                np.tensordot(weights, auc_pos[name], axes=(0, 0)),
+                np.tensordot(weights, auc_neg[name], axes=(0, 0)),
+            )
+            for name in (baseline_name, candidate_name)
+        }
+        return float(delta_bss), float(auc[candidate_name] - auc[baseline_name])
+
+    point_weights = np.ones(year_values.size, dtype=np.float64)
+    point_delta_bss, point_delta_auc = compare(point_weights)
+    rng = np.random.default_rng(seed)
+    n_reps = max(1, int(reps))
+    bootstrap = np.empty((n_reps, 2), dtype=np.float64)
+    for rep in range(n_reps):
+        selected = rng.integers(0, year_values.size, size=year_values.size)
+        weights = np.bincount(selected, minlength=year_values.size).astype(np.float64)
+        bootstrap[rep] = compare(weights)
+
+    summary_rows = []
+    for metric_name, estimate, values in (
+        ("delta_bss_candidate_minus_baseline", point_delta_bss, bootstrap[:, 0]),
+        ("delta_roc_auc_candidate_minus_baseline", point_delta_auc, bootstrap[:, 1]),
+    ):
+        finite = values[np.isfinite(values)]
+        summary_rows.append({
+            "metric": metric_name,
+            "estimate": estimate,
+            "ci_2.5": float(np.quantile(finite, 0.025)) if finite.size else float("nan"),
+            "ci_97.5": float(np.quantile(finite, 0.975)) if finite.size else float("nan"),
+            "probability_gt_zero": float(np.mean(finite > 0.0)) if finite.size else float("nan"),
+            "bootstrap_reps": int(finite.size),
+            "block": "test_year",
+            "baseline_model": baseline_name,
+            "candidate_model": candidate_name,
+        })
+    return per_year_rows, summary_rows
+
+
 def write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         return
-    keys = list(rows[0].keys())
+    keys = list(dict.fromkeys(key for row in rows for key in row.keys()))
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
@@ -1370,6 +1499,54 @@ class ClimatologyAnchoredLogisticCalibrator:
         return rows
 
 
+@dataclass
+class NestedYearShrinkageCalibrator:
+    feature_names: Tuple[str, ...]
+    coef: np.ndarray
+    alpha: float
+    selected_l2: float
+    calibration_split: str
+    n_samples: int
+    event_rate: float
+    mean_base_rate: float
+
+    def predict_features(self, x: np.ndarray, base_rate: np.ndarray) -> np.ndarray:
+        base = np.clip(np.asarray(base_rate, dtype=np.float32), 1e-5, 1.0 - 1e-5)
+        fixed_offset = np.log(base / (1.0 - base))
+        logits = np.clip(
+            fixed_offset + float(self.alpha) * (x.astype(np.float32) @ self.coef),
+            -30.0,
+            30.0,
+        )
+        return (1.0 / (1.0 + np.exp(-logits))).astype(np.float32)
+
+    def coefficient_rows(self) -> List[Dict[str, object]]:
+        rows = [{
+            "feature": "fixed_logit_train_climatology",
+            "coef": 1.0,
+            "feature_mean": self.mean_base_rate,
+            "feature_std": "fixed_offset_no_intercept",
+            "calibration_split": self.calibration_split,
+            "n_samples": self.n_samples,
+            "event_rate": self.event_rate,
+            "alpha": self.alpha,
+            "selected_l2": self.selected_l2,
+        }]
+        for name, coef in zip(self.feature_names, self.coef):
+            rows.append({
+                "feature": name,
+                "coef": float(coef),
+                "feature_mean": "",
+                "feature_std": "",
+                "calibration_split": self.calibration_split,
+                "n_samples": self.n_samples,
+                "event_rate": self.event_rate,
+                "alpha": self.alpha,
+                "selected_l2": self.selected_l2,
+            })
+        return rows
+
+
 def calibration_feature_names(region_names: Sequence[str]) -> Tuple[str, ...]:
     return (
         "stage1_logit",
@@ -1520,6 +1697,118 @@ def fit_climatology_anchored_logistic_calibrator(
     )
 
 
+def fit_nested_year_shrinkage_calibrator(
+    features: np.ndarray,
+    labels: np.ndarray,
+    base_rates: np.ndarray,
+    pair_years: np.ndarray,
+    feature_names: Sequence[str],
+    calibration_split: str,
+    alpha_grid: Sequence[float],
+    l2_grid: Sequence[float],
+    steps: int,
+    lr: float,
+) -> Tuple[NestedYearShrinkageCalibrator, List[Dict[str, object]]]:
+    """Select shrinkage and regularization by leave-one-calibration-year-out Brier."""
+    x = np.asarray(features, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.float32).reshape(-1)
+    base = np.asarray(base_rates, dtype=np.float32).reshape(-1)
+    pair_years = np.asarray(pair_years, dtype=np.int16).reshape(-1)
+    valid = (
+        np.all(np.isfinite(x), axis=1)
+        & np.isfinite(y)
+        & np.isfinite(base)
+        & np.isfinite(pair_years)
+    )
+    x = x[valid]
+    y = y[valid]
+    base = np.clip(base[valid], 1e-5, 1.0 - 1e-5)
+    pair_years = pair_years[valid]
+    unique_years = np.array(sorted(set(int(v) for v in pair_years)), dtype=np.int16)
+    if unique_years.size < 3:
+        raise RuntimeError("Nested year-wise shrinkage requires at least three calibration years.")
+    alphas = tuple(sorted(set(float(v) for v in alpha_grid)))
+    l2_values = tuple(sorted(set(float(v) for v in l2_grid)))
+    if not alphas or any(v < 0.0 or v > 1.0 for v in alphas):
+        raise ValueError("Nested shrinkage alpha grid must contain values in [0, 1].")
+    if 0.0 not in alphas:
+        raise ValueError("Nested shrinkage alpha grid must include 0 so climatology is an available fallback.")
+    if not l2_values or any(v < 0.0 for v in l2_values):
+        raise ValueError("Nested shrinkage L2 grid must contain non-negative values.")
+
+    fixed_offset = np.log(base / (1.0 - base))
+    selection_rows: List[Dict[str, object]] = []
+    for l2 in l2_values:
+        oof_signal = np.full(y.shape, np.nan, dtype=np.float32)
+        for hold_year in unique_years:
+            hold = pair_years == int(hold_year)
+            fit = ~hold
+            if int(np.sum(fit)) < 100 or np.unique(y[fit]).size < 2:
+                raise RuntimeError(f"Nested shrinkage inner fit is too thin after holding out year {int(hold_year)}.")
+            inner = fit_climatology_anchored_logistic_calibrator(
+                x[fit],
+                y[fit],
+                base[fit],
+                feature_names,
+                calibration_split=f"{calibration_split}_leave_{int(hold_year)}_out",
+                steps=steps,
+                lr=lr,
+                l2=l2,
+            )
+            oof_signal[hold] = x[hold] @ inner.coef
+        if not np.all(np.isfinite(oof_signal)):
+            raise RuntimeError("Nested shrinkage failed to produce complete out-of-year calibration signals.")
+        for alpha in alphas:
+            logits = np.clip(fixed_offset + float(alpha) * oof_signal, -30.0, 30.0)
+            prob = 1.0 / (1.0 + np.exp(-logits))
+            slope, ece, brier = reliability_from_arrays(prob, y)
+            selection_rows.append({
+                "alpha": float(alpha),
+                "l2": float(l2),
+                "leave_one_year_out_brier": brier,
+                "leave_one_year_out_ece": ece,
+                "leave_one_year_out_slope": slope,
+                "calibration_years": " ".join(str(int(v)) for v in unique_years),
+                "n_samples": int(y.size),
+            })
+
+    selected = min(
+        selection_rows,
+        key=lambda row: (
+            float(row["leave_one_year_out_brier"]),
+            float(row["alpha"]),
+            -float(row["l2"]),
+        ),
+    )
+    selected_alpha = float(selected["alpha"])
+    selected_l2 = float(selected["l2"])
+    full = fit_climatology_anchored_logistic_calibrator(
+        x,
+        y,
+        base,
+        feature_names,
+        calibration_split=calibration_split,
+        steps=steps,
+        lr=lr,
+        l2=selected_l2,
+    )
+    model = NestedYearShrinkageCalibrator(
+        feature_names=tuple(feature_names),
+        coef=full.coef.copy(),
+        alpha=selected_alpha,
+        selected_l2=selected_l2,
+        calibration_split=calibration_split,
+        n_samples=int(y.size),
+        event_rate=float(y.mean()),
+        mean_base_rate=float(base.mean()),
+    )
+    for row in selection_rows:
+        row["selected"] = (
+            float(row["alpha"]) == selected_alpha and float(row["l2"]) == selected_l2
+        )
+    return model, selection_rows
+
+
 def resolve_calibration_split(requested: str, eval_split: str) -> str:
     if requested != "auto":
         return requested
@@ -1588,6 +1877,7 @@ INCREMENTAL_SKILL_SPECS: Dict[str, Tuple[str, ...]] = {
     "incremental_D_init_forecast_sigma": ("init_margin", "forecast_margin", "predicted_sigma"),
 }
 CLIMATOLOGY_ANCHORED_MODEL_NAME = "incremental_E_climo_offset_init_forecast"
+NESTED_SHRINKAGE_MODEL_NAME = "incremental_F_nested_year_shrinkage"
 
 
 def collect_incremental_skill_pairs(
@@ -1701,11 +1991,14 @@ def fit_incremental_skill_models(
     features: np.ndarray,
     labels: np.ndarray,
     base_rates: np.ndarray,
+    pair_years: np.ndarray,
     calibration_split: str,
+    alpha_grid: Sequence[float],
+    l2_grid: Sequence[float],
     steps: int,
     lr: float,
     l2: float,
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], List[Dict[str, object]]]:
     column_index = {"init_margin": 0, "forecast_margin": 1, "predicted_sigma": 2}
     models: Dict[str, Any] = {}
     for model_name, feature_names in INCREMENTAL_SKILL_SPECS.items():
@@ -1759,7 +2052,37 @@ def fit_incremental_skill_models(
         f"event_rate={anchored.event_rate:.4f}, mean_base_rate={anchored.mean_base_rate:.4f}, "
         f"zero_margin_anchor_error={anchor_error:.3g}"
     )
-    return models
+    nested, nested_selection_rows = fit_nested_year_shrinkage_calibrator(
+        features[:, anchored_idx],
+        labels,
+        base_rates,
+        pair_years,
+        anchored_features,
+        calibration_split=calibration_split,
+        alpha_grid=alpha_grid,
+        l2_grid=l2_grid,
+        steps=steps,
+        lr=lr,
+    )
+    models[NESTED_SHRINKAGE_MODEL_NAME] = nested
+    nested_zero_margin_prob = nested.predict_features(
+        np.zeros((finite_base_rates.size, len(anchored_features)), dtype=np.float32),
+        finite_base_rates,
+    )
+    nested_anchor_error = float(np.max(np.abs(nested_zero_margin_prob - finite_base_rates)))
+    if nested_anchor_error > 1e-6:
+        raise RuntimeError(
+            "Nested shrinkage invariant failed: zero-margin probability does not equal "
+            f"the train-only base rate (max_abs_error={nested_anchor_error:.3g})."
+        )
+    print(
+        f"Fitted {NESTED_SHRINKAGE_MODEL_NAME} on {calibration_split}: "
+        f"alpha={nested.alpha:.3f}, l2={nested.selected_l2:g}, "
+        f"selection=leave-one-calibration-year-out Brier, learned_intercept=False, "
+        f"n={nested.n_samples}, event_rate={nested.event_rate:.4f}, "
+        f"zero_margin_anchor_error={nested_anchor_error:.3g}"
+    )
+    return models, nested_selection_rows
 
 
 def predict_incremental_skill_grid(
@@ -1772,14 +2095,14 @@ def predict_incremental_skill_grid(
     valid = mask.copy()
     for field in fields:
         valid &= np.isfinite(field)
-    if isinstance(calibrator, ClimatologyAnchoredLogisticCalibrator):
+    if isinstance(calibrator, (ClimatologyAnchoredLogisticCalibrator, NestedYearShrinkageCalibrator)):
         if base_rate is None:
             raise RuntimeError("Climatology-anchored incremental model requires a train-only base-rate field.")
         valid &= np.isfinite(base_rate)
     out = np.full(mask.shape, np.nan, dtype=np.float32)
     if np.any(valid):
         x = np.column_stack([field[valid] for field in fields]).astype(np.float32)
-        if isinstance(calibrator, ClimatologyAnchoredLogisticCalibrator):
+        if isinstance(calibrator, (ClimatologyAnchoredLogisticCalibrator, NestedYearShrinkageCalibrator)):
             out[valid] = calibrator.predict_features(x, base_rate[valid])
         else:
             out[valid] = calibrator.predict_features(x)
@@ -2428,6 +2751,7 @@ def evaluate(args: argparse.Namespace) -> None:
         )
 
     incremental_models: Dict[str, Any] = {}
+    nested_selection_rows: List[Dict[str, object]] = []
     if args.incremental_skill_diagnostic:
         incremental_x, incremental_y, incremental_years, incremental_base_rates = collect_incremental_skill_pairs(
             model,
@@ -2451,11 +2775,14 @@ def evaluate(args: argparse.Namespace) -> None:
         )
         if set(int(v) for v in np.unique(incremental_years)) & eval_year_set:
             raise RuntimeError("Incremental-skill fitting leaked evaluation years.")
-        incremental_models = fit_incremental_skill_models(
+        incremental_models, nested_selection_rows = fit_incremental_skill_models(
             incremental_x,
             incremental_y,
             incremental_base_rates,
+            incremental_years,
             calibration_split=calibration_split,
+            alpha_grid=parse_float_list(args.incremental_alpha_grid),
+            l2_grid=parse_float_list(args.incremental_l2_grid),
             steps=int(args.calibration_steps),
             lr=float(args.calibration_lr),
             l2=float(args.calibration_l2),
@@ -2540,6 +2867,16 @@ def evaluate(args: argparse.Namespace) -> None:
         model_names.extend([fixed_sigma_analytic_name, fixed_sigma_calibrated_name])
     model_names.extend(incremental_models)
     acc = EvaluationAccumulator(model_names, regions)
+    year_incremental_acc: Optional[Dict[int, EvaluationAccumulator]] = (
+        defaultdict(
+            lambda: EvaluationAccumulator(
+                [reference_name, "incremental_A_init_margin", NESTED_SHRINKAGE_MODEL_NAME],
+                {},
+            )
+        )
+        if NESTED_SHRINKAGE_MODEL_NAME in incremental_models
+        else {}
+    )
     daily_compare_acc = (
         EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
         if target_mode == "window" else None
@@ -2733,6 +3070,16 @@ def evaluate(args: argparse.Namespace) -> None:
 
             for name, prob in forecasts.items():
                 acc.update(name, prob, truth, mask_np, target_month, auc_score=auc_scores.get(name))
+            if year_incremental_acc is not None:
+                target_year = int(years[target_t])
+                for name in (reference_name, "incremental_A_init_margin", NESTED_SHRINKAGE_MODEL_NAME):
+                    year_incremental_acc[target_year].update(
+                        name,
+                        forecasts[name],
+                        truth,
+                        mask_np,
+                        target_month,
+                    )
 
             if daily_compare_acc is not None:
                 daily_target_t = t + int(cfm.Config.LEAD_TIME)
@@ -2768,6 +3115,17 @@ def evaluate(args: argparse.Namespace) -> None:
     monthly_rows = acc.monthly_rows(reference_name)
     region_rows = acc.region_rows()
     rel_tables = {name: metric.rel.table() for name, metric in acc.metrics.items()}
+    bootstrap_per_year_rows: List[Dict[str, object]] = []
+    bootstrap_summary_rows: List[Dict[str, object]] = []
+    if year_incremental_acc is not None:
+        bootstrap_per_year_rows, bootstrap_summary_rows = year_block_bootstrap_incremental_comparison(
+            year_incremental_acc,
+            reference_name,
+            "incremental_A_init_margin",
+            NESTED_SHRINKAGE_MODEL_NAME,
+            reps=int(args.year_bootstrap_reps),
+            seed=int(args.seed) + 2909,
+        )
 
     write_csv(out_dir / "exceedance_results.csv", summary_rows)
     write_csv(out_dir / "monthly_exceedance_results.csv", monthly_rows)
@@ -2802,6 +3160,9 @@ def evaluate(args: argparse.Namespace) -> None:
                 for row in calibrator.coefficient_rows()
             ],
         )
+        write_csv(out_dir / "incremental_nested_year_selection.csv", nested_selection_rows)
+        write_csv(out_dir / "incremental_nested_test_year_metrics.csv", bootstrap_per_year_rows)
+        write_csv(out_dir / "incremental_nested_year_bootstrap.csv", bootstrap_summary_rows)
     if args.use_model_sigma and fixed_sigma_calibrator is not None:
         write_csv(out_dir / "heldout_monotonic_cached_sigma_coefficients.csv", fixed_sigma_calibrator.coefficient_rows())
         write_csv(
@@ -2892,17 +3253,19 @@ def evaluate(args: argparse.Namespace) -> None:
             if row["model"] in incremental_models
         }
         anchored_row = incremental_rows[CLIMATOLOGY_ANCHORED_MODEL_NAME]
+        nested_row = incremental_rows[NESTED_SHRINKAGE_MODEL_NAME]
         reference_valid_count = next(
             row["valid_count"] for row in summary_rows if row["model"] == reference_name
         )
-        if anchored_row["valid_count"] != reference_valid_count:
+        if anchored_row["valid_count"] != reference_valid_count or nested_row["valid_count"] != reference_valid_count:
             raise RuntimeError(
                 "Climatology-anchored incremental model valid-cell count differs from reference: "
-                f"anchored={anchored_row['valid_count']}, reference={reference_valid_count}"
+                f"anchored={anchored_row['valid_count']}, nested={nested_row['valid_count']}, "
+                f"reference={reference_valid_count}"
             )
         init_bss = incremental_rows["incremental_A_init_margin"]["bss_vs_monthly_climo"]
         print("Incremental-skill diagnostic (fit on calibration split, scored on eval split):")
-        for name in (*INCREMENTAL_SKILL_SPECS, CLIMATOLOGY_ANCHORED_MODEL_NAME):
+        for name in (*INCREMENTAL_SKILL_SPECS, CLIMATOLOGY_ANCHORED_MODEL_NAME, NESTED_SHRINKAGE_MODEL_NAME):
             if name not in incremental_rows:
                 continue
             row = incremental_rows[name]
@@ -2917,6 +3280,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 "incremental_C_init_plus_forecast",
                 "incremental_D_init_forecast_sigma",
                 CLIMATOLOGY_ANCHORED_MODEL_NAME,
+                NESTED_SHRINKAGE_MODEL_NAME,
             )
             if name in incremental_rows
         ]
@@ -2946,6 +3310,24 @@ def evaluate(args: argparse.Namespace) -> None:
             f"delta_BSS_vs_A={anchored_row['bss_vs_monthly_climo'] - init_bss:+.4f}, "
             f"delta_BSS_vs_C="
             f"{anchored_row['bss_vs_monthly_climo'] - incremental_rows['incremental_C_init_plus_forecast']['bss_vs_monthly_climo']:+.4f}"
+        )
+        nested = incremental_models[NESTED_SHRINKAGE_MODEL_NAME]
+        print(
+            "Nested year-wise shrinkage selection: "
+            f"alpha={nested.alpha:.3f}, l2={nested.selected_l2:g}, "
+            "criterion=leave-one-validation-year-out Brier"
+        )
+        for row in bootstrap_summary_rows:
+            print(
+                f"Year-block bootstrap {row['metric']}: estimate={float(row['estimate']):+.4f}, "
+                f"95% CI=[{float(row['ci_2.5']):+.4f}, {float(row['ci_97.5']):+.4f}], "
+                f"P(>0)={float(row['probability_gt_zero']):.3f}, "
+                f"reps={int(row['bootstrap_reps'])}"
+            )
+        print(
+            "Nested-shrinkage leakage assert: PASS "
+            "(alpha and L2 selected only by leave-one-calibration-year-out predictions; "
+            "test years used once for reporting)"
         )
     if target_mode == "window":
         print(
@@ -3025,7 +3407,10 @@ def main() -> None:
     parser.add_argument("--target_mode", choices=["daily", "window"], default="daily")
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")
-    parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-E incremental diagnostics, including a train-climatology-anchored model, on calibration years and score on eval years.")
+    parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-F incremental diagnostics, including climatology-anchored and nested year-wise shrinkage models, on calibration years and score on eval years.")
+    parser.add_argument("--incremental_alpha_grid", default="0,0.1,0.25,0.5,0.75,1.0", help="Shrinkage alpha candidates for nested year-wise Model F; must include 0.")
+    parser.add_argument("--incremental_l2_grid", default="0,0.0001,0.001,0.01,0.1,1.0", help="L2 candidates selected by leave-one-calibration-year-out Brier for Model F.")
+    parser.add_argument("--year_bootstrap_reps", type=int, default=1000, help="Whole-test-year bootstrap replicates for Model F versus Model A.")
     parser.add_argument("--persistence_windows", default="7,14,30")
     parser.add_argument("--max_logistic_samples", type=int, default=1000000)
     parser.add_argument("--calibration_split", choices=["auto", "train", "val", "test"], default="val")
