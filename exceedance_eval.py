@@ -2109,6 +2109,120 @@ def predict_incremental_skill_grid(
     return out
 
 
+def save_incremental_calibration_arrays(
+    out_dir: Path,
+    features: np.ndarray,
+    labels: np.ndarray,
+    pair_years: np.ndarray,
+    base_rates: np.ndarray,
+    train_years: Iterable[int],
+    calibration_years: Iterable[int],
+    test_years: Iterable[int],
+    calibration_split: str,
+) -> Path:
+    array_dir = ensure_dir(out_dir / "incremental_arrays")
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+    path = array_dir / "calibration_pairs.npz"
+    np.savez_compressed(
+        path,
+        init_margin=np.asarray(features[:, 0], dtype=np.float32),
+        forecast_margin=np.asarray(features[:, 1], dtype=np.float32),
+        model_sigma=np.asarray(features[:, 2], dtype=np.float32),
+        truth=np.asarray(labels, dtype=np.uint8),
+        base_rate=np.asarray(base_rates, dtype=np.float32),
+        year=np.asarray(pair_years, dtype=np.int16),
+        source_fold=np.array(fold, dtype=np.int16),
+        train_years=np.array(sorted(int(v) for v in train_years), dtype=np.int16),
+        calibration_years=np.array(sorted(int(v) for v in calibration_years), dtype=np.int16),
+        test_years=np.array(sorted(int(v) for v in test_years), dtype=np.int16),
+        calibration_split=np.array(str(calibration_split)),
+    )
+    return path
+
+
+def prepare_incremental_test_chunk_dir(out_dir: Path) -> Path:
+    chunk_dir = ensure_dir(out_dir / "incremental_arrays" / "test_chunks")
+    for path in chunk_dir.glob("sample_*.npz"):
+        path.unlink()
+    return chunk_dir
+
+
+def save_incremental_test_chunk(
+    chunk_dir: Path,
+    sample_index: int,
+    source_fold: int,
+    target_year: int,
+    target_month: int,
+    init_margin: np.ndarray,
+    forecast_margin: np.ndarray,
+    model_sigma: Optional[np.ndarray],
+    truth: np.ndarray,
+    base_rate: np.ndarray,
+    mask: np.ndarray,
+) -> int:
+    valid = (
+        mask
+        & np.isfinite(init_margin)
+        & np.isfinite(forecast_margin)
+        & np.isfinite(truth)
+        & np.isfinite(base_rate)
+    )
+    if not np.any(valid):
+        return 0
+    sigma = (
+        np.asarray(model_sigma, dtype=np.float32)[valid]
+        if model_sigma is not None
+        else np.full(int(np.sum(valid)), np.nan, dtype=np.float32)
+    )
+    path = chunk_dir / f"sample_{int(sample_index):05d}.npz"
+    np.savez_compressed(
+        path,
+        init_margin=np.asarray(init_margin[valid], dtype=np.float32),
+        forecast_margin=np.asarray(forecast_margin[valid], dtype=np.float32),
+        model_sigma=sigma,
+        truth=np.asarray(truth[valid] > 0.5, dtype=np.uint8),
+        base_rate=np.asarray(base_rate[valid], dtype=np.float32),
+        year=np.array(int(target_year), dtype=np.int16),
+        month=np.array(int(target_month), dtype=np.int8),
+        source_fold=np.array(int(source_fold), dtype=np.int16),
+    )
+    return int(np.sum(valid))
+
+
+def save_incremental_array_manifest(
+    out_dir: Path,
+    run_name: str,
+    target_mode: str,
+    window_leads: Sequence[int],
+    train_years: Iterable[int],
+    calibration_years: Iterable[int],
+    test_years: Iterable[int],
+    calibration_split: str,
+    eval_split: str,
+    sample_count: int,
+    valid_cell_count: int,
+) -> Path:
+    array_dir = ensure_dir(out_dir / "incremental_arrays")
+    fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+    path = array_dir / "manifest.npz"
+    np.savez_compressed(
+        path,
+        run_name=np.array(str(run_name)),
+        source_fold=np.array(fold, dtype=np.int16),
+        target_mode=np.array(str(target_mode)),
+        window_leads=np.array(tuple(int(v) for v in window_leads), dtype=np.int16),
+        train_years=np.array(sorted(int(v) for v in train_years), dtype=np.int16),
+        calibration_years=np.array(sorted(int(v) for v in calibration_years), dtype=np.int16),
+        test_years=np.array(sorted(int(v) for v in test_years), dtype=np.int16),
+        calibration_split=np.array(str(calibration_split)),
+        eval_split=np.array(str(eval_split)),
+        sample_count=np.array(int(sample_count), dtype=np.int32),
+        valid_cell_count=np.array(int(valid_cell_count), dtype=np.int64),
+        schema_version=np.array(1, dtype=np.int16),
+    )
+    return path
+
+
 def monotonic_calibrator_cache_path(
     target_mode: str,
     window_leads: Sequence[int],
@@ -2752,6 +2866,9 @@ def evaluate(args: argparse.Namespace) -> None:
 
     incremental_models: Dict[str, Any] = {}
     nested_selection_rows: List[Dict[str, object]] = []
+    incremental_array_chunk_dir: Optional[Path] = None
+    incremental_saved_cells = 0
+    incremental_saved_samples = 0
     if args.incremental_skill_diagnostic:
         incremental_x, incremental_y, incremental_years, incremental_base_rates = collect_incremental_skill_pairs(
             model,
@@ -2775,6 +2892,20 @@ def evaluate(args: argparse.Namespace) -> None:
         )
         if set(int(v) for v in np.unique(incremental_years)) & eval_year_set:
             raise RuntimeError("Incremental-skill fitting leaked evaluation years.")
+        if args.save_incremental_arrays:
+            calibration_array_path = save_incremental_calibration_arrays(
+                out_dir,
+                incremental_x,
+                incremental_y,
+                incremental_years,
+                incremental_base_rates,
+                train_years,
+                calibration_years,
+                test_years,
+                calibration_split,
+            )
+            incremental_array_chunk_dir = prepare_incremental_test_chunk_dir(out_dir)
+            print(f"Saved incremental calibration arrays to: {calibration_array_path}")
         incremental_models, nested_selection_rows = fit_incremental_skill_models(
             incremental_x,
             incremental_y,
@@ -2875,7 +3006,7 @@ def evaluate(args: argparse.Namespace) -> None:
             )
         )
         if NESTED_SHRINKAGE_MODEL_NAME in incremental_models
-        else {}
+        else None
     )
     daily_compare_acc = (
         EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
@@ -3025,6 +3156,22 @@ def evaluate(args: argparse.Namespace) -> None:
                     )
                     for name, calibrator in incremental_models.items()
                 }
+                if incremental_array_chunk_dir is not None:
+                    saved_cells = save_incremental_test_chunk(
+                        incremental_array_chunk_dir,
+                        batch_idx,
+                        int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0])),
+                        int(years[target_t]),
+                        target_month,
+                        init_margin,
+                        mu_z - q,
+                        sigma_model_z,
+                        truth,
+                        monthly_climo,
+                        mask_np,
+                    )
+                    incremental_saved_cells += saved_cells
+                    incremental_saved_samples += int(saved_cells > 0)
 
             run_start = find_run_start(runs, t)
             if t >= target_t:
@@ -3163,6 +3310,25 @@ def evaluate(args: argparse.Namespace) -> None:
         write_csv(out_dir / "incremental_nested_year_selection.csv", nested_selection_rows)
         write_csv(out_dir / "incremental_nested_test_year_metrics.csv", bootstrap_per_year_rows)
         write_csv(out_dir / "incremental_nested_year_bootstrap.csv", bootstrap_summary_rows)
+        if incremental_array_chunk_dir is not None:
+            manifest_path = save_incremental_array_manifest(
+                out_dir,
+                args.run_name,
+                target_mode,
+                window_leads,
+                train_years,
+                calibration_years,
+                test_years,
+                calibration_split,
+                eval_split,
+                incremental_saved_samples,
+                incremental_saved_cells,
+            )
+            print(
+                "Saved stitchable incremental arrays: "
+                f"samples={incremental_saved_samples}, valid_cells={incremental_saved_cells}, "
+                f"manifest={manifest_path}"
+            )
     if args.use_model_sigma and fixed_sigma_calibrator is not None:
         write_csv(out_dir / "heldout_monotonic_cached_sigma_coefficients.csv", fixed_sigma_calibrator.coefficient_rows())
         write_csv(
@@ -3408,6 +3574,7 @@ def main() -> None:
     parser.add_argument("--window_leads", default=None, help="Comma-separated lead offsets for --target_mode window; defaults to predicted tube leads.")
     parser.add_argument("--use_model_sigma", action="store_true", help="Use distributional model sigma in Phi((mu-q95)/sigma) instead of cached sigma.")
     parser.add_argument("--incremental_skill_diagnostic", action="store_true", help="Fit A-F incremental diagnostics, including climatology-anchored and nested year-wise shrinkage models, on calibration years and score on eval years.")
+    parser.add_argument("--save_incremental_arrays", action="store_true", help="Persist minimal calibration pairs and full test-cell incremental arrays for stitch_exceedance_folds.py.")
     parser.add_argument("--incremental_alpha_grid", default="0,0.1,0.25,0.5,0.75,1.0", help="Shrinkage alpha candidates for nested year-wise Model F; must include 0.")
     parser.add_argument("--incremental_l2_grid", default="0,0.0001,0.001,0.01,0.1,1.0", help="L2 candidates selected by leave-one-calibration-year-out Brier for Model F.")
     parser.add_argument("--year_bootstrap_reps", type=int, default=1000, help="Whole-test-year bootstrap replicates for Model F versus Model A.")
