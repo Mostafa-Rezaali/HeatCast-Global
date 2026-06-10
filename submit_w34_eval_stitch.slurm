@@ -19,6 +19,8 @@ PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28
 RUNS=cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1
 INPUT_ROOT=exceedance_eval_incremental
+CHECKPOINT_CHOICE_FILE=${CHECKPOINT_CHOICE_FILE:-w34_checkpoint_choice.txt}
+CHECKPOINT_OVERRIDE=${CHECKPOINT_OVERRIDE:-}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -29,13 +31,27 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 git pull --ff-only origin codex/tube_v1
 "$PY" -m py_compile exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
 
+if [ -n "$CHECKPOINT_OVERRIDE" ]; then
+    CHECKPOINT=$CHECKPOINT_OVERRIDE
+elif [ -f "$CHECKPOINT_CHOICE_FILE" ]; then
+    CHECKPOINT=$(tr -d '[:space:]' < "$CHECKPOINT_CHOICE_FILE")
+else
+    echo "Missing $CHECKPOINT_CHOICE_FILE. Run submit_w34_checkpoint_arbitration.slurm first."
+    exit 1
+fi
+case "$CHECKPOINT" in
+    best_tac|best_monitor) ;;
+    *) echo "Invalid W34 checkpoint choice: $CHECKPOINT"; exit 1 ;;
+esac
+echo "Locked W34 evaluation checkpoint selector: $CHECKPOINT"
+
 for FOLD in 0 1 2 3 4; do
     RUN=cvfold${FOLD}_w34_dist_v1
     echo "Evaluating fold $FOLD: $RUN"
     "$PY" -u exceedance_eval.py \
       --run_name "$RUN" \
       --cv_fold "$FOLD" \
-      --checkpoint best_tac \
+      --checkpoint "$CHECKPOINT" \
       --prediction_leads "$LEADS" \
       --target_mode window \
       --window_leads "$LEADS" \

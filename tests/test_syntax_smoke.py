@@ -19,6 +19,7 @@ CORE_SCRIPTS = (
     "ens_ingest.py",
     "ens_score.py",
     "ens_compare.py",
+    "w34_checkpoint_arbitration.py",
 )
 
 
