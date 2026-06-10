@@ -18,6 +18,7 @@ CORE_SCRIPTS = (
     "recover_chunk_init_dates.py",
     "build_driver_tables.py",
     "ens_common.py",
+    "download_ecmwf_s2s.py",
     "ens_ingest.py",
     "ens_score.py",
     "ens_compare.py",

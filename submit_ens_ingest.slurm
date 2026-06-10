@@ -27,6 +27,7 @@ git pull --ff-only origin codex/tube_v1
 "$PY" -u ens_ingest.py \
   --raw_dir ens_reforecast/raw \
   --output_dir ens_reforecast/regridded \
+  --init_list ens_reforecast/raw/init_list.txt \
   --variable mx2t6 \
   --weekdays 0,3 \
   --max_lead 28 \

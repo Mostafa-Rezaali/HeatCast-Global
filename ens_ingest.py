@@ -63,6 +63,29 @@ def requested_init_dates(
     return output
 
 
+def load_init_list(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing ENS initialization list: {path}")
+    labels = []
+    seen = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        label = line.strip()
+        if not label:
+            continue
+        try:
+            value = datetime.strptime(label, "%Y%m%d")
+        except ValueError as exc:
+            raise ValueError(f"{path}:{line_number}: expected YYYYMMDD, got {label!r}.") from exc
+        if value.month not in (5, 6, 7, 8, 9):
+            raise ValueError(f"{path}:{line_number}: init {label} is outside MJJAS.")
+        if label not in seen:
+            labels.append(label)
+            seen.add(label)
+    if not labels:
+        raise RuntimeError(f"No initialization dates found in {path}.")
+    return labels
+
+
 def find_raw_file(raw_dir: Path, init_label: str) -> Path | None:
     candidates = []
     for suffix in (".nc", ".nc4", ".grib", ".grib2", ".grb", ".grb2"):
@@ -149,6 +172,11 @@ def main() -> None:
     parser.add_argument("--end_year", type=int, default=None)
     parser.add_argument("--max_lead", type=int, default=28)
     parser.add_argument("--expected_members", type=int, default=11)
+    parser.add_argument(
+        "--init_list",
+        default=None,
+        help="Optional YYYYMMDD list from download_ecmwf_s2s.py; uses only available S2S inits.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -161,12 +189,23 @@ def main() -> None:
 
     cfm.Config.TRAINING_DATA_PATH = str(args.training_data_path)
     land_mask = cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5
-    init_labels = requested_init_dates(
-        dates,
-        parse_int_list(args.weekdays),
-        args.start_year,
-        args.end_year,
-    )
+    if args.init_list:
+        init_labels = load_init_list(Path(args.init_list))
+        outside_axis = [label for label in init_labels if label not in date_lookup]
+        if outside_axis:
+            print(
+                f"Skipping {len(outside_axis)} downloaded S2S inits outside the HeatCast time axis."
+            )
+            init_labels = [label for label in init_labels if label in date_lookup]
+        if not init_labels:
+            raise RuntimeError("No init-list dates overlap the HeatCast MJJAS time axis.")
+    else:
+        init_labels = requested_init_dates(
+            dates,
+            parse_int_list(args.weekdays),
+            args.start_year,
+            args.end_year,
+        )
     raw_files = {label: find_raw_file(raw_dir, label) for label in init_labels}
     missing = [label for label, path in raw_files.items() if path is None]
     if missing:

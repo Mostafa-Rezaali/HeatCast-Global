@@ -9,6 +9,8 @@ from ens_common import (
     intersection_years,
     member_fraction_probability,
 )
+from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu
+from ens_ingest import load_init_list
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -89,3 +91,15 @@ def test_chunk_schema_round_trip_through_stitch_loader(tmp_path: Path):
 def test_intersection_logic_restricts_years_and_init_dates():
     assert intersection_years([1981, 1982, 1983], [1982, 1983, 1984]) == (1982, 1983)
     assert common_init_indices({3: "a", 7: "b", 9: "c"}, {2: "d", 7: "e", 9: "f"}) == (7, 9)
+
+
+def test_s2s_download_dates_and_ingest_init_list(tmp_path: Path):
+    model_dates = list(mjjas_mon_thu(2022))
+    assert model_dates
+    assert all(value.month in (5, 6, 7, 8, 9) and value.weekday() in (0, 3) for value in model_dates)
+    hdates = hindcast_dates(model_dates[0], 20)
+    assert len(hdates) == 20
+    assert hdates[0].year == 2002
+    init_list = tmp_path / "init_list.txt"
+    init_list.write_text("20020502\n20020502\n20020506\n", encoding="utf-8")
+    assert load_init_list(init_list) == ["20020502", "20020506"]

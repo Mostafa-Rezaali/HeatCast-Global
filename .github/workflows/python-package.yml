@@ -36,7 +36,7 @@ jobs:
           stitch_hindcast_tac.py tac_skill_maps.py summarize_hindcast_diagnostics.py \
           compute_baselines.py export_per_year_stats.py bootstrap_significance.py \
           exceedance_eval.py forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py \
-          ens_common.py ens_ingest.py ens_score.py ens_compare.py \
+          ens_common.py download_ecmwf_s2s.py ens_ingest.py ens_score.py ens_compare.py \
           w34_checkpoint_arbitration.py
     - name: Lint with flake8
       run: |
