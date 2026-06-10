@@ -2159,6 +2159,8 @@ def save_incremental_test_chunk(
     truth: np.ndarray,
     base_rate: np.ndarray,
     mask: np.ndarray,
+    init_time_index: Optional[int] = None,
+    target_center_time_index: Optional[int] = None,
 ) -> int:
     valid = (
         mask
@@ -2185,6 +2187,11 @@ def save_incremental_test_chunk(
         year=np.array(int(target_year), dtype=np.int16),
         month=np.array(int(target_month), dtype=np.int8),
         source_fold=np.array(int(source_fold), dtype=np.int16),
+        init_time_index=np.array(-1 if init_time_index is None else int(init_time_index), dtype=np.int32),
+        target_center_time_index=np.array(
+            -1 if target_center_time_index is None else int(target_center_time_index),
+            dtype=np.int32,
+        ),
     )
     return int(np.sum(valid))
 
@@ -3169,6 +3176,8 @@ def evaluate(args: argparse.Namespace) -> None:
                         truth,
                         monthly_climo,
                         mask_np,
+                        init_time_index=t,
+                        target_center_time_index=target_t,
                     )
                     incremental_saved_cells += saved_cells
                     incremental_saved_samples += int(saved_cells > 0)

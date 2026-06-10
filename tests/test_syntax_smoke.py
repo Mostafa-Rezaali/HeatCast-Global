@@ -14,6 +14,7 @@ CORE_SCRIPTS = (
     "export_per_year_stats.py",
     "bootstrap_significance.py",
     "exceedance_eval.py",
+    "forecasts_of_opportunity.py",
 )
 
 
