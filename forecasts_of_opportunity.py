@@ -217,7 +217,8 @@ def roc_auc_from_hist(pos_hist: np.ndarray, neg_hist: np.ndarray) -> float:
     fp = np.cumsum(np.asarray(neg_hist, dtype=np.float64)[::-1])
     tpr = np.r_[0.0, tp / pos_total, 1.0]
     fpr = np.r_[0.0, fp / neg_total, 1.0]
-    return float(np.trapz(tpr, fpr))
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    return float(trapezoid(tpr, fpr))
 
 
 @dataclass

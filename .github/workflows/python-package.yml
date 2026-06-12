@@ -37,13 +37,16 @@ jobs:
           compute_baselines.py export_per_year_stats.py bootstrap_significance.py \
           exceedance_eval.py forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py \
           ens_common.py download_ecmwf_s2s.py ens_ingest.py ens_score.py ens_compare.py \
-          w34_checkpoint_arbitration.py
+          w34_checkpoint_arbitration.py repo_integrity.py
+    - name: Audit repository experiment contracts
+      run: |
+        python repo_integrity.py
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        git ls-files -z '*.py' | xargs -0 flake8 --count --select=E9,F63,F7,F82 --show-source --statistics
         # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        git ls-files -z '*.py' | xargs -0 flake8 --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
     - name: Test with pytest
       run: |
         if find . \( -name "test_*.py" -o -name "*_test.py" \) | grep -q .; then

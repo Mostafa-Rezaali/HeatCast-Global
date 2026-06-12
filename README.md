@@ -130,6 +130,16 @@ Optional analysis/figure dependencies used by some scripts:
 
 ## Quick Sanity Check
 
+Run the repository integrity kit before training or evaluation:
+
+```bash
+python repo_integrity.py
+python -m pytest -q
+```
+
+See `INTEGRITY_TEST_KIT.md` for the protected experiment contracts and limits
+of the data-free checks.
+
 From the HPC work directory:
 
 ```bash

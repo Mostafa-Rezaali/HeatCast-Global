@@ -27,7 +27,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 git pull --ff-only origin codex/tube_v1
-"$PY" -m py_compile cfm_mesh_train.py mesh_backbone.py mode_dispatch.py exceedance_eval.py
+"$PY" -m py_compile repo_integrity.py cfm_mesh_train.py mesh_backbone.py mode_dispatch.py exceedance_eval.py
+"$PY" repo_integrity.py
 
 fold_training_complete() {
     local run=$1

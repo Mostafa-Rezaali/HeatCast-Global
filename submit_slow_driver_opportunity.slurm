@@ -29,7 +29,8 @@ unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 
 git pull --ff-only origin codex/tube_v1
-"$PY" -m py_compile forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py
+"$PY" -m py_compile repo_integrity.py forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py
+"$PY" repo_integrity.py
 
 "$PY" -u recover_chunk_init_dates.py \
   --input_root "$INPUT_ROOT" \

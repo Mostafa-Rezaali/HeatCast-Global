@@ -23,6 +23,7 @@ CORE_SCRIPTS = (
     "ens_score.py",
     "ens_compare.py",
     "w34_checkpoint_arbitration.py",
+    "repo_integrity.py",
 )
 
 

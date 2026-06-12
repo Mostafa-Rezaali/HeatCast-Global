@@ -29,7 +29,8 @@ export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
 git pull --ff-only origin codex/tube_v1
-"$PY" -m py_compile exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
+"$PY" -m py_compile repo_integrity.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
+"$PY" repo_integrity.py
 
 if [ -n "$CHECKPOINT_OVERRIDE" ]; then
     CHECKPOINT=$CHECKPOINT_OVERRIDE

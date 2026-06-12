@@ -23,7 +23,8 @@ unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 
 git pull --ff-only origin codex/tube_v1
-"$PY" -m py_compile ens_common.py ens_ingest.py
+"$PY" -m py_compile repo_integrity.py ens_common.py ens_ingest.py
+"$PY" repo_integrity.py
 "$PY" -u ens_ingest.py \
   --raw_dir ens_reforecast/raw \
   --output_dir ens_reforecast/regridded \

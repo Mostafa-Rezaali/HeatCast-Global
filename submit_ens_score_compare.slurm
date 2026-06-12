@@ -26,7 +26,8 @@ unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 
 git pull --ff-only origin codex/tube_v1
-"$PY" -m py_compile ens_common.py ens_score.py ens_compare.py
+"$PY" -m py_compile repo_integrity.py ens_common.py ens_score.py ens_compare.py
+"$PY" repo_integrity.py
 
 for FOLD in 0 1 2 3 4; do
     "$PY" -u ens_score.py \
