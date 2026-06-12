@@ -328,15 +328,3 @@ Do not commit:
 - `node_modules`
 
 The `.gitignore` file is configured to keep the repository code-only.
-
-## Citation / Paper Framing
-
-Paper framing is:
-
-> A transparent CONUS warm-season day-15 and weekly T2max hindcast benchmark
-> using a GraphCast-style mesh GNN with global teleconnection-aware predictors.
-
-The strongest claim is not broad operational superiority. The strongest claim is
-that the model provides a reproducible neural hindcast benchmark with clear MSE
-gains, modest weekly7 TAC skill, and explicit failure analysis by fold, month,
-and region.
