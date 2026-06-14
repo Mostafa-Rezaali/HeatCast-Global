@@ -318,3 +318,16 @@ def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
     assert required[28] == (6, 7, 9)
     assert 5 not in required[15]
     assert 5 not in required[28]
+
+
+def test_ens_score_submission_runs_bounded_parallel_folds_before_compare():
+    script = (Path(__file__).resolve().parents[1] / "submit_ens_score_compare.slurm").read_text(
+        encoding="utf-8"
+    )
+    assert "FOLD_WORKERS=${FOLD_WORKERS:-2}" in script
+    assert 'score_fold "$FOLD" &' in script
+    assert "wait_for_fold_batch()" in script
+    assert 'if [ "${#PIDS[@]}" -ge "$FOLD_WORKERS" ]; then' in script
+    assert script.index("All ENS folds complete; starting pooled comparison") < script.index(
+        '"$PY" -u ens_compare.py'
+    )

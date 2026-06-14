@@ -201,6 +201,12 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28",
             "--bootstrap_reps 5000",
             '"$PY" repo_integrity.py',
+            "FOLD_WORKERS=${FOLD_WORKERS:-2}",
+            "score_fold()",
+            "wait_for_fold_batch()",
+            'score_fold "$FOLD" &',
+            'if [ "${#PIDS[@]}" -ge "$FOLD_WORKERS" ]; then',
+            "All ENS folds complete; starting pooled comparison",
         ),
     ))
 
