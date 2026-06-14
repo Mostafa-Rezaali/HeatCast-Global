@@ -14,7 +14,7 @@ from ens_common import (
     member_fraction_probability,
 )
 from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, retrieve
-from ens_ingest import load_init_list, load_native_daily_max
+from ens_ingest import load_init_list, load_native_daily_max, validate_ingested_output
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -261,3 +261,46 @@ def test_ens_score_configures_extended_global_fields_before_loading_stats(monkey
     assert ens_score.cfm.Config.CV_TEST_OFFSETS == (2,)
     assert ens_score.cfm.Config.CV_VAL_OFFSETS == (3,)
     assert ens_score.cfm.Config.PREDICTION_LEADS == tuple(range(15, 29))
+
+
+def test_ingest_resume_validator_rejects_corrupt_and_accepts_valid_metadata(tmp_path: Path):
+    corrupt = tmp_path / "init_20010701.npz"
+    corrupt.write_bytes(b"partial output")
+    valid, reason = validate_ingested_output(corrupt, (1, 2, 3), expected_members=2)
+    assert not valid
+    assert "BadZipFile" in reason
+
+    complete = tmp_path / "init_20010702.npz"
+    np.savez_compressed(
+        complete,
+        t2max=np.zeros((2, 3, 1, 1), dtype=np.float32),
+        leads=np.array([1, 2, 3], dtype=np.int16),
+        members=np.array([0, 1], dtype=np.int16),
+        init_date=np.array("20010702"),
+        init_time_index=np.array(456, dtype=np.int32),
+        variable=np.array("mx2t6"),
+    )
+    valid, reason = validate_ingested_output(
+        complete,
+        (1, 2, 3),
+        expected_members=2,
+        expected_label="20010702",
+        expected_init_time_index=456,
+        expected_variable="mx2t6",
+    )
+    assert valid, reason
+
+
+def test_ens_score_reports_all_invalid_ingested_outputs(tmp_path: Path):
+    (tmp_path / "init_20010701.npz").write_bytes(b"partial one")
+    (tmp_path / "init_20010702.npz").write_bytes(b"partial two")
+    try:
+        ens_score.load_ingested_files(tmp_path, (15, 16))
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected invalid ENS outputs to stop scoring.")
+    assert "Found 2 invalid ingested ENS outputs" in message
+    assert "init_20010701.npz" in message
+    assert "init_20010702.npz" in message
+    assert "Rerun submit_ens_ingest.slurm" in message

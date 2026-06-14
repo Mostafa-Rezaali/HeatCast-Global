@@ -10,6 +10,7 @@ import multiprocessing
 import os
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
+import zipfile
 
 import numpy as np
 
@@ -291,6 +292,43 @@ def _write_ingested_output(
         temporary_path.unlink(missing_ok=True)
 
 
+def validate_ingested_output(
+    path: Path,
+    required_leads: Sequence[int],
+    expected_members: int | None = None,
+    expected_label: str | None = None,
+    expected_init_time_index: int | None = None,
+    expected_variable: str | None = None,
+) -> Tuple[bool, str]:
+    required_keys = {"t2max", "leads", "members", "init_date", "init_time_index", "variable"}
+    if not zipfile.is_zipfile(path):
+        return False, "BadZipFile: not a valid NPZ/ZIP archive"
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            missing_keys = sorted(required_keys - set(data.files))
+            if missing_keys:
+                return False, f"missing keys {missing_keys}"
+            leads = tuple(np.atleast_1d(data["leads"]).astype(int).tolist())
+            members = np.atleast_1d(data["members"])
+            label = str(np.asarray(data["init_date"]).item())
+            init_time_index = int(np.asarray(data["init_time_index"]).item())
+            variable = str(np.asarray(data["variable"]).item())
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    missing_leads = sorted(set(int(value) for value in required_leads) - set(leads))
+    if missing_leads:
+        return False, f"missing leads {missing_leads}"
+    if expected_members is not None and members.size != int(expected_members):
+        return False, f"expected {expected_members} members, found {members.size}"
+    if expected_label is not None and label != str(expected_label):
+        return False, f"expected init_date={expected_label}, found {label}"
+    if expected_init_time_index is not None and init_time_index != int(expected_init_time_index):
+        return False, f"expected init_time_index={expected_init_time_index}, found {init_time_index}"
+    if expected_variable is not None and variable != str(expected_variable):
+        return False, f"expected variable={expected_variable}, found {variable}"
+    return True, "valid"
+
+
 def ingest_one_init(
     label: str,
     raw_path: str,
@@ -392,15 +430,28 @@ def main() -> None:
     _, _, target_lat, target_lon = conus_lat_lon((621, 1405))
     tasks = []
     skipped = 0
+    invalid_existing = 0
     for label in init_labels:
         output_path = output_dir / f"init_{label}.npz"
-        if output_path.exists() and not args.overwrite:
-            skipped += 1
-            continue
         init_time_index = date_lookup.get(label)
         if init_time_index is None:
             print(f"Skipping init {label}: date is outside the HeatCast MJJAS time axis.")
             continue
+        if output_path.exists() and not args.overwrite:
+            valid, reason = validate_ingested_output(
+                output_path,
+                range(1, int(args.max_lead) + 1),
+                expected_members=int(args.expected_members),
+                expected_label=label,
+                expected_init_time_index=int(init_time_index),
+                expected_variable=str(args.variable),
+            )
+            if valid:
+                skipped += 1
+                continue
+            print(f"Removing invalid existing output {output_path.name}: {reason}")
+            output_path.unlink()
+            invalid_existing += 1
         tasks.append((
             label,
             str(raw_files[label]),
@@ -413,7 +464,7 @@ def main() -> None:
 
     print(
         f"ENS ingestion plan: total={len(init_labels)}, skipped_existing={skipped}, "
-        f"remaining={len(tasks)}, workers={args.workers}"
+        f"invalid_existing={invalid_existing}, remaining={len(tasks)}, workers={args.workers}"
     )
     if not tasks:
         print(f"ENS ingestion complete: all requested files already exist in {output_dir}")

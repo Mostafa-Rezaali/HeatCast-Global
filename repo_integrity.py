@@ -227,7 +227,9 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "multiprocessing.get_context(\"spawn\")",
             "def ingest_one_init(",
             "def _write_ingested_output(",
+            "def validate_ingested_output(",
             "os.replace(temporary_path, output_path)",
+            "Removing invalid existing output",
         ))
         and all(token in ens_ingest_submission for token in (
             "--cpus-per-task=32",
@@ -244,6 +246,14 @@ def audit_repository(root: Path) -> list[CheckResult]:
         and "cfm.apply_extended_global_fields()" in ens_score
         and ens_score.index("cfm.apply_extended_global_fields()") < ens_score.index("norm_stats = ee.load_norm_stats()"),
         "ENS scoring applies the extended global-field configuration before loading fold norm stats",
+    ))
+
+    results.append(_result(
+        "s2s.score_rejects_corrupt_ingest_contract",
+        "validate_ingested_output(path, window_leads)" in ens_score
+        and "Found {len(invalid_files)} invalid ingested ENS outputs" in ens_score
+        and "Rerun submit_ens_ingest.slurm" in ens_score,
+        "ENS scoring rejects invalid ingested archives with a repair command",
     ))
 
     for relative in (

@@ -20,6 +20,7 @@ from ens_common import (
     fit_quantile_mapping,
     member_fraction_probability,
 )
+from ens_ingest import validate_ingested_output
 
 
 def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> None:
@@ -36,8 +37,13 @@ def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> No
 def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Path]:
     output: Dict[int, Path] = {}
     missing_leads: List[str] = []
+    invalid_files: List[str] = []
     required = set(int(value) for value in window_leads)
     for path in sorted(root.glob("init_*.npz")):
+        valid, reason = validate_ingested_output(path, window_leads)
+        if not valid:
+            invalid_files.append(f"{path.name}: {reason}")
+            continue
         with np.load(path, allow_pickle=False) as data:
             init_t = int(np.asarray(data["init_time_index"]).item())
             available = set(np.atleast_1d(data["leads"]).astype(int).tolist())
@@ -47,6 +53,12 @@ def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Pa
         if init_t in output:
             raise RuntimeError(f"Duplicate ingested ENS init_time_index={init_t}: {output[init_t]} and {path}")
         output[init_t] = path
+    if invalid_files:
+        preview = "\n".join(f"  {line}" for line in invalid_files[:100])
+        raise RuntimeError(
+            f"Found {len(invalid_files)} invalid ingested ENS outputs under {root}:\n{preview}\n"
+            "Rerun submit_ens_ingest.slurm; its resume validator will remove and rebuild them."
+        )
     if missing_leads:
         print("Skipped ingested files that do not contain the requested window:")
         for line in missing_leads[:25]:
