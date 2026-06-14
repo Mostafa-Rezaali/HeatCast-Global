@@ -152,7 +152,12 @@ def main() -> None:
             ) from exc
         client = cdsapi.Client()
 
-    combined_labels = set()
+    combined_path = raw_dir / "init_list.txt"
+    combined_labels = {
+        line.strip()
+        for line in combined_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    } if combined_path.exists() else set()
     for rt_year in rt_years:
         downloads = raw_dir / "downloads" / f"rt{rt_year}"
         parts = raw_dir / "parts" / f"rt{rt_year}"
@@ -178,7 +183,7 @@ def main() -> None:
         print(f"Completed rt{rt_year}: {len(labels)} tagged init files.")
 
     combined = sorted(combined_labels)
-    (raw_dir / "init_list.txt").write_text("\n".join(combined) + "\n", encoding="utf-8")
+    combined_path.write_text("\n".join(combined) + "\n", encoding="utf-8")
     print(f"Done: {len(combined)} unique hdates across cycles; combined labels in init_list.txt")
     print("Next: submit submit_ens_ingest.slurm, then submit_ens_score_compare.slurm.")
 
