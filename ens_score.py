@@ -110,6 +110,25 @@ def mapping_path(cache_dir: Path, month: int, lead: int) -> Path:
     return cache_dir / f"month{int(month):02d}_lead{int(lead):02d}.npz"
 
 
+def required_target_months_by_lead(
+    files_by_init: Mapping[int, Path],
+    months: np.ndarray,
+    window_leads: Sequence[int],
+) -> Dict[int, Tuple[int, ...]]:
+    required: Dict[int, Tuple[int, ...]] = {}
+    for lead in window_leads:
+        target_months = {
+            int(months[int(init_t) + int(lead)])
+            for init_t in files_by_init
+            if int(init_t) + int(lead) < len(months)
+            and int(months[int(init_t) + int(lead)]) in ee.MJJAS_MONTHS
+        }
+        if not target_months:
+            raise RuntimeError(f"No valid ENS target months available for lead={lead}.")
+        required[int(lead)] = tuple(sorted(target_months))
+    return required
+
+
 def build_or_load_quantile_mapping(
     files_by_init: Mapping[int, Path],
     train_years: Iterable[int],
@@ -129,18 +148,23 @@ def build_or_load_quantile_mapping(
     land_count = int(np.sum(land_mask))
     mappings: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
     sanity_errors: List[float] = []
+    required_months = required_target_months_by_lead(files_by_init, months, window_leads)
+    print(
+        "Required ENS target months by lead: "
+        + ", ".join(f"+{lead}:{required_months[int(lead)]}" for lead in window_leads)
+    )
 
     for lead in window_leads:
         grouped: Dict[int, List[Tuple[int, Path]]] = defaultdict(list)
         for init_t, path in files_by_init.items():
             target_t = int(init_t) + int(lead)
-            if target_t >= len(years) or int(years[int(init_t)]) not in train_year_set:
+            if target_t >= len(years) or int(years[target_t]) not in train_year_set:
                 continue
             month = int(months[target_t])
             if month in ee.MJJAS_MONTHS:
                 grouped[month].append((int(init_t), path))
 
-        for month in ee.MJJAS_MONTHS:
+        for month in required_months[int(lead)]:
             path = mapping_path(cache_dir, month, int(lead))
             if path.exists():
                 with np.load(path, allow_pickle=False) as data:
@@ -160,7 +184,10 @@ def build_or_load_quantile_mapping(
                         continue
             pairs = grouped.get(month, [])
             if not pairs:
-                raise RuntimeError(f"No train-year ENS inits available for month={month}, lead={lead}.")
+                raise RuntimeError(
+                    f"No train-year ENS inits available for required target month={month}, lead={lead}. "
+                    f"Required target months for this lead are {required_months[int(lead)]}."
+                )
             source_rows: List[np.ndarray] = []
             target_rows: List[np.ndarray] = []
             for init_t, init_path in pairs:

@@ -304,3 +304,17 @@ def test_ens_score_reports_all_invalid_ingested_outputs(tmp_path: Path):
     assert "init_20010701.npz" in message
     assert "init_20010702.npz" in message
     assert "Rerun submit_ens_ingest.slurm" in message
+
+
+def test_ens_quantile_mapping_requires_only_observed_valid_target_months():
+    months = np.array([5] * 20 + [6] * 30 + [7] * 30 + [8] * 30 + [9] * 30, dtype=np.int16)
+    files_by_init = {
+        10: Path("early.npz"),
+        45: Path("middle.npz"),
+        105: Path("late.npz"),
+    }
+    required = ens_score.required_target_months_by_lead(files_by_init, months, (15, 28))
+    assert required[15] == (6, 7, 9)
+    assert required[28] == (6, 7, 9)
+    assert 5 not in required[15]
+    assert 5 not in required[28]

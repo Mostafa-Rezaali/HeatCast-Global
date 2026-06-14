@@ -256,6 +256,15 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ENS scoring rejects invalid ingested archives with a repair command",
     ))
 
+    results.append(_result(
+        "s2s.score_required_month_coverage_contract",
+        "def required_target_months_by_lead(" in ens_score
+        and "required_months = required_target_months_by_lead(" in ens_score
+        and "for month in required_months[int(lead)]:" in ens_score
+        and "int(years[target_t]) not in train_year_set" in ens_score,
+        "ENS quantile mappings require only observed valid target months and remain target-year fold safe",
+    ))
+
     for relative in (
         "submit_w34_tube_all.slurm",
         "submit_w34_eval_stitch.slurm",
