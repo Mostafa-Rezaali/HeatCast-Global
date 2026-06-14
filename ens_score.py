@@ -30,6 +30,7 @@ def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> No
     cfm.Config.CV_VAL_OFFSETS = ((fold + 1) % int(cv_stride),)
     cfm.Config.MULTI_LEAD_TUBE = True
     cfm.Config.PREDICTION_LEADS = tuple(int(value) for value in window_leads)
+    cfm.apply_extended_global_fields()
 
 
 def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Path]:

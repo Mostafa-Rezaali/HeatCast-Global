@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import ens_ingest as ingest
+import ens_score
 from ens_common import (
     apply_quantile_mapping,
     common_init_indices,
@@ -249,3 +250,14 @@ def test_ingest_worker_writes_atomic_resume_safe_output(monkeypatch, tmp_path: P
         assert np.all(np.isnan(saved["t2max"][:, :, 0, 1]))
         assert saved["init_time_index"].item() == 123
         assert saved["init_date"].item() == "20010701"
+
+
+def test_ens_score_configures_extended_global_fields_before_loading_stats(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ens_score.cfm, "apply_extended_global_fields", lambda: calls.append("extended"))
+    ens_score.configure_fold(2, tuple(range(15, 29)), 5)
+    assert calls == ["extended"]
+    assert ens_score.cfm.Config.CV_FOLD == 2
+    assert ens_score.cfm.Config.CV_TEST_OFFSETS == (2,)
+    assert ens_score.cfm.Config.CV_VAL_OFFSETS == (3,)
+    assert ens_score.cfm.Config.PREDICTION_LEADS == tuple(range(15, 29))

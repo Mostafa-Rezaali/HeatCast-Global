@@ -72,6 +72,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     cfm = _text(root, "cfm_mesh_train.py")
     exceed = _text(root, "exceedance_eval.py")
     ens_ingest = _text(root, "ens_ingest.py")
+    ens_score = _text(root, "ens_score.py")
     mode = _text(root, "mode_dispatch.py")
     mesh = _text(root, "mesh_backbone.py")
     w34_train = _text(root, "submit_w34_tube_all.slurm")
@@ -235,6 +236,14 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "export MKL_NUM_THREADS=1",
         )),
         "ENS ingestion uses bounded process parallelism and atomic resume-safe outputs",
+    ))
+
+    results.append(_result(
+        "s2s.score_extended_global_contract",
+        "def configure_fold(" in ens_score
+        and "cfm.apply_extended_global_fields()" in ens_score
+        and ens_score.index("cfm.apply_extended_global_fields()") < ens_score.index("norm_stats = ee.load_norm_stats()"),
+        "ENS scoring applies the extended global-field configuration before loading fold norm stats",
     ))
 
     for relative in (
