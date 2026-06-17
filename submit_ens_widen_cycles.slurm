@@ -21,6 +21,7 @@ HEATCAST_RUNS=cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold
 ENS_RUN_TEMPLATES='cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024'
 FOLD_WORKERS=${FOLD_WORKERS:-2}
 INGEST_WORKERS=${INGEST_WORKERS:-16}
+WINDOW_LABEL=window_${LEADS//,/-}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -52,6 +53,12 @@ score_fold_cycle() {
         run="${run}_${tag}"
         extra=(--rt_tag "$tag")
     fi
+    local out_dir="ens_exceedance_incremental/${run}/test/${WINDOW_LABEL}"
+    if [ -s "${out_dir}/ens_score_metadata.json" ] && [ -s "${out_dir}/incremental_arrays/manifest.npz" ]; then
+        echo "Skipping complete ENS score: fold=${fold}, cycle=${tag:-legacy}, output=${out_dir}"
+        return 0
+    fi
+    rm -rf "$out_dir"
     "$PY" -u ens_score.py \
       --cv_fold "$fold" \
       --run_name "$run" \

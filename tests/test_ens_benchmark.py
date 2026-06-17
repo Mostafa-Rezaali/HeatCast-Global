@@ -397,6 +397,10 @@ def test_cycle_widen_submission_rescores_legacy_and_merges_by_year():
     )
     assert "INGEST_WORKERS=${INGEST_WORKERS:-16}" in script
     assert '--workers "$INGEST_WORKERS"' in script
+    assert "WINDOW_LABEL=window_${LEADS//,/-}" in script
+    assert "ens_score_metadata.json" in script
+    assert "incremental_arrays/manifest.npz" in script
+    assert "Skipping complete ENS score" in script
     assert "run_cycle \"\"" in script
     assert "run_cycle rt2024" in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script

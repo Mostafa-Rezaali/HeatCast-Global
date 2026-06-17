@@ -336,6 +336,9 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "run_cycle \"\"",
             "run_cycle rt2024",
             "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
+            "WINDOW_LABEL=window_${LEADS//,/-}",
+            "Skipping complete ENS score",
+            "incremental_arrays/manifest.npz",
             "--emit_per_year",
         ),
     ))
