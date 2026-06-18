@@ -435,6 +435,10 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "heatcast_top10_confidence" in source
     assert "ThreadPoolExecutor(max_workers=fold_workers)" in source
     assert "--fold_workers" in source
+    assert "robustness_by_month.csv" in source
+    assert "robustness_by_region.csv" in source
+    assert "robustness_leave_one_out.csv" in source
+    assert "leave-one-" in source
     assert "--mem=500G" in script
     assert "--gres=gpu:1" in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script

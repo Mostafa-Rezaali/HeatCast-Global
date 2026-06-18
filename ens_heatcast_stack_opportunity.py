@@ -165,6 +165,104 @@ def bootstrap_delta_rows(
     return output
 
 
+def summarize_fold_accumulators(
+    accumulators: Mapping[int, ee.EvaluationAccumulator],
+    label_name: str,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for label, acc in sorted(accumulators.items()):
+        for row in acc.summary_rows(REFERENCE):
+            rows.append({label_name: label, **row})
+    return rows
+
+
+def summarize_named_accumulators(
+    accumulators: Mapping[str, ee.EvaluationAccumulator],
+    label_name: str,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for label, acc in sorted(accumulators.items()):
+        for row in acc.summary_rows(REFERENCE):
+            rows.append({label_name: label, **row})
+    return rows
+
+
+def aggregate_eval_accumulators(
+    sources: Iterable[ee.EvaluationAccumulator],
+    model_names: Sequence[str] = MODEL_NAMES,
+) -> ee.EvaluationAccumulator:
+    target = ee.EvaluationAccumulator(model_names, {})
+    for source in sources:
+        for model in model_names:
+            add_metric(target.metrics[model], source.metrics[model])
+    return target
+
+
+def delta_summary_row(
+    label: str,
+    acc: ee.EvaluationAccumulator,
+    candidate: str,
+    baseline: str = ENS_MODEL,
+) -> Dict[str, object]:
+    rows = {str(row["model"]): row for row in acc.summary_rows(REFERENCE)}
+    return {
+        "label": label,
+        "candidate_model": candidate,
+        "baseline_model": baseline,
+        "candidate_bss": rows[candidate]["bss_vs_monthly_climo"],
+        "baseline_bss": rows[baseline]["bss_vs_monthly_climo"],
+        "delta_bss_candidate_minus_baseline": (
+            float(rows[candidate]["bss_vs_monthly_climo"])
+            - float(rows[baseline]["bss_vs_monthly_climo"])
+        ),
+        "candidate_roc_auc": rows[candidate]["roc_auc"],
+        "baseline_roc_auc": rows[baseline]["roc_auc"],
+        "delta_auc_candidate_minus_baseline": (
+            float(rows[candidate]["roc_auc"]) - float(rows[baseline]["roc_auc"])
+        ),
+        "candidate_ece": rows[candidate]["ece"],
+        "baseline_ece": rows[baseline]["ece"],
+        "valid_count": rows[candidate]["valid_count"],
+    }
+
+
+def leave_one_out_rows(
+    group_accumulators: Mapping[object, ee.EvaluationAccumulator],
+    group_name: str,
+    candidates: Sequence[str] = (HEATCAST_MODEL, STACK_MODEL),
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    labels = list(group_accumulators)
+    for dropped in sorted(labels):
+        kept = [acc for label, acc in group_accumulators.items() if label != dropped]
+        if not kept:
+            continue
+        pooled = aggregate_eval_accumulators(kept)
+        for candidate in candidates:
+            row = delta_summary_row(f"drop_{group_name}_{dropped}", pooled, candidate)
+            row["dropped_group_type"] = group_name
+            row["dropped_group_value"] = dropped
+            rows.append(row)
+    return rows
+
+
+def load_region_masks_for_land_order(cell_count: int) -> Dict[str, np.ndarray]:
+    import cfm_mesh_train as cfm
+    from publication_analysis_utils import region_masks
+
+    land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+    land_count = int(np.sum(land_mask))
+    if land_count != int(cell_count):
+        raise RuntimeError(
+            f"Region mask land_count={land_count} does not match chunk cell_count={cell_count}; "
+            "saved chunks may not be full land-order arrays."
+        )
+    return {
+        name: np.asarray(mask, dtype=bool).ravel()[land_mask.ravel()]
+        for name, mask in region_masks(land_mask.shape).items()
+    }
+
+
 def paired_chunk(
     fold: int,
     init_t: int,
@@ -324,10 +422,15 @@ def score_fold_chunks(
     info: Mapping[str, object],
     stacker,
     progress_every: int,
+    region_masks: Mapping[str, np.ndarray] | None = None,
 ) -> Tuple[
     int,
     ee.EvaluationAccumulator,
     Dict[Tuple[int, int], ee.EvaluationAccumulator],
+    Dict[Tuple[int, int], ee.EvaluationAccumulator],
+    Dict[Tuple[int, int, int], ee.EvaluationAccumulator],
+    Dict[str, ee.EvaluationAccumulator],
+    Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
     Dict[str, ee.EvaluationAccumulator],
     Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
     Dict[str, object],
@@ -336,9 +439,18 @@ def score_fold_chunks(
     """Score all paired chunks for one fold, returning independent accumulators."""
     fold_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
     by_fold_year: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
+    by_fold_month: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
+    by_fold_month_year: Dict[Tuple[int, int, int], ee.EvaluationAccumulator] = {}
     subset_acc = {name: ee.EvaluationAccumulator(MODEL_NAMES, {}) for name in SUBSETS}
     subset_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {
         name: {} for name in SUBSETS
+    }
+    region_acc = {
+        name: ee.EvaluationAccumulator(MODEL_NAMES, {})
+        for name in (region_masks or {})
+    }
+    region_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {
+        name: {} for name in (region_masks or {})
     }
     fold_years = set()
     boundaries = info["boundaries"]
@@ -374,9 +486,13 @@ def score_fold_chunks(
             STACK_MODEL: stack_prob,
         }
         year_acc = by_fold_year.setdefault((fold, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
+        month_acc = by_fold_month.setdefault((fold, month), ee.EvaluationAccumulator(MODEL_NAMES, {}))
+        month_year_acc = by_fold_month_year.setdefault((fold, month, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
         for name, probability in forecasts.items():
             fold_acc.update(name, probability, truth, mask, month)
             year_acc.update(name, probability, truth, mask, month)
+            month_acc.update(name, probability, truth, mask, month)
+            month_year_acc.update(name, probability, truth, mask, month)
 
         confidence = np.abs(heat_prob - base)
         subset_masks = {
@@ -401,6 +517,19 @@ def score_fold_chunks(
                 truth,
                 subset_mask,
             )
+        for region_name, region_mask in (region_masks or {}).items():
+            region_selection = mask & region_mask
+            update_subset_accumulators(
+                region_acc,
+                region_year_acc,
+                region_name,
+                fold,
+                year,
+                month,
+                forecasts,
+                truth,
+                region_selection,
+            )
         fold_years.add(year)
         if (index + 1) % max(1, int(progress_every)) == 0:
             print(f"  fold {fold}: scored {index + 1}/{len(info['common'])} paired inits")
@@ -417,7 +546,19 @@ def score_fold_chunks(
         f"Fold {fold}: scored common_inits={len(info['common'])}, "
         f"duplicate-cycle inits={duplicate_cycle_inits}, years={sorted(fold_years)}"
     )
-    return fold, fold_acc, by_fold_year, subset_acc, subset_year_acc, coverage_row, fold_years
+    return (
+        fold,
+        fold_acc,
+        by_fold_year,
+        by_fold_month,
+        by_fold_month_year,
+        subset_acc,
+        subset_year_acc,
+        region_acc,
+        region_year_acc,
+        coverage_row,
+        fold_years,
+    )
 
 
 def update_subset_accumulators(
@@ -459,6 +600,7 @@ def main() -> None:
     parser.add_argument("--max_stack_samples_per_fold", type=int, default=500000)
     parser.add_argument("--fold_workers", type=int, default=1, help="Number of folds to stream concurrently.")
     parser.add_argument("--progress_every", type=int, default=100)
+    parser.add_argument("--disable_region_robustness", action="store_true")
     parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
 
@@ -547,12 +689,38 @@ def main() -> None:
 
     fold_acc: Dict[int, ee.EvaluationAccumulator] = {}
     by_fold_year: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
+    by_fold_month: Dict[Tuple[int, int], ee.EvaluationAccumulator] = {}
+    by_fold_month_year: Dict[Tuple[int, int, int], ee.EvaluationAccumulator] = {}
     subset_acc = {name: ee.EvaluationAccumulator(MODEL_NAMES, {}) for name in SUBSETS}
     subset_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {
         name: {} for name in SUBSETS
     }
+    region_acc: Dict[str, ee.EvaluationAccumulator] = {}
+    region_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {}
     coverage_rows: List[Dict[str, object]] = []
     scored_years = set()
+    region_masks = None
+    if not args.disable_region_robustness:
+        try:
+            first_fold = sorted(fold_inputs)[0]
+            first_init = int(fold_inputs[first_fold]["common"][0])
+            first_data = paired_chunk(
+                first_fold,
+                first_init,
+                fold_inputs[first_fold]["heat_map"][first_init],
+                fold_inputs[first_fold]["ens_sources"],
+                fold_inputs[first_fold]["heat_c"],
+            )
+            region_masks = load_region_masks_for_land_order(len(first_data["truth"]))
+            region_acc = {
+                name: ee.EvaluationAccumulator(MODEL_NAMES, {})
+                for name in region_masks
+            }
+            region_year_acc = {name: {} for name in region_masks}
+            print(f"Region robustness enabled for {len(region_masks)} regions.")
+        except Exception as exc:
+            region_masks = None
+            print(f"WARNING: region robustness disabled: {exc}")
 
     print(f"Scoring paired test chunks with cross-fitted stacker using fold_workers={fold_workers}.")
     with ThreadPoolExecutor(max_workers=fold_workers) as pool:
@@ -563,6 +731,7 @@ def main() -> None:
                 fold_inputs[fold],
                 stackers[fold],
                 int(args.progress_every),
+                region_masks,
             )
             for fold in sorted(fold_inputs)
         ]
@@ -571,19 +740,32 @@ def main() -> None:
                 fold,
                 fold_acc_one,
                 by_fold_year_one,
+                by_fold_month_one,
+                by_fold_month_year_one,
                 subset_acc_one,
                 subset_year_acc_one,
+                region_acc_one,
+                region_year_acc_one,
                 coverage_row,
                 fold_years,
             ) = future.result()
             fold_acc[fold] = fold_acc_one
             by_fold_year.update(by_fold_year_one)
+            by_fold_month.update(by_fold_month_one)
+            by_fold_month_year.update(by_fold_month_year_one)
             coverage_rows.append(coverage_row)
             scored_years.update(fold_years)
             for subset_name in SUBSETS:
                 for model in MODEL_NAMES:
                     add_metric(subset_acc[subset_name].metrics[model], subset_acc_one[subset_name].metrics[model])
                 subset_year_acc[subset_name].update(subset_year_acc_one[subset_name])
+            for region_name in region_acc_one:
+                if region_name not in region_acc:
+                    region_acc[region_name] = ee.EvaluationAccumulator(MODEL_NAMES, {})
+                    region_year_acc[region_name] = {}
+                for model in MODEL_NAMES:
+                    add_metric(region_acc[region_name].metrics[model], region_acc_one[region_name].metrics[model])
+                region_year_acc[region_name].update(region_year_acc_one[region_name])
 
     rows = score_rows_from_folds(fold_acc)
     by_name = {str(row["model"]): row for row in rows}
@@ -614,6 +796,39 @@ def main() -> None:
                     subset_name,
                 )
             )
+    month_acc = {
+        month: aggregate_eval_accumulators(
+            acc for (fold, month_key), acc in by_fold_month.items() if month_key == month
+        )
+        for month in sorted({month for _, month in by_fold_month})
+    }
+    year_acc = {
+        year: aggregate_eval_accumulators(
+            acc for (fold, year_key), acc in by_fold_year.items() if year_key == year
+        )
+        for year in sorted({year for _, year in by_fold_year})
+    }
+    dominance_rows: List[Dict[str, object]] = []
+    dominance_rows.extend(leave_one_out_rows(fold_acc, "fold"))
+    dominance_rows.extend(leave_one_out_rows(month_acc, "month"))
+    dominance_rows.extend(leave_one_out_rows(year_acc, "year"))
+
+    region_rows: List[Dict[str, object]] = summarize_named_accumulators(region_acc, "region") if region_acc else []
+    region_bootstrap_rows: List[Dict[str, object]] = []
+    for region_name, region_by_year in region_year_acc.items():
+        region_years = sorted({year for _, year in region_by_year})
+        if len(region_years) >= 2:
+            region_bootstrap_rows.extend(
+                bootstrap_delta_rows(
+                    region_by_year,
+                    region_years,
+                    (HEATCAST_MODEL, STACK_MODEL),
+                    ENS_MODEL,
+                    int(args.bootstrap_reps),
+                    int(args.seed) + 2000 + len(region_bootstrap_rows),
+                    f"region_{region_name}",
+                )
+            )
 
     out_dir = Path(args.output_dir) / f"window_{ee.lead_list_label(window_leads)}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -632,6 +847,13 @@ def main() -> None:
     ee.write_csv(out_dir / "heatcast_ens_stack_head_to_head.csv", combined_rows)
     ee.write_csv(out_dir / "opportunity_pair_summary.csv", subset_rows)
     ee.write_csv(out_dir / "opportunity_pair_bootstrap.csv", subset_bootstrap_rows)
+    ee.write_csv(out_dir / "robustness_by_fold.csv", summarize_fold_accumulators(fold_acc, "fold"))
+    ee.write_csv(out_dir / "robustness_by_month.csv", summarize_fold_accumulators(month_acc, "month"))
+    ee.write_csv(out_dir / "robustness_by_year.csv", summarize_fold_accumulators(year_acc, "year"))
+    ee.write_csv(out_dir / "robustness_leave_one_out.csv", dominance_rows)
+    if region_rows:
+        ee.write_csv(out_dir / "robustness_by_region.csv", region_rows)
+        ee.write_csv(out_dir / "robustness_region_bootstrap.csv", region_bootstrap_rows)
     ee.write_csv(
         out_dir / "stacker_coefficients.csv",
         [
@@ -675,6 +897,24 @@ def main() -> None:
                 f"CI=[{row['ci_low']:+.4f},{row['ci_high']:+.4f}], "
                 f"excludes_zero={row['ci_excludes_zero']}"
             )
+    print("\nRobustness checks")
+    print("=================")
+    for group_type in ("fold", "month", "year"):
+        stack_rows = [
+            row for row in dominance_rows
+            if row["dropped_group_type"] == group_type and row["candidate_model"] == STACK_MODEL
+        ]
+        if stack_rows:
+            deltas = np.asarray([row["delta_bss_candidate_minus_baseline"] for row in stack_rows], dtype=np.float64)
+            print(
+                f"  leave-one-{group_type}: Stack-vs-ENS delta_BSS "
+                f"min={np.nanmin(deltas):+.4f}, max={np.nanmax(deltas):+.4f}, "
+                f"n={len(stack_rows)}"
+            )
+    if region_acc:
+        print(f"  region robustness: wrote {len(region_acc)} regions with year-block bootstrap.")
+    else:
+        print("  region robustness: unavailable from current chunk metadata/mask state.")
     print("Cross-fit assert: PASS (each scored fold excluded from its own HeatCast+ENS stacker fit).")
     print("Paired alignment assert: PASS (HeatCast and ENS matched by init_time_index and identical truth/base fields).")
     print(

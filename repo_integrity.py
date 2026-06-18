@@ -224,6 +224,10 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "opportunity_pair_bootstrap.csv",
             "ThreadPoolExecutor(max_workers=fold_workers)",
             "--fold_workers",
+            "robustness_by_month.csv",
+            "robustness_by_region.csv",
+            "robustness_leave_one_out.csv",
+            "Region robustness enabled",
             "Cross-fit assert: PASS",
         ),
     ))
