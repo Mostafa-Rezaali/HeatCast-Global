@@ -169,6 +169,38 @@ def build_mechanism_block(stack_dir: Path, opportunity_dir: Path) -> List[Dict[s
                 "interpretation": "Regional Stack-vs-ENS incremental skill.",
             })
 
+    for row in read_csv(stack_dir / "driver_pair_bootstrap.csv", required=False):
+        if row.get("candidate_model") == STACK_MODEL and row.get("metric", "").startswith("delta_bss"):
+            if ":" not in str(row.get("comparison_set", "")):
+                continue
+            axis, stratum = str(row.get("comparison_set", "")).split(":", 1)
+            rows.append({
+                "evidence_type": "paired_stack_vs_ens_driver",
+                "axis": axis,
+                "stratum": stratum,
+                "delta_bss": f(row["point_estimate"]),
+                "ci_low": f(row["ci_low"]),
+                "ci_high": f(row["ci_high"]),
+                "ci_excludes_zero": row["ci_excludes_zero"],
+                "interpretation": "Driver-stratified Stack-vs-ENS incremental skill on identical samples.",
+            })
+    for row in read_csv(stack_dir / "driver_pair_parent_bootstrap.csv", required=False):
+        if row.get("metric") == "delta_bss_stack_vs_ens_child_minus_parent":
+            rows.append({
+                "evidence_type": "paired_stack_vs_ens_driver_parent_comparison",
+                "axis": row.get("interaction_axis", ""),
+                "stratum": row.get("interaction_stratum", ""),
+                "parent_kind": row.get("parent_kind", ""),
+                "parent_axis": row.get("parent_axis", ""),
+                "parent_stratum": row.get("parent_stratum", ""),
+                "delta_bss": f(row.get("point_estimate")),
+                "ci_low": f(row.get("ci_low")),
+                "ci_high": f(row.get("ci_high")),
+                "p_value": f(row.get("p_value")),
+                "ci_excludes_zero": row.get("ci_excludes_zero", ""),
+                "interpretation": "Whether a driver interaction improves Stack-vs-ENS delta beyond its parent selection or driver stratum.",
+            })
+
     driver_summary = read_csv(opportunity_dir / "driver_opportunity_summary.csv", required=False)
     for row in driver_summary:
         axis = row.get("axis", "")
@@ -276,8 +308,8 @@ def write_summary(path: Path, headline: Mapping[str, object], mechanism: Sequenc
         ),
         "",
         "## Mechanism Block",
-        "- Use paired Stack-vs-ENS regional and opportunity rows as primary mechanism evidence.",
-        "- Use MJO/ENSO/soil rows as HeatCast-only driver stratification evidence unless paired ENS columns are added.",
+        "- Use paired Stack-vs-ENS regional, opportunity, and driver rows as primary mechanism evidence.",
+        "- Treat HeatCast-only MJO/ENSO/soil rows as secondary context when paired driver rows are absent or sparse.",
         "- Strongest paired regional candidates are listed in mechanism_block.csv.",
         "",
         "## Operational Block",

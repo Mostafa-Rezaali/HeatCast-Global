@@ -6,9 +6,6 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=500G
 #SBATCH --time=2-00:00:00
-#SBATCH --partition=hpg-b200
-#SBATCH --qos=nessie
-#SBATCH --gres=gpu:1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mostafarezaali@ufl.edu
 
@@ -24,9 +21,11 @@ RMM_PATH=${RMM_PATH:?Set RMM_PATH to the manually downloaded BOM rmm.74toRealtim
 NINO34_PATH=${NINO34_PATH:?Set NINO34_PATH to the manually downloaded NOAA PSL Nino3.4 text file}
 
 cd "$WORK_DIR"
-module load cuda/12.9.1
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
 
 git pull --ff-only origin codex/tube_v1
 "$PY" -m py_compile repo_integrity.py forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py

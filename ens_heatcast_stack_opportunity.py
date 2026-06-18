@@ -13,7 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -46,6 +46,11 @@ STACK_FEATURE_NAMES = (
     "heatcast_sigma",
 )
 SUBSETS = ("all", "heatcast_top10_confidence", "heatcast_low_sigma_tercile", "heatcast_top10_and_low_sigma")
+DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
+DRIVER_PARENT_SELECTIONS = {
+    "top_confidence": "heatcast_top10_confidence",
+    "low_sigma": "heatcast_low_sigma_tercile",
+}
 
 
 def logit(probability: np.ndarray) -> np.ndarray:
@@ -165,6 +170,139 @@ def bootstrap_delta_rows(
     return output
 
 
+def driver_key(axis: str, stratum: str) -> str:
+    return f"{axis}::{stratum}"
+
+
+def split_driver_key(key: str) -> Tuple[str, str]:
+    if "::" not in str(key):
+        raise ValueError(f"Invalid driver stratum key: {key!r}")
+    axis, stratum = str(key).split("::", 1)
+    return axis, stratum
+
+
+def driver_interaction_parent_pairs(keys: Iterable[str]) -> List[Tuple[str, str, str, str]]:
+    """Return driver interaction child/parent pairs for paired Stack-vs-ENS tests."""
+    key_set = set(str(key) for key in keys)
+    pairs: List[Tuple[str, str, str, str]] = []
+    for key in sorted(key_set):
+        axis, stratum = split_driver_key(key)
+        if "__" not in stratum or "_x_" not in axis:
+            continue
+        driver_axis = axis.split("_x_", 1)[0]
+        driver_stratum = stratum.split("__", 1)[0]
+        driver_parent = driver_key(driver_axis, driver_stratum)
+        if axis.endswith("_x_top_confidence"):
+            selection_parent = DRIVER_PARENT_SELECTIONS["top_confidence"]
+            selection_kind = "selection_parent_top_confidence"
+        elif axis.endswith("_x_low_sigma"):
+            selection_parent = DRIVER_PARENT_SELECTIONS["low_sigma"]
+            selection_kind = "selection_parent_low_sigma"
+        else:
+            continue
+        if selection_parent:
+            pairs.append((key, selection_kind, "subset", selection_parent))
+        if driver_parent in key_set:
+            pairs.append((key, "driver_parent", "driver", driver_parent))
+    return pairs
+
+
+def _delta_from_rows(
+    rows: Mapping[str, Mapping[str, object]],
+    candidate: str,
+    baseline: str,
+    metric: str,
+) -> float:
+    if metric == "bss":
+        field = "bss_vs_monthly_climo"
+    elif metric == "auc":
+        field = "weighted_per_fold_roc_auc"
+    else:
+        raise ValueError(metric)
+    return float(rows[candidate][field]) - float(rows[baseline][field])
+
+
+def bootstrap_parent_delta_rows(
+    child_by_year: Mapping[Tuple[int, int], ee.EvaluationAccumulator],
+    parent_by_year: Mapping[Tuple[int, int], ee.EvaluationAccumulator],
+    child_label: str,
+    parent_label: str,
+    parent_kind: str,
+    reps: int,
+    seed: int,
+    candidate: str = STACK_MODEL,
+    baseline: str = ENS_MODEL,
+) -> List[Dict[str, object]]:
+    """Bootstrap whether a child stratum improves Stack-vs-ENS delta over its parent."""
+    years = np.array(sorted({int(year) for _, year in child_by_year}), dtype=np.int16)
+    if years.size < 2:
+        return []
+    rng = np.random.default_rng(int(seed))
+    child_point = {
+        str(row["model"]): row
+        for row in score_rows_from_folds(aggregate_selected_years(child_by_year, years))
+    }
+    parent_point = {
+        str(row["model"]): row
+        for row in score_rows_from_folds(aggregate_selected_years(parent_by_year, years))
+    }
+    samples = {"bss": [], "auc": []}
+    for _ in range(int(reps)):
+        selected = rng.choice(years, size=years.size, replace=True)
+        child_rows = {
+            str(row["model"]): row
+            for row in score_rows_from_folds(aggregate_selected_years(child_by_year, selected))
+        }
+        parent_rows = {
+            str(row["model"]): row
+            for row in score_rows_from_folds(aggregate_selected_years(parent_by_year, selected))
+        }
+        for metric in samples:
+            samples[metric].append(
+                _delta_from_rows(child_rows, candidate, baseline, metric)
+                - _delta_from_rows(parent_rows, candidate, baseline, metric)
+            )
+
+    output: List[Dict[str, object]] = []
+    child_axis, child_stratum = split_driver_key(child_label)
+    if "::" in parent_label:
+        parent_axis, parent_stratum = split_driver_key(parent_label)
+    else:
+        parent_axis, parent_stratum = "opportunity_selection", parent_label
+    for metric in ("bss", "auc"):
+        point = (
+            _delta_from_rows(child_point, candidate, baseline, metric)
+            - _delta_from_rows(parent_point, candidate, baseline, metric)
+        )
+        values = np.asarray(samples[metric], dtype=np.float64)
+        finite = values[np.isfinite(values)]
+        if finite.size:
+            lo, hi = np.nanpercentile(finite, [2.5, 97.5])
+            lower_tail = (np.sum(finite <= 0.0) + 1.0) / (finite.size + 1.0)
+            upper_tail = (np.sum(finite >= 0.0) + 1.0) / (finite.size + 1.0)
+            p_value = min(1.0, 2.0 * min(lower_tail, upper_tail))
+        else:
+            lo = hi = p_value = float("nan")
+        output.append({
+            "interaction_axis": child_axis,
+            "interaction_stratum": child_stratum,
+            "parent_kind": parent_kind,
+            "parent_axis": parent_axis,
+            "parent_stratum": parent_stratum,
+            "candidate_model": candidate,
+            "baseline_model": baseline,
+            "metric": f"delta_{metric}_stack_vs_ens_child_minus_parent",
+            "point_estimate": float(point),
+            "ci_low": float(lo),
+            "ci_high": float(hi),
+            "ci_excludes_zero": bool(lo > 0.0 or hi < 0.0),
+            "p_value": float(p_value),
+            "bootstrap_reps": int(reps),
+            "independent_year_blocks": int(years.size),
+        })
+    return output
+
+
 def summarize_fold_accumulators(
     accumulators: Mapping[int, ee.EvaluationAccumulator],
     label_name: str,
@@ -184,6 +322,17 @@ def summarize_named_accumulators(
     for label, acc in sorted(accumulators.items()):
         for row in acc.summary_rows(REFERENCE):
             rows.append({label_name: label, **row})
+    return rows
+
+
+def summarize_driver_accumulators(
+    accumulators: Mapping[str, ee.EvaluationAccumulator],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for key, acc in sorted(accumulators.items()):
+        axis, stratum = split_driver_key(key)
+        for row in acc.summary_rows(REFERENCE):
+            rows.append({"axis": axis, "stratum": stratum, **row})
     return rows
 
 
@@ -304,6 +453,8 @@ def paired_chunk(
         "sigma": sigma,
         "year": scalar(heat, "year"),
         "month": scalar(heat, "month"),
+        "source_fold": scalar(heat, "source_fold") if "source_fold" in heat else fold,
+        "init_time_index": scalar(heat, "init_time_index"),
         "target_center_time_index": scalar(heat, "target_center_time_index"),
     }
 
@@ -423,12 +574,15 @@ def score_fold_chunks(
     stacker,
     progress_every: int,
     region_masks: Mapping[str, np.ndarray] | None = None,
+    driver_lookup: Optional[object] = None,
 ) -> Tuple[
     int,
     ee.EvaluationAccumulator,
     Dict[Tuple[int, int], ee.EvaluationAccumulator],
     Dict[Tuple[int, int], ee.EvaluationAccumulator],
     Dict[Tuple[int, int, int], ee.EvaluationAccumulator],
+    Dict[str, ee.EvaluationAccumulator],
+    Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
     Dict[str, ee.EvaluationAccumulator],
     Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]],
     Dict[str, ee.EvaluationAccumulator],
@@ -452,14 +606,19 @@ def score_fold_chunks(
     region_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {
         name: {} for name in (region_masks or {})
     }
+    driver_acc: Dict[str, ee.EvaluationAccumulator] = {}
+    driver_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {}
     fold_years = set()
     boundaries = info["boundaries"]
     duplicate_cycle_inits = 0
+    soil_undefined = 0
+    soil_total = 0
     for index, init_t in enumerate(info["common"]):
+        heat_path = info["heat_map"][int(init_t)]
         data = paired_chunk(
             fold,
             int(init_t),
-            info["heat_map"][int(init_t)],
+            heat_path,
             info["ens_sources"],
             info["heat_c"],
         )
@@ -530,6 +689,48 @@ def score_fold_chunks(
                 truth,
                 region_selection,
             )
+        if driver_lookup is not None:
+            driver_selections = driver_lookup.sample_strata(fold, heat_path, data)[1]
+            top_selection = confidence >= boundaries["top10_confidence_threshold"]
+            low_sigma = sigma <= boundaries["low_sigma_threshold"]
+            for driver_axis, strata in driver_selections.items():
+                for stratum, driver_selection in strata.items():
+                    driver_selection = np.asarray(driver_selection, dtype=bool)
+                    base_key = driver_key(driver_axis, stratum)
+                    top_key = driver_key(
+                        f"{driver_axis}_x_top_confidence",
+                        f"{stratum}__top_10pct_ge_p90",
+                    )
+                    low_key = driver_key(
+                        f"{driver_axis}_x_low_sigma",
+                        f"{stratum}__bottom_sigma_tercile",
+                    )
+                    for key, selection in (
+                        (base_key, driver_selection),
+                        (top_key, driver_selection & top_selection),
+                        (low_key, driver_selection & low_sigma),
+                    ):
+                        selected_mask = mask & selection
+                        if not np.any(selected_mask):
+                            continue
+                        if key not in driver_acc:
+                            driver_acc[key] = ee.EvaluationAccumulator(MODEL_NAMES, {})
+                            driver_year_acc[key] = {}
+                        update_subset_accumulators(
+                            driver_acc,
+                            driver_year_acc,
+                            key,
+                            fold,
+                            year,
+                            month,
+                            forecasts,
+                            truth,
+                            selected_mask,
+                        )
+                if driver_axis == "soil_moisture_tercile":
+                    undefined = np.asarray(strata.get("undefined", np.zeros_like(mask)), dtype=bool)
+                    soil_undefined += int(np.sum(undefined))
+                    soil_total += int(undefined.size)
         fold_years.add(year)
         if (index + 1) % max(1, int(progress_every)) == 0:
             print(f"  fold {fold}: scored {index + 1}/{len(info['common'])} paired inits")
@@ -546,6 +747,11 @@ def score_fold_chunks(
         f"Fold {fold}: scored common_inits={len(info['common'])}, "
         f"duplicate-cycle inits={duplicate_cycle_inits}, years={sorted(fold_years)}"
     )
+    if driver_lookup is not None:
+        undefined_fraction = soil_undefined / max(soil_total, 1)
+        if undefined_fraction >= 0.05:
+            raise RuntimeError(f"Fold {fold}: undefined soil percentile fraction={undefined_fraction:.4f} >= 0.05.")
+        print(f"Fold {fold}: paired slow-driver strata scored; soil undefined={undefined_fraction:.4%}.")
     return (
         fold,
         fold_acc,
@@ -556,6 +762,8 @@ def score_fold_chunks(
         subset_year_acc,
         region_acc,
         region_year_acc,
+        driver_acc,
+        driver_year_acc,
         coverage_row,
         fold_years,
     )
@@ -601,6 +809,11 @@ def main() -> None:
     parser.add_argument("--fold_workers", type=int, default=1, help="Number of folds to stream concurrently.")
     parser.add_argument("--progress_every", type=int, default=100)
     parser.add_argument("--disable_region_robustness", action="store_true")
+    parser.add_argument(
+        "--driver_table_dir",
+        default="",
+        help="Optional fold-safe slow-driver table directory from build_driver_tables.py.",
+    )
     parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
 
@@ -697,21 +910,34 @@ def main() -> None:
     }
     region_acc: Dict[str, ee.EvaluationAccumulator] = {}
     region_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {}
+    driver_acc: Dict[str, ee.EvaluationAccumulator] = {}
+    driver_year_acc: Dict[str, Dict[Tuple[int, int], ee.EvaluationAccumulator]] = {}
     coverage_rows: List[Dict[str, object]] = []
     scored_years = set()
+    first_fold = sorted(fold_inputs)[0]
+    first_init = int(fold_inputs[first_fold]["common"][0])
+    first_data = paired_chunk(
+        first_fold,
+        first_init,
+        fold_inputs[first_fold]["heat_map"][first_init],
+        fold_inputs[first_fold]["ens_sources"],
+        fold_inputs[first_fold]["heat_c"],
+    )
+    land_count = len(first_data["truth"])
+    driver_lookup = None
+    if str(args.driver_table_dir).strip():
+        from forecasts_of_opportunity import load_driver_lookup
+
+        driver_lookup = load_driver_lookup(
+            Path(args.driver_table_dir),
+            [fold_inputs[fold]["manifest"] for fold in sorted(fold_inputs)],
+            int(land_count),
+        )
+        print(f"Paired slow-driver Stack-vs-ENS tests enabled from {args.driver_table_dir}.")
     region_masks = None
     if not args.disable_region_robustness:
         try:
-            first_fold = sorted(fold_inputs)[0]
-            first_init = int(fold_inputs[first_fold]["common"][0])
-            first_data = paired_chunk(
-                first_fold,
-                first_init,
-                fold_inputs[first_fold]["heat_map"][first_init],
-                fold_inputs[first_fold]["ens_sources"],
-                fold_inputs[first_fold]["heat_c"],
-            )
-            region_masks = load_region_masks_for_land_order(len(first_data["truth"]))
+            region_masks = load_region_masks_for_land_order(land_count)
             region_acc = {
                 name: ee.EvaluationAccumulator(MODEL_NAMES, {})
                 for name in region_masks
@@ -732,6 +958,7 @@ def main() -> None:
                 stackers[fold],
                 int(args.progress_every),
                 region_masks,
+                driver_lookup,
             )
             for fold in sorted(fold_inputs)
         ]
@@ -746,6 +973,8 @@ def main() -> None:
                 subset_year_acc_one,
                 region_acc_one,
                 region_year_acc_one,
+                driver_acc_one,
+                driver_year_acc_one,
                 coverage_row,
                 fold_years,
             ) = future.result()
@@ -766,6 +995,13 @@ def main() -> None:
                 for model in MODEL_NAMES:
                     add_metric(region_acc[region_name].metrics[model], region_acc_one[region_name].metrics[model])
                 region_year_acc[region_name].update(region_year_acc_one[region_name])
+            for key, acc_one in driver_acc_one.items():
+                if key not in driver_acc:
+                    driver_acc[key] = ee.EvaluationAccumulator(MODEL_NAMES, {})
+                    driver_year_acc[key] = {}
+                for model in MODEL_NAMES:
+                    add_metric(driver_acc[key].metrics[model], acc_one.metrics[model])
+                driver_year_acc[key].update(driver_year_acc_one[key])
 
     rows = score_rows_from_folds(fold_acc)
     by_name = {str(row["model"]): row for row in rows}
@@ -830,6 +1066,43 @@ def main() -> None:
                 )
             )
 
+    driver_rows: List[Dict[str, object]] = summarize_driver_accumulators(driver_acc) if driver_acc else []
+    driver_bootstrap_rows: List[Dict[str, object]] = []
+    driver_parent_rows: List[Dict[str, object]] = []
+    for key, key_by_year in sorted(driver_year_acc.items()):
+        key_years = sorted({year for _, year in key_by_year})
+        if len(key_years) >= 2:
+            axis, stratum = split_driver_key(key)
+            driver_bootstrap_rows.extend(
+                bootstrap_delta_rows(
+                    key_by_year,
+                    key_years,
+                    (HEATCAST_MODEL, STACK_MODEL),
+                    ENS_MODEL,
+                    int(args.bootstrap_reps),
+                    int(args.seed) + 3000 + len(driver_bootstrap_rows),
+                    f"{axis}:{stratum}",
+                )
+            )
+    for child_key, parent_kind, parent_source, parent_key in driver_interaction_parent_pairs(driver_year_acc):
+        parent_by_year = (
+            subset_year_acc[parent_key]
+            if parent_source == "subset"
+            else driver_year_acc.get(parent_key, {})
+        )
+        if parent_by_year:
+            driver_parent_rows.extend(
+                bootstrap_parent_delta_rows(
+                    driver_year_acc[child_key],
+                    parent_by_year,
+                    child_key,
+                    parent_key,
+                    parent_kind,
+                    int(args.bootstrap_reps),
+                    int(args.seed) + 4000 + len(driver_parent_rows),
+                )
+            )
+
     out_dir = Path(args.output_dir) / f"window_{ee.lead_list_label(window_leads)}"
     out_dir.mkdir(parents=True, exist_ok=True)
     combined_rows: List[Dict[str, object]] = []
@@ -854,6 +1127,10 @@ def main() -> None:
     if region_rows:
         ee.write_csv(out_dir / "robustness_by_region.csv", region_rows)
         ee.write_csv(out_dir / "robustness_region_bootstrap.csv", region_bootstrap_rows)
+    if driver_rows:
+        ee.write_csv(out_dir / "driver_pair_summary.csv", driver_rows)
+        ee.write_csv(out_dir / "driver_pair_bootstrap.csv", driver_bootstrap_rows)
+        ee.write_csv(out_dir / "driver_pair_parent_bootstrap.csv", driver_parent_rows)
     ee.write_csv(
         out_dir / "stacker_coefficients.csv",
         [
@@ -915,6 +1192,37 @@ def main() -> None:
         print(f"  region robustness: wrote {len(region_acc)} regions with year-block bootstrap.")
     else:
         print("  region robustness: unavailable from current chunk metadata/mask state.")
+    if driver_acc:
+        print("\nPaired driver-stratified Stack-vs-ENS tests")
+        print("===========================================")
+        print(
+            f"  wrote {len(driver_acc)} driver/intersection strata, "
+            f"{len(driver_bootstrap_rows)} Stack-vs-ENS bootstrap rows, "
+            f"{len(driver_parent_rows)} parent-comparison rows."
+        )
+        required = {
+            ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "selection_parent_top_confidence"),
+            ("mjo_phase_x_top_confidence", "phase_8__top_10pct_ge_p90", "driver_parent"),
+            ("mjo_phase_x_low_sigma", "phase_8__bottom_sigma_tercile", "selection_parent_low_sigma"),
+            ("mjo_phase_x_low_sigma", "phase_8__bottom_sigma_tercile", "driver_parent"),
+        }
+        found = 0
+        for row in driver_parent_rows:
+            if row["metric"] != "delta_bss_stack_vs_ens_child_minus_parent":
+                continue
+            key = (str(row["interaction_axis"]), str(row["interaction_stratum"]), str(row["parent_kind"]))
+            if key in required:
+                found += 1
+                print(
+                    f"  {row['interaction_axis']}:{row['interaction_stratum']} vs "
+                    f"{row['parent_kind']} {row['parent_axis']}:{row['parent_stratum']} "
+                    f"delta(Stack-ENS BSS)={row['point_estimate']:+.4f} "
+                    f"CI=[{row['ci_low']:+.4f},{row['ci_high']:+.4f}], "
+                    f"excludes_zero={row['ci_excludes_zero']}"
+                )
+        print(f"  required phase-8 parent comparisons found={found}/4")
+    else:
+        print("  paired driver-stratified Stack-vs-ENS tests: skipped (no --driver_table_dir).")
     print("Cross-fit assert: PASS (each scored fold excluded from its own HeatCast+ENS stacker fit).")
     print("Paired alignment assert: PASS (HeatCast and ENS matched by init_time_index and identical truth/base fields).")
     print(

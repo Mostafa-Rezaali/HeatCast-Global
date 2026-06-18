@@ -182,12 +182,20 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "submit_slow_driver_opportunity.slurm",
         (
             "--mem=500G",
-            "--gres=gpu:1",
             f"--mail-user={EMAIL}",
             "--driver_table_dir \"$DRIVER_DIR\"",
             "--bootstrap_axes mjo_phase,enso_state,soil_moisture_tercile",
             '"$PY" repo_integrity.py',
+            "OPENBLAS_NUM_THREADS=1",
         ),
+    ))
+    slow_driver_submit = _text(root, "submit_slow_driver_opportunity.slurm")
+    results.append(_result(
+        "opportunity.slow_driver_cpu_only_submission",
+        "--gres=gpu" not in slow_driver_submit
+        and "module load cuda" not in slow_driver_submit
+        and "--partition=hpg-b200" not in slow_driver_submit,
+        "Slow-driver opportunity analysis is CPU-only and does not request B200 GPUs",
     ))
 
     results.append(_required_tokens_check(
@@ -228,6 +236,10 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "robustness_by_region.csv",
             "robustness_leave_one_out.csv",
             "Region robustness enabled",
+            "--driver_table_dir",
+            "driver_pair_bootstrap.csv",
+            "driver_pair_parent_bootstrap.csv",
+            "Paired driver-stratified Stack-vs-ENS tests",
             "Cross-fit assert: PASS",
         ),
     ))
@@ -245,6 +257,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--bootstrap_reps 5000",
             "--max_stack_samples_per_fold 500000",
             "FOLD_WORKERS=${FOLD_WORKERS:-5}",
+            "DRIVER_ARGS=()",
+            "DRIVER_TABLE_DIR",
             '--fold_workers "$FOLD_WORKERS"',
             "OMP_NUM_THREADS=1",
         ),
@@ -268,6 +282,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "operational_block.csv",
             "paper_evidence_summary.md",
             "MJO/ENSO/soil",
+            "paired_stack_vs_ens_driver",
+            "driver_pair_parent_bootstrap.csv",
             "Stack minus ENS delta BSS",
         ),
     ))

@@ -439,6 +439,10 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "robustness_by_region.csv" in source
     assert "robustness_leave_one_out.csv" in source
     assert "leave-one-" in source
+    assert "--driver_table_dir" in source
+    assert "driver_pair_bootstrap.csv" in source
+    assert "driver_pair_parent_bootstrap.csv" in source
+    assert "Paired driver-stratified Stack-vs-ENS tests" in source
     assert "--mem=500G" in script
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script
@@ -446,6 +450,8 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
     assert "--max_stack_samples_per_fold 500000" in script
     assert "FOLD_WORKERS=${FOLD_WORKERS:-5}" in script
+    assert "DRIVER_ARGS=()" in script
+    assert "DRIVER_TABLE_DIR" in script
     assert '--fold_workers "$FOLD_WORKERS"' in script
     assert "OMP_NUM_THREADS=1" in script
 
@@ -459,6 +465,8 @@ def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
     assert "operational_block.csv" in source
     assert "paper_evidence_summary.md" in source
     assert "MJO/ENSO/soil" in source
+    assert "paired_stack_vs_ens_driver" in source
+    assert "driver_pair_parent_bootstrap.csv" in source
     assert "Stack minus ENS delta BSS" in source
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script

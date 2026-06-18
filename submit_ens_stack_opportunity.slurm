@@ -18,6 +18,10 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 FOLD_WORKERS=${FOLD_WORKERS:-5}
+DRIVER_ARGS=()
+if [ -n "${DRIVER_TABLE_DIR:-}" ]; then
+  DRIVER_ARGS=(--driver_table_dir "$DRIVER_TABLE_DIR")
+fi
 
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
@@ -38,4 +42,5 @@ git pull --ff-only origin codex/tube_v1
   --bootstrap_reps 5000 \
   --max_stack_samples_per_fold 500000 \
   --fold_workers "$FOLD_WORKERS" \
-  --emit_per_year
+  --emit_per_year \
+  "${DRIVER_ARGS[@]}"
