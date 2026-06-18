@@ -6,18 +6,18 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=500G
 #SBATCH --time=1-00:00:00
-#SBATCH --partition=hpg-b200
-#SBATCH --qos=nessie
-#SBATCH --gres=gpu:1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mostafarezaali@ufl.edu
 
 set -euo pipefail
 
-module load cuda/12.9.1
 unset PYTHONHOME
 unset PYTHONPATH
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+FOLD_WORKERS=${FOLD_WORKERS:-5}
 
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
@@ -37,5 +37,5 @@ git pull --ff-only origin codex/tube_v1
   --output_dir ens_heatcast_stack_opportunity \
   --bootstrap_reps 5000 \
   --max_stack_samples_per_fold 500000 \
-  --fold_workers 5 \
+  --fold_workers "$FOLD_WORKERS" \
   --emit_per_year

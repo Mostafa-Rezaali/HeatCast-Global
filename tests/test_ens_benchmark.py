@@ -440,10 +440,14 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "robustness_leave_one_out.csv" in source
     assert "leave-one-" in source
     assert "--mem=500G" in script
-    assert "--gres=gpu:1" in script
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--partition=hpg-b200" not in script
     assert "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024" in script
     assert "--max_stack_samples_per_fold 500000" in script
-    assert "--fold_workers 5" in script
+    assert "FOLD_WORKERS=${FOLD_WORKERS:-5}" in script
+    assert '--fold_workers "$FOLD_WORKERS"' in script
+    assert "OMP_NUM_THREADS=1" in script
 
 
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():

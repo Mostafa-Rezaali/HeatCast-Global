@@ -238,15 +238,24 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "submit_ens_stack_opportunity.slurm",
         (
             "--mem=500G",
-            "--gres=gpu:1",
             f"--mail-user={EMAIL}",
             "git pull --ff-only origin codex/tube_v1",
             "ens_heatcast_stack_opportunity.py",
             "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
             "--bootstrap_reps 5000",
             "--max_stack_samples_per_fold 500000",
-            "--fold_workers 5",
+            "FOLD_WORKERS=${FOLD_WORKERS:-5}",
+            '--fold_workers "$FOLD_WORKERS"',
+            "OMP_NUM_THREADS=1",
         ),
+    ))
+    stack_submit = _text(root, "submit_ens_stack_opportunity.slurm")
+    results.append(_result(
+        "s2s.stack_opportunity_cpu_only_submission",
+        "--gres=gpu" not in stack_submit
+        and "module load cuda" not in stack_submit
+        and "--partition=hpg-b200" not in stack_submit,
+        "Stack/opportunity paired postprocessing is CPU-only and does not request B200 GPUs",
     ))
 
     results.append(_result(
