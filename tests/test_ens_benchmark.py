@@ -450,6 +450,23 @@ def test_heatcast_ens_stack_opportunity_is_cross_fitted_and_paired():
     assert "OMP_NUM_THREADS=1" in script
 
 
+def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "build_paper_evidence_blocks.py").read_text(encoding="utf-8")
+    script = (root / "submit_paper_evidence_blocks.slurm").read_text(encoding="utf-8")
+    assert "mechanism_block.csv" in source
+    assert "robustness_block.csv" in source
+    assert "operational_block.csv" in source
+    assert "paper_evidence_summary.md" in source
+    assert "MJO/ENSO/soil" in source
+    assert "Stack minus ENS delta BSS" in source
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--partition=hpg-b200" not in script
+    assert "--mem=16G" in script
+    assert "build_paper_evidence_blocks.py" in script
+
+
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():
     source = (Path(__file__).resolve().parents[1] / "download_ecmwf_s2s.py").read_text(
         encoding="utf-8"

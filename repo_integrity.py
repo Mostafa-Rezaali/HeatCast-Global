@@ -258,6 +258,41 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Stack/opportunity paired postprocessing is CPU-only and does not request B200 GPUs",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "paper.evidence_blocks_contract",
+        "build_paper_evidence_blocks.py",
+        (
+            "mechanism_block.csv",
+            "robustness_block.csv",
+            "operational_block.csv",
+            "paper_evidence_summary.md",
+            "MJO/ENSO/soil",
+            "Stack minus ENS delta BSS",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "paper.evidence_blocks_submission_contract",
+        "submit_paper_evidence_blocks.slurm",
+        (
+            "--mem=16G",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            "build_paper_evidence_blocks.py",
+            "paper_evidence_blocks/window_15-16-17-18-19-20-21-22-23-24-25-26-27-28",
+        ),
+    ))
+    evidence_submit = _text(root, "submit_paper_evidence_blocks.slurm")
+    results.append(_result(
+        "paper.evidence_blocks_cpu_only_submission",
+        "--gres=gpu" not in evidence_submit
+        and "module load cuda" not in evidence_submit
+        and "--partition=hpg-b200" not in evidence_submit,
+        "Paper evidence block builder is CPU-only and does not request B200 GPUs",
+    ))
+
     results.append(_result(
         "s2s.mixed_control_perturbed_grib_contract",
         all(token in ens_ingest for token in (
