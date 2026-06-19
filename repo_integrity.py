@@ -399,6 +399,30 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Extended paper figure builder is CPU-only and does not request B200 GPUs",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "paper.figures_journal_submission_contract",
+        "submit_paper_figures_journal.slurm",
+        (
+            "--mem=64G",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            "figure_style.py",
+            "build_paper_figures_tables.py",
+            "build_paper_figures_extended.py",
+            "--w34_log_glob",
+            "OPENBLAS_NUM_THREADS=1",
+        ),
+    ))
+    journal_submit = _text(root, "submit_paper_figures_journal.slurm")
+    results.append(_result(
+        "paper.figures_journal_cpu_only_submission",
+        "--gres=gpu" not in journal_submit
+        and "module load cuda" not in journal_submit
+        and "--partition=hpg-b200" not in journal_submit,
+        "Journal paper figure builder is CPU-only and does not request B200 GPUs",
+    ))
+
     results.append(_result(
         "s2s.mixed_control_perturbed_grib_contract",
         all(token in ens_ingest for token in (

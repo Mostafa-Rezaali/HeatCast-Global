@@ -19,6 +19,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
+from figure_style import (
+    DOUBLE_COLUMN_MM,
+    SINGLE_COLUMN_MM,
+    figure_size,
+    panel_label,
+    save_figure,
+    setup_matplotlib,
+    system_color,
+    system_label,
+)
+
 
 WINDOW_LABEL = "window_15-16-17-18-19-20-21-22-23-24-25-26-27-28"
 ENS_MODEL = "ens_calibrated"
@@ -94,18 +105,11 @@ def rows_by_model(rows: Iterable[Mapping[str, str]]) -> Dict[str, Mapping[str, s
 
 
 def ensure_matplotlib():
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    return plt
+    return setup_matplotlib()
 
 
 def savefig(fig, path_base: Path) -> None:
-    path_base.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path_base.with_suffix(".png"), dpi=300, bbox_inches="tight")
-    fig.savefig(path_base.with_suffix(".pdf"), bbox_inches="tight")
+    save_figure(fig, path_base)
 
 
 def extract_head_to_head(stack_dir: Path) -> tuple[Dict[str, Mapping[str, str]], List[Mapping[str, str]]]:
@@ -116,13 +120,7 @@ def extract_head_to_head(stack_dir: Path) -> tuple[Dict[str, Mapping[str, str]],
 
 
 def model_label(model: str) -> str:
-    return {
-        REFERENCE_MODEL: "Climatology",
-        "ens_raw_fraction": "ENS raw",
-        ENS_MODEL: "ENS calibrated",
-        HEATCAST_MODEL: "HeatCast-C",
-        STACK_MODEL: "HeatCast+ENS",
-    }.get(model, model)
+    return system_label(model)
 
 
 def build_headline_tables(stack_dir: Path, table_dir: Path) -> tuple[List[Dict[str, object]], List[Dict[str, object]]]:
@@ -296,8 +294,8 @@ def plot_headline(stack_dir: Path, fig_dir: Path) -> None:
     slope = [f(scores[m]["reliability_slope"]) for m in models]
     ece = [f(scores[m]["ece"]) for m in models]
 
-    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
-    colors = ["#4C78A8", "#F58518", "#54A24B"]
+    fig, axes = plt.subplots(1, 3, figsize=figure_size(DOUBLE_COLUMN_MM, 70.0))
+    colors = [system_color(model) for model in models]
     axes[0].bar(labels, bss, color=colors)
     axes[0].axhline(0, color="black", linewidth=0.8)
     axes[0].set_ylabel("Brier skill score")
@@ -333,7 +331,7 @@ def plot_headline(stack_dir: Path, fig_dir: Path) -> None:
         lows.append(f(row["ci_low"]))
         highs.append(f(row["ci_high"]))
     y = list(range(len(points)))
-    ax.errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color="#54A24B", capsize=3)
+    ax.errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color=system_color(STACK_MODEL), capsize=3)
     ax.axvline(0, color="black", linewidth=0.8)
     ax.set_yticks(y, ylabels)
     ax.set_xlabel("Difference versus calibrated ENS")
@@ -366,7 +364,7 @@ def plot_robustness(evidence_dir: Path, stack_dir: Path, fig_dir: Path) -> None:
     lows = [f(r["ci_low"]) for r in region_boot]
     highs = [f(r["ci_high"]) for r in region_boot]
     y = list(range(len(labels)))
-    axes[1].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color="#4C78A8", capsize=2)
+    axes[1].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color=system_color(ENS_MODEL), capsize=2)
     axes[1].axvline(0, color="black", linewidth=0.8)
     axes[1].set_yticks(y, labels)
     axes[1].set_xlabel("Stack - ENS BSS")
@@ -377,7 +375,7 @@ def plot_robustness(evidence_dir: Path, stack_dir: Path, fig_dir: Path) -> None:
         min(f(r["delta_bss"]) for r in loo if r["group_type"] == group)
         for group in loo_groups
     ]
-    axes[2].bar(["fold", "month", "year"], loo_vals, color="#54A24B")
+    axes[2].bar(["fold", "month", "year"], loo_vals, color=system_color(STACK_MODEL))
     axes[2].axhline(0, color="black", linewidth=0.8)
     axes[2].set_ylabel("Minimum leave-one-out BSS")
     axes[2].set_title("Dominance checks")
@@ -431,7 +429,7 @@ def plot_mechanism(stack_dir: Path, fig_dir: Path) -> None:
     lows = [f(r["ci_low"]) for r in opportunity]
     highs = [f(r["ci_high"]) for r in opportunity]
     y = list(range(len(labels)))
-    axes[0].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color="#54A24B", capsize=2)
+    axes[0].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color=system_color(STACK_MODEL), capsize=2)
     axes[0].axvline(0, color="black", linewidth=0.8)
     axes[0].set_yticks(y, labels)
     axes[0].set_xlabel("Stack - ENS BSS")
@@ -465,7 +463,7 @@ def plot_mechanism(stack_dir: Path, fig_dir: Path) -> None:
     lows = [f(r["ci_low"]) for r in selected_driver]
     highs = [f(r["ci_high"]) for r in selected_driver]
     y = list(range(len(labels)))
-    axes[1].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color="#F58518", capsize=2)
+    axes[1].errorbar(points, y, xerr=[[p - lo for p, lo in zip(points, lows)], [hi - p for p, hi in zip(points, highs)]], fmt="o", color=system_color(HEATCAST_MODEL), capsize=2)
     axes[1].axvline(0, color="black", linewidth=0.8)
     axes[1].set_yticks(y, labels)
     axes[1].set_xlabel("Child-parent Stack-vs-ENS BSS")
@@ -531,7 +529,7 @@ def plot_threshold_operating_curves(stack_dir: Path, fig_dir: Path) -> None:
     scores, _ = extract_head_to_head(stack_dir)
     thresholds = [float(threshold) for threshold in PROBABILITY_THRESHOLDS]
     models = [ENS_MODEL, HEATCAST_MODEL, STACK_MODEL]
-    colors = {ENS_MODEL: "#4C78A8", HEATCAST_MODEL: "#F58518", STACK_MODEL: "#54A24B"}
+    colors = {model: system_color(model) for model in models}
     fig, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), sharex=True)
     for model in models:
         row = scores[model]
@@ -580,9 +578,9 @@ def plot_opportunity_probability_metrics(stack_dir: Path, fig_dir: Path) -> None
 
     fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.2), constrained_layout=True)
     x = list(range(len(labels)))
-    axes[0].bar(x, delta_bss, color="#54A24B")
+    axes[0].bar(x, delta_bss, color=system_color(STACK_MODEL))
     axes[0].set_ylabel("Stack - ENS BSS")
-    axes[1].bar(x, delta_auc, color="#4C78A8")
+    axes[1].bar(x, delta_auc, color=system_color(ENS_MODEL))
     axes[1].set_ylabel("Stack - ENS ROC-AUC")
     axes[2].bar(x, delta_ece, color="#E45756")
     axes[2].set_ylabel("Stack - ENS ECE")

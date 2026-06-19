@@ -18,6 +18,7 @@ from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, parse_year_list, r
 from ens_ingest import find_raw_file, load_init_list, load_native_daily_max, normalize_rt_tag, validate_ingested_output
 from stitch_exceedance_folds import load_fold_inputs
 import build_paper_figures_extended as paper_ext
+from figure_style import SINGLE_COLUMN_MM, figure_size, save_figure, setup_matplotlib
 
 
 def test_quantile_mapping_is_monotonic_and_reproduces_train_distribution():
@@ -589,6 +590,96 @@ def test_extended_paper_submission_is_cpu_only_and_auditable():
     assert "ENS_RUNS=${ENS_RUNS:-cvfold{F}" not in script
     assert "ENS_RUNS='cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024'" in script
     assert "repo_integrity.py" in script
+
+
+def test_journal_figure_style_contract_and_submission_wrapper():
+    root = Path(__file__).resolve().parents[1]
+    style = (root / "figure_style.py").read_text(encoding="utf-8")
+    tables = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
+    extended = (root / "build_paper_figures_extended.py").read_text(encoding="utf-8")
+    script = (root / "submit_paper_figures_journal.slurm").read_text(encoding="utf-8")
+    assert "SYSTEM_COLORS" in style
+    assert "save_figure" in style
+    assert "svg.fonttype" in style and '"none"' in style
+    assert "from figure_style import" in tables
+    assert "from figure_style import" in extended
+    for system_hex in ("#0072B2", "#D55E00", "#009E73", "#6F6F6F"):
+        assert system_hex not in tables
+        assert system_hex not in extended
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--mem=64G" in script
+    assert "submit_paper_figures_journal" in script or "paper_fig_journal" in script
+    assert "figure_style.py" in script
+    assert "--w34_log_glob" in script
+
+
+def test_journal_style_svg_smoke_text_is_selectable_and_legible(tmp_path: Path):
+    plt = setup_matplotlib()
+    fig, ax = plt.subplots(figsize=figure_size(SINGLE_COLUMN_MM, 50.0))
+    ax.plot([0, 1], [0, 1])
+    ax.set_xlabel("Probability")
+    ax.set_ylabel("Observed frequency")
+    save_figure(fig, tmp_path / "smoke")
+    plt.close(fig)
+    svg = (tmp_path / "smoke.svg").read_text(encoding="utf-8")
+    assert "<text" in svg
+    assert "<path" in svg
+    sizes = [float(value) for value in __import__("re").findall(r"font-size:\s*([0-9.]+)px", svg)]
+    assert not sizes or min(sizes) >= 5.0
+    assert (tmp_path / "smoke.png").exists()
+
+
+def test_extended_paper_parses_w34_per_lead_logs(tmp_path: Path):
+    leads = tuple(range(15, 29))
+    parts0 = ", ".join(f"+{lead}:TAC={0.10 + lead / 1000:.3f}/MSE={0.40 + lead / 1000:.3f}" for lead in leads)
+    parts1 = ", ".join(f"+{lead}:TAC={0.20 + lead / 1000:.3f}/MSE={0.50 + lead / 1000:.3f}" for lead in leads)
+    (tmp_path / "w34_tube_all_1.log").write_text(
+        "\n".join([
+            "Run name: cvfold0_w34_dist_v1",
+            f"  Per-lead diagnostics: {parts0}",
+            "Run name: cvfold1_w34_dist_v1",
+            f"  Per-lead diagnostics: {parts1}",
+        ]),
+        encoding="utf-8",
+    )
+    rows, detail = paper_ext.parse_w34_per_lead_logs(tmp_path, "w34_tube_all_*.log", leads)
+    assert len(rows) == 14
+    assert len(detail) == 28
+    assert all(np.isfinite(float(row["tac_mean"])) for row in rows)
+    assert rows[0]["lead"] == 15
+    assert rows[-1]["lead"] == 28
+    assert rows[0]["n_folds"] == 2
+
+
+def test_extended_table8_replaces_fold2_sensitivity_with_base_rate_rows(tmp_path: Path):
+    stack_dir = tmp_path / "stack"
+    table_dir = tmp_path / "tables"
+    stack_dir.mkdir()
+    paper_ext.write_csv(
+        stack_dir / "heatcast_ens_stack_head_to_head.csv",
+        [{"section": "coverage", "fold": 0, "intersection_years": "2004 2014 2020"}],
+    )
+    rows = []
+    for year, base_rate, ens_brier, stack_brier in (
+        (2004, 0.005, 0.10, 0.11),
+        (2014, 0.006, 0.09, 0.08),
+        (2020, 0.060, 0.08, 0.06),
+    ):
+        rows.extend([
+            {"year": year, "model": paper_ext.REFERENCE_MODEL, "brier": 0.12, "valid_count": 10, "bss_vs_monthly_climo": 0.0, "roc_auc": 0.5, "base_rate": base_rate},
+            {"year": year, "model": paper_ext.ENS_MODEL, "brier": ens_brier, "valid_count": 10, "bss_vs_monthly_climo": 1 - ens_brier / 0.12, "roc_auc": 0.6},
+            {"year": year, "model": paper_ext.STACK_MODEL, "brier": stack_brier, "valid_count": 10, "bss_vs_monthly_climo": 1 - stack_brier / 0.12, "roc_auc": 0.7},
+        ])
+    paper_ext.write_csv(stack_dir / "robustness_by_year.csv", rows)
+    sources = {}
+    paper_ext.write_table_8(stack_dir, table_dir, sources)
+    out_rows = paper_ext.read_csv(table_dir / "table_8_per_year_head_to_head.csv")
+    labels = {str(row["year"]) for row in out_rows}
+    assert "fold2_removed" not in labels
+    assert "median_year_delta" in labels
+    assert "two_lowest_base_rate_years_removed" in labels
+    assert any(row.get("sign_test_wins") == "2/3" for row in out_rows)
 
 
 def test_s2s_downloader_uses_bounded_parallel_atomic_retrievals():

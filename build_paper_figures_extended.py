@@ -14,6 +14,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -26,6 +27,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
+from figure_style import DOUBLE_COLUMN_MM, figure_size, panel_label, system_color
 from build_paper_figures_tables import (
     ENS_MODEL,
     HEATCAST_MODEL,
@@ -59,6 +61,7 @@ RELIABILITY_CSV = "figure_6_reliability_decomposition.csv"
 CASE_CSV = "figure_7_case_study_fields.csv"
 PER_LEAD_CSV = "figure_8_per_lead_profile.csv"
 DISCARD_CSV = "figure_9_discard_curve.csv"
+PER_YEAR_BASE_RATE_CSV = "figure_10_per_year_base_rate.csv"
 
 
 def git_output(args: Sequence[str], root: Path) -> str:
@@ -517,8 +520,7 @@ def stream_chunk_products(args: argparse.Namespace, manifest_sources: Dict[str, 
 
 def write_spatial_skill(products: ExtendedProducts, out_dir: Path, reps: int, seed: int, sources: Dict[str, object]) -> None:
     if products is None or products.land_mask is None:
-        write_csv(out_dir / SPATIAL_CSV, [{"status": "not_available", "reason": sources.get("chunk_streaming_status", "")}])
-        return
+        raise RuntimeError(f"Cannot build Figure 5: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
     valid_count = np.maximum(products.valid_count, 1.0)
     base_brier = products.brier_sum[REFERENCE_MODEL] / valid_count
     stack_brier = products.brier_sum[STACK_MODEL] / valid_count
@@ -570,6 +572,8 @@ def write_spatial_skill(products: ExtendedProducts, out_dir: Path, reps: int, se
             "valid_count": int(products.valid_count[idx]),
         })
     write_csv(out_dir / SPATIAL_CSV, rows)
+    if not real_numeric_rows(rows, ("stack_bss", "delta_bss_stack_minus_ens", "stack_roc_auc")):
+        raise RuntimeError("Figure 5 spatial CSV has no numeric rows.")
 
     plt = ensure_matplotlib()
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.5), constrained_layout=True)
@@ -595,8 +599,7 @@ def write_spatial_skill(products: ExtendedProducts, out_dir: Path, reps: int, se
 
 def write_reliability_decomposition(products: ExtendedProducts, stack_dir: Path, evidence_dir: Path, out_dir: Path, sources: Dict[str, object]) -> None:
     if products is None:
-        write_csv(out_dir / RELIABILITY_CSV, [{"status": "not_available", "reason": sources.get("chunk_streaming_status", "")}])
-        return
+        raise RuntimeError(f"Cannot build Figure 6: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
     rows: List[Dict[str, object]] = []
     for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
         dec = products.reliability[model].decomposition()
@@ -605,10 +608,12 @@ def write_reliability_decomposition(products: ExtendedProducts, stack_dir: Path,
         for row in rel.rows(model):
             rows.append({"row_type": "reliability_bin", **row})
     write_csv(out_dir / RELIABILITY_CSV, rows)
+    if not real_numeric_rows([row for row in rows if not row.get("row_type")], ("reliability", "resolution", "uncertainty")):
+        raise RuntimeError("Figure 6 reliability CSV has no numeric decomposition rows.")
 
     plt = ensure_matplotlib()
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4), constrained_layout=True)
-    colors = {ENS_MODEL: "#4C78A8", HEATCAST_MODEL: "#F58518", STACK_MODEL: "#54A24B"}
+    colors = {model: system_color(model) for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL)}
     for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
         rel_rows = products.reliability[model].rows(model)
         x = np.array([r["mean_forecast_probability"] for r in rel_rows], dtype=float)
@@ -684,68 +689,146 @@ def write_case_studies(products: ExtendedProducts, out_dir: Path, sources: Dict[
     sources["figure_7_case_studies"] = source_entry(out_dir / CASE_CSV, ["event_fraction", "stack_mean_probability", "ens_mean_probability"], "case fields computed from saved fold incremental chunks")
 
 
+PER_LEAD_LINE_RE = re.compile(r"Per-lead diagnostics:\s*(?P<body>.*)")
+PER_LEAD_PAIR_RE = re.compile(r"\+(?P<lead>\d+):TAC=(?P<tac>[+-]?(?:\d+(?:\.\d*)?|\.\d+))/(?:MSE=)(?P<mse>[+-]?(?:\d+(?:\.\d*)?|\.\d+))")
+RUN_FOLD_RE = re.compile(r"cvfold(?P<fold>\d+)_w34")
+
+
+def real_numeric_rows(rows: Sequence[Mapping[str, str]], required_columns: Sequence[str]) -> bool:
+    if not rows or any(row.get("status") == "not_available" for row in rows):
+        return False
+    for row in rows:
+        if all(math.isfinite(f(row.get(column))) for column in required_columns):
+            return True
+    return False
+
+
+def parse_per_lead_diagnostics_file(path: Path, expected_leads: Sequence[int]) -> Dict[int, Dict[int, Dict[str, object]]]:
+    latest_by_fold: Dict[int, Dict[int, Dict[str, object]]] = {}
+    current_fold: Optional[int] = None
+    fallback_match = RUN_FOLD_RE.search(path.name)
+    fallback_fold = int(fallback_match.group("fold")) if fallback_match else None
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            run_match = RUN_FOLD_RE.search(line)
+            if run_match:
+                current_fold = int(run_match.group("fold"))
+            diag = PER_LEAD_LINE_RE.search(line)
+            if not diag:
+                continue
+            fold = current_fold if current_fold is not None else fallback_fold
+            if fold is None:
+                continue
+            values: Dict[int, Dict[str, object]] = {}
+            for match in PER_LEAD_PAIR_RE.finditer(diag.group("body")):
+                lead = int(match.group("lead"))
+                if lead not in expected_leads:
+                    continue
+                values[lead] = {
+                    "fold": fold,
+                    "lead": lead,
+                    "tac": float(match.group("tac")),
+                    "mse": float(match.group("mse")),
+                    "source_log": str(path),
+                    "line_number": line_number,
+                }
+            if values:
+                latest_by_fold[fold] = values
+    return latest_by_fold
+
+
+def parse_w34_per_lead_logs(root: Path, patterns: str, expected_leads: Sequence[int]) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    latest_by_fold: Dict[int, Dict[int, Dict[str, object]]] = {}
+    paths: List[Path] = []
+    for pattern in [item.strip() for item in str(patterns).split(",") if item.strip()]:
+        matches = sorted(root.glob(pattern))
+        if not matches and not pattern.startswith("**/"):
+            matches = sorted(root.glob(f"**/{pattern}"))
+        paths.extend(path for path in matches if path.is_file())
+    for path in sorted(set(paths)):
+        parsed = parse_per_lead_diagnostics_file(path, expected_leads)
+        latest_by_fold.update(parsed)
+    if not latest_by_fold:
+        raise RuntimeError(
+            "Could not recover W34 per-lead diagnostics from logs. "
+            "Set --w34_log_glob to matching logs or provide --per_lead_csv."
+        )
+    aggregate: List[Dict[str, object]] = []
+    detail: List[Dict[str, object]] = []
+    expected = tuple(int(lead) for lead in expected_leads)
+    for lead in expected:
+        lead_rows = [fold_values[lead] for fold_values in latest_by_fold.values() if lead in fold_values]
+        if not lead_rows:
+            raise RuntimeError(f"No W34 per-lead diagnostics recovered for lead +{lead}.")
+        tac = np.asarray([float(row["tac"]) for row in lead_rows], dtype=np.float64)
+        mse = np.asarray([float(row["mse"]) for row in lead_rows], dtype=np.float64)
+        if not np.all(np.isfinite(tac)):
+            raise RuntimeError(f"Non-finite TAC recovered for lead +{lead}.")
+        aggregate.append({
+            "lead": lead,
+            "model": HEATCAST_MODEL,
+            "tac_mean": float(np.mean(tac)),
+            "tac_sd": float(np.std(tac, ddof=1)) if tac.size > 1 else 0.0,
+            "mse_mean": float(np.mean(mse)),
+            "mse_sd": float(np.std(mse, ddof=1)) if mse.size > 1 else 0.0,
+            "n_folds": int(tac.size),
+            "folds": " ".join(str(int(row["fold"])) for row in sorted(lead_rows, key=lambda item: int(item["fold"]))),
+            "source": "w34_training_log_per_lead_diagnostics",
+        })
+        detail.extend(lead_rows)
+    if len(aggregate) != len(expected):
+        raise RuntimeError(f"Expected {len(expected)} per-lead rows, wrote {len(aggregate)}.")
+    return aggregate, detail
+
+
 def write_per_lead_profile(args: argparse.Namespace, out_dir: Path, sources: Dict[str, object]) -> None:
     candidates = [
         Path(args.per_lead_csv) if args.per_lead_csv else None,
         Path(args.stack_dir) / "per_lead_profile.csv",
         Path(args.stack_dir) / "figure_8_per_lead_profile.csv",
     ]
-    source = next((path for path in candidates if path is not None and path.exists()), None)
-    if source is None:
-        rows = [{
-            "status": "not_available",
-            "reason": "No per-lead stitched CSV was found. Saved window chunks do not contain individual lead predictions, so this panel requires an upstream per-lead export.",
-        }]
-        write_csv(out_dir / PER_LEAD_CSV, rows)
-        plt = ensure_matplotlib()
-        fig, ax = plt.subplots(figsize=(7.0, 2.8))
-        ax.axis("off")
-        ax.text(
-            0.5,
-            0.58,
-            "Per-lead W34 profile unavailable",
-            ha="center",
-            va="center",
-            fontsize=14,
-            weight="bold",
-        )
-        ax.text(
-            0.5,
-            0.38,
-            "Saved window chunks do not contain individual lead predictions.\nRun an upstream per-lead export to populate this panel.",
-            ha="center",
-            va="center",
-            fontsize=10,
-        )
-        savefig(fig, out_dir / "figure_8_per_lead_profile")
-        plt.close(fig)
-        sources["figure_8_per_lead_profile"] = source_entry(out_dir / PER_LEAD_CSV, ["status", "reason"], "placeholder because no per-lead stitched CSV exists")
-        return
-    rows = read_csv(source)
+    source = None
+    rows: List[Dict[str, object]]
+    for path in candidates:
+        if path is None or not path.exists():
+            continue
+        candidate_rows = read_csv(path)
+        if real_numeric_rows(candidate_rows, ("lead", "tac")):
+            source = path
+            rows = [dict(row) for row in candidate_rows]
+            break
+    else:
+        expected_leads = [int(value) for value in str(args.window_leads).split(",") if value.strip()]
+        rows, detail = parse_w34_per_lead_logs(Path.cwd(), args.w34_log_glob, expected_leads)
+        write_csv(out_dir / "figure_8_per_lead_profile_fold_details.csv", detail)
+        source = out_dir / PER_LEAD_CSV
     write_csv(out_dir / PER_LEAD_CSV, rows)
     plt = ensure_matplotlib()
-    by_model: Dict[str, List[Mapping[str, str]]] = {}
-    for row in rows:
-        by_model.setdefault(row.get("model", ""), []).append(row)
-    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.4), constrained_layout=True)
-    for model, model_rows in by_model.items():
-        model_rows = sorted(model_rows, key=lambda r: f(r.get("lead", "nan")))
-        lead = [f(r.get("lead")) for r in model_rows]
-        bss = [f(r.get("bss")) for r in model_rows]
-        tac = [f(r.get("tac")) for r in model_rows]
-        axes[0].plot(lead, bss, marker="o", label=model_label(model))
-        axes[1].plot(lead, tac, marker="o", label=model_label(model))
-    axes[0].set_ylabel("BSS")
-    axes[1].set_ylabel("TAC")
+    fig, axes = plt.subplots(1, 2, figsize=figure_size(DOUBLE_COLUMN_MM, 70.0), constrained_layout=True)
+    rows = sorted(rows, key=lambda r: f(r.get("lead", "nan")))
+    lead = np.asarray([f(row.get("lead")) for row in rows], dtype=float)
+    tac = np.asarray([f(row.get("tac_mean", row.get("tac"))) for row in rows], dtype=float)
+    tac_sd = np.asarray([f(row.get("tac_sd", 0.0)) for row in rows], dtype=float)
+    mse = np.asarray([f(row.get("mse_mean", row.get("mse"))) for row in rows], dtype=float)
+    mse_sd = np.asarray([f(row.get("mse_sd", 0.0)) for row in rows], dtype=float)
+    if len(rows) != 14 or not np.all(np.isfinite(tac)):
+        raise RuntimeError("figure_8_per_lead_profile.csv must contain 14 finite TAC rows for leads +15..+28.")
+    axes[0].plot(lead, tac, marker="o", color=system_color(HEATCAST_MODEL), label=model_label(HEATCAST_MODEL))
+    axes[0].fill_between(lead, tac - tac_sd, tac + tac_sd, color=system_color(HEATCAST_MODEL), alpha=0.18, linewidth=0.0)
+    axes[1].plot(lead, mse, marker="o", color=system_color(HEATCAST_MODEL), label=model_label(HEATCAST_MODEL))
+    axes[1].fill_between(lead, mse - mse_sd, mse + mse_sd, color=system_color(HEATCAST_MODEL), alpha=0.18, linewidth=0.0)
+    axes[0].set_ylabel("Temporal anomaly correlation")
+    axes[1].set_ylabel("Mean-squared error (z-score²)")
     for ax in axes:
         ax.set_xlabel("Lead day")
         ax.axhline(0, color="black", linewidth=0.8)
         ax.spines[["top", "right"]].set_visible(False)
         ax.legend(frameon=False)
-    fig.suptitle("Per-lead skill across W34 tube")
+    panel_label(axes[0], "a")
+    panel_label(axes[1], "b")
     savefig(fig, out_dir / "figure_8_per_lead_profile")
     plt.close(fig)
-    sources["figure_8_per_lead_profile"] = source_entry(source, ["lead", "model", "bss", "tac"], "read from upstream per-lead stitched CSV")
+    sources["figure_8_per_lead_profile"] = source_entry(source, ["lead", "model", "tac_mean", "mse_mean"], "recovered from latest W34 training-log per-lead diagnostics when no stitched per-lead CSV exists")
 
 
 def write_discard_curve(products: ExtendedProducts, out_dir: Path, sources: Dict[str, object], reps: int, seed: int) -> None:
@@ -771,7 +854,7 @@ def write_discard_curve(products: ExtendedProducts, out_dir: Path, sources: Dict
     fig, ax = plt.subplots(figsize=(6.5, 3.8))
     x = [float(row["retained_percent"]) for row in rows]
     y = [float(row["bss"]) for row in rows]
-    ax.plot(x, y, marker="o", color="#54A24B")
+    ax.plot(x, y, marker="o", color=system_color(STACK_MODEL))
     ax.invert_xaxis()
     ax.axhline(0, color="black", linewidth=0.8)
     ax.set_xlabel("Retained highest-confidence cells (%)")
@@ -781,6 +864,42 @@ def write_discard_curve(products: ExtendedProducts, out_dir: Path, sources: Dict
     savefig(fig, out_dir / "figure_9_opportunity_discard_curve")
     plt.close(fig)
     sources["figure_9_opportunity_discard_curve"] = source_entry(out_dir / DISCARD_CSV, ["retained_fraction", "bss", "roc_auc", "ece"], "computed from stack probabilities and validation-year confidence thresholds")
+
+
+def write_figure_captions(out_dir: Path, sources: Mapping[str, object]) -> None:
+    lines = [
+        "# Figure Captions",
+        "",
+        "All confidence intervals use paired whole-year bootstrap resampling unless noted. SVG files are the primary vector outputs; 600-dpi PNG files are fallbacks.",
+        "",
+        "## Figure 5. Spatial probabilistic skill.",
+        f"Cell-wise W34 BSS, Stack-minus-ENS BSS, and ROC-AUC on the common HeatCast/ENS verification grid. Source CSV: `{SPATIAL_CSV}`. Significance outlines indicate cells whose year-block bootstrap interval excludes zero where available.",
+        "",
+        "## Figure 6. Reliability and Brier decomposition.",
+        f"Reliability curves, sharpness histograms, and Murphy Brier decomposition for ENS, HeatCast-C, and HeatCast+ENS. Source CSV: `{RELIABILITY_CSV}`. The decomposition separates reliability, resolution, and uncertainty terms on the same held-out cell-year set.",
+        "",
+        "## Figure 7. Probabilistic case studies.",
+        f"Representative high-event-fraction W34 cases showing observed exceedance and forecast probability fields. Source CSV: `{CASE_CSV}`. Cases are selected from the saved held-out paired chunks, not from training data.",
+        "",
+        "## Figure 8. Per-lead W34 profile.",
+        f"Per-lead TAC and MSE from the latest converged W34 per-lead diagnostics across folds. Source CSV: `{PER_LEAD_CSV}`. Lines show fold means; bands show across-fold standard deviation.",
+        "",
+        "## Figure 9. Forecasts-of-opportunity discard curve.",
+        f"Stack BSS after retaining the highest-confidence forecast cells. Source CSV: `{DISCARD_CSV}`. Confidence thresholds are validation-year quantities applied to held-out test chunks.",
+        "",
+        "## Figure 10. Per-year base-rate sensitivity.",
+        f"Per-year Stack-minus-ENS BSS and ROC-AUC versus the year-specific q95 event base rate. Source CSV: `{PER_YEAR_BASE_RATE_CSV}`. The two lowest-base-rate years are labeled to show where BSS is most unstable under rare events.",
+        "",
+        "## Audit Notes",
+        "The reproducibility manifest records input paths, git commit, and source columns for each generated product. Missing or nonnumeric figure inputs are treated as build errors for the journal path rather than as silent placeholder panels.",
+        "",
+        "## Source Map",
+        "```json",
+        json.dumps(sources, indent=2),
+        "```",
+    ]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "figure_captions.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def write_table_7(stack_dir: Path, fig_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
@@ -832,41 +951,152 @@ def write_table_8(stack_dir: Path, table_dir: Path, sources: Dict[str, object]) 
         write_csv(table_dir / "table_8_per_year_head_to_head.csv", [{"status": "not_available", "reason": "No per-year CSV found."}])
         return
     rows = read_csv(source)
+    robustness_path = stack_dir / "robustness_by_year.csv"
+    robustness_rows = read_csv(robustness_path, required=False)
     fold_map = year_to_fold_from_head_to_head(stack_dir)
     by_year_model: Dict[Tuple[int, str], Mapping[str, str]] = {}
-    for row in rows:
+    for row in [*rows, *robustness_rows]:
+        if not math.isfinite(f(row.get("year", row.get("fold", "nan")))):
+            continue
         year = int(f(row.get("year", row.get("fold", "nan"))))
         model = str(row.get("model", ""))
-        by_year_model[(year, model)] = row
-    output = []
+        existing = by_year_model.get((year, model), {})
+        by_year_model[(year, model)] = {**existing, **row}
+    base_rate_by_year: Dict[int, float] = {}
+    for row in robustness_rows:
+        if row.get("model") not in (REFERENCE_MODEL, "monthly_climatology", "windowed_climatology"):
+            continue
+        year = int(f(row.get("year", "nan"))) if math.isfinite(f(row.get("year", "nan"))) else None
+        if year is not None:
+            base_rate_by_year[year] = f(row.get("base_rate"))
+    output: List[Dict[str, object]] = []
     for year in sorted({year for year, _ in by_year_model}):
         ens = by_year_model.get((year, ENS_MODEL))
         stack = by_year_model.get((year, STACK_MODEL))
         if not ens or not stack:
             continue
+        delta_bss = f(stack.get("bss_vs_monthly_climo")) - f(ens.get("bss_vs_monthly_climo"))
+        delta_auc = f(stack.get("roc_auc")) - f(ens.get("roc_auc"))
         output.append({
             "year": year,
             "fold": fold_map.get(year, ""),
             "stack_bss": fmt(stack.get("bss_vs_monthly_climo")),
             "ens_bss": fmt(ens.get("bss_vs_monthly_climo")),
-            "delta_bss_stack_minus_ens": fmt(f(stack.get("bss_vs_monthly_climo")) - f(ens.get("bss_vs_monthly_climo"))),
+            "delta_bss_stack_minus_ens": fmt(delta_bss),
             "stack_auc": fmt(stack.get("roc_auc"), signed=False),
             "ens_auc": fmt(ens.get("roc_auc"), signed=False),
+            "delta_auc_stack_minus_ens": fmt(delta_auc),
+            "base_rate": fmt(base_rate_by_year.get(year, float("nan")), signed=False),
         })
-    fold2_removed = [row for row in output if str(row.get("fold")) != "2"]
-    if fold2_removed:
+    year_rows = [row for row in output if math.isfinite(f(row.get("delta_bss_stack_minus_ens")))]
+    if year_rows:
+        deltas = np.asarray([f(row["delta_bss_stack_minus_ens"]) for row in year_rows], dtype=np.float64)
         output.append({
-            "year": "fold2_removed",
+            "year": "median_year_delta",
             "fold": "",
-            "delta_bss_stack_minus_ens": fmt(np.nanmean([f(row["delta_bss_stack_minus_ens"]) for row in fold2_removed])),
             "stack_bss": "",
             "ens_bss": "",
+            "delta_bss_stack_minus_ens": fmt(np.nanmedian(deltas)),
             "stack_auc": "",
             "ens_auc": "",
+            "delta_auc_stack_minus_ens": "",
+            "base_rate": "",
+            "sign_test_wins": f"{int(np.sum(deltas > 0.0))}/{len(deltas)}",
         })
+        finite_base_rows = [row for row in year_rows if math.isfinite(f(row.get("base_rate"))) and f(row.get("base_rate")) > 0.0]
+        dropped = sorted(finite_base_rows, key=lambda row: f(row["base_rate"]))[:2]
+        kept_years = {int(row["year"]) for row in year_rows if row not in dropped}
+        def pooled_bss(model: str, years: set[int]) -> float:
+            model_num = 0.0
+            ref_num = 0.0
+            weight = 0.0
+            for year in years:
+                model_row = by_year_model.get((year, model), {})
+                ref_row = by_year_model.get((year, REFERENCE_MODEL), {})
+                count = f(model_row.get("valid_count", ref_row.get("valid_count", "nan")))
+                model_brier = f(model_row.get("brier"))
+                ref_brier = f(ref_row.get("brier"))
+                if not all(math.isfinite(value) for value in (count, model_brier, ref_brier)) or count <= 0:
+                    continue
+                model_num += model_brier * count
+                ref_num += ref_brier * count
+                weight += count
+            if weight <= 0 or ref_num <= 0:
+                return float("nan")
+            return 1.0 - model_num / ref_num
+        if dropped and kept_years:
+            stack_bss = pooled_bss(STACK_MODEL, kept_years)
+            ens_bss = pooled_bss(ENS_MODEL, kept_years)
+            output.append({
+                "year": "two_lowest_base_rate_years_removed",
+                "fold": "",
+                "stack_bss": fmt(stack_bss),
+                "ens_bss": fmt(ens_bss),
+                "delta_bss_stack_minus_ens": fmt(stack_bss - ens_bss),
+                "stack_auc": "",
+                "ens_auc": "",
+                "delta_auc_stack_minus_ens": "",
+                "base_rate": "",
+                "removed_years": " ".join(str(row["year"]) for row in dropped),
+                "removed_base_rates": " ".join(fmt(row["base_rate"], signed=False) for row in dropped),
+                "sign_test_wins": f"{int(np.sum(deltas > 0.0))}/{len(deltas)}",
+            })
     write_csv(table_dir / "table_8_per_year_head_to_head.csv", output)
     write_markdown_table(table_dir / "table_8_per_year_head_to_head.md", output)
     sources["table_8_per_year_head_to_head"] = source_entry(source, ["year", "model", "bss_vs_monthly_climo", "roc_auc"], "read from existing per-year/robustness CSV and coverage fold map")
+
+
+def write_figure_10_per_year_base_rate(stack_dir: Path, table_dir: Path, out_dir: Path, sources: Dict[str, object]) -> None:
+    table_path = table_dir / "table_8_per_year_head_to_head.csv"
+    if not table_path.exists():
+        raise FileNotFoundError(table_path)
+    rows = [
+        row for row in read_csv(table_path)
+        if math.isfinite(f(row.get("year"))) and math.isfinite(f(row.get("base_rate"))) and f(row.get("base_rate")) > 0.0
+    ]
+    if not rows:
+        raise RuntimeError("Cannot build Figure 10: no per-year rows with finite base_rate.")
+    rows = sorted(rows, key=lambda row: int(f(row["year"])))
+    write_csv(out_dir / PER_YEAR_BASE_RATE_CSV, rows)
+    plt = ensure_matplotlib()
+    fig, axes = plt.subplots(1, 2, figsize=figure_size(DOUBLE_COLUMN_MM, 74.0), constrained_layout=True)
+    folds = sorted({str(row.get("fold", "")) for row in rows})
+    cmap = plt.get_cmap("tab10")
+    fold_colors = {fold: cmap(idx % 10) for idx, fold in enumerate(folds)}
+    low_base_years = {int(f(row["year"])) for row in sorted(rows, key=lambda row: f(row["base_rate"]))[:2]}
+    for ax, field, ylabel in (
+        (axes[0], "delta_bss_stack_minus_ens", "Stack - ENS BSS"),
+        (axes[1], "delta_auc_stack_minus_ens", "Stack - ENS ROC-AUC"),
+    ):
+        for row in rows:
+            year = int(f(row["year"]))
+            fold = str(row.get("fold", ""))
+            ax.scatter(
+                f(row["base_rate"]),
+                f(row[field]),
+                s=22 if year not in low_base_years else 36,
+                color=fold_colors.get(fold, "black"),
+                edgecolor="black" if year in low_base_years else "none",
+                linewidth=0.6,
+            )
+            if year in low_base_years:
+                ax.annotate(str(year), (f(row["base_rate"]), f(row[field])), xytext=(3, 4), textcoords="offset points", fontsize=7)
+        ax.set_xscale("log")
+        ax.axhline(0.0, color="black", linewidth=0.7)
+        ax.set_xlabel("Year-specific q95 base rate")
+        ax.set_ylabel(ylabel)
+        ax.spines[["top", "right"]].set_visible(False)
+    handles = []
+    labels = []
+    for fold in folds:
+        handles.append(axes[0].scatter([], [], color=fold_colors[fold], s=18))
+        labels.append(f"fold {fold}")
+    axes[1].legend(handles, labels, frameon=False, loc="best", title="Test fold")
+    panel_label(axes[0], "a")
+    panel_label(axes[1], "b")
+    savefig(fig, out_dir / "figure_10_per_year_base_rate")
+    plt.close(fig)
+    sources["figure_10_per_year_base_rate"] = source_entry(out_dir / PER_YEAR_BASE_RATE_CSV, ["year", "base_rate", "delta_bss_stack_minus_ens", "delta_auc_stack_minus_ens"], "joined Table 8 per-year deltas with robustness_by_year climatology base rates")
 
 
 def write_table_9(root: Path, stack_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
@@ -952,6 +1182,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
     parser.add_argument("--per_lead_csv", default="")
+    parser.add_argument(
+        "--w34_log_glob",
+        default="w34_tube_all_*.log,w34_tube_all_*.err,*w34_dist*.log,*w34*.log,*w34*.err",
+        help="Comma-separated glob patterns used to recover Figure 8 per-lead diagnostics from W34 training logs.",
+    )
     parser.add_argument("--calibration_steps", type=int, default=200)
     parser.add_argument("--calibration_lr", type=float, default=0.1)
     parser.add_argument("--calibration_l2", type=float, default=1e-4)
@@ -985,7 +1220,9 @@ def main() -> None:
     write_discard_curve(products, fig_dir, sources, int(args.spatial_bootstrap_reps), int(args.seed))
     write_table_7(Path(args.stack_dir), fig_dir, table_dir, sources)
     write_table_8(Path(args.stack_dir), table_dir, sources)
+    write_figure_10_per_year_base_rate(Path(args.stack_dir), table_dir, fig_dir, sources)
     write_table_9(root, Path(args.stack_dir), table_dir, sources)
+    write_figure_captions(out_dir, sources)
     copy_inputs_to_repro(root, out_dir, args)
     update_manifest(out_dir, sources, root)
 
