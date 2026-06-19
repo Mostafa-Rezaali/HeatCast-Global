@@ -18,6 +18,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 FOLD_WORKERS=${FOLD_WORKERS:-5}
+STRATUM_BOOTSTRAP_REPS=${STRATUM_BOOTSTRAP_REPS:-1000}
 DRIVER_ARGS=()
 if [ -n "${DRIVER_TABLE_DIR:-}" ]; then
   DRIVER_ARGS=(--driver_table_dir "$DRIVER_TABLE_DIR")
@@ -40,6 +41,7 @@ git pull --ff-only origin codex/tube_v1
   --ens_root ens_exceedance_incremental \
   --output_dir ens_heatcast_stack_opportunity \
   --bootstrap_reps 5000 \
+  --stratum_bootstrap_reps "$STRATUM_BOOTSTRAP_REPS" \
   --max_stack_samples_per_fold 500000 \
   --fold_workers "$FOLD_WORKERS" \
   --emit_per_year \

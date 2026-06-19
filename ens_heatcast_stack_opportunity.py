@@ -801,6 +801,12 @@ def main() -> None:
     parser.add_argument("--ens_root", default="ens_exceedance_incremental")
     parser.add_argument("--output_dir", default="ens_heatcast_stack_opportunity")
     parser.add_argument("--bootstrap_reps", type=int, default=5000)
+    parser.add_argument(
+        "--stratum_bootstrap_reps",
+        type=int,
+        default=0,
+        help="Bootstrap reps for region/driver/opportunity strata; 0 uses --bootstrap_reps.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--calibration_steps", type=int, default=200)
     parser.add_argument("--calibration_lr", type=float, default=0.1)
@@ -831,6 +837,7 @@ def main() -> None:
     all_years = set()
     total_common_inits = 0
     fold_workers = max(1, min(int(args.fold_workers), len(heatcast_runs)))
+    stratum_reps = int(args.stratum_bootstrap_reps) if int(args.stratum_bootstrap_reps) > 0 else int(args.bootstrap_reps)
 
     print("Loading fold metadata and fitting per-fold HeatCast-C calibrators.")
     for heat_name in heatcast_runs:
@@ -1005,6 +1012,7 @@ def main() -> None:
 
     rows = score_rows_from_folds(fold_acc)
     by_name = {str(row["model"]): row for row in rows}
+    print(f"Running headline year-block bootstrap: reps={int(args.bootstrap_reps)}")
     bootstrap_rows = bootstrap_delta_rows(
         by_fold_year,
         sorted(scored_years),
@@ -1016,6 +1024,7 @@ def main() -> None:
     )
     subset_rows: List[Dict[str, object]] = []
     subset_bootstrap_rows: List[Dict[str, object]] = []
+    print(f"Running opportunity-subset bootstraps: subsets={len(SUBSETS)}, reps={stratum_reps}")
     for subset_name in SUBSETS:
         for row in subset_acc[subset_name].summary_rows(REFERENCE):
             subset_rows.append({"subset": subset_name, **row})
@@ -1027,7 +1036,7 @@ def main() -> None:
                     subset_years,
                     (HEATCAST_MODEL, STACK_MODEL),
                     ENS_MODEL,
-                    int(args.bootstrap_reps),
+                    stratum_reps,
                     int(args.seed) + 1000 + SUBSETS.index(subset_name),
                     subset_name,
                 )
@@ -1051,16 +1060,19 @@ def main() -> None:
 
     region_rows: List[Dict[str, object]] = summarize_named_accumulators(region_acc, "region") if region_acc else []
     region_bootstrap_rows: List[Dict[str, object]] = []
+    if region_year_acc:
+        print(f"Running region bootstraps: regions={len(region_year_acc)}, reps={stratum_reps}")
     for region_name, region_by_year in region_year_acc.items():
         region_years = sorted({year for _, year in region_by_year})
         if len(region_years) >= 2:
+            print(f"  region bootstrap {region_name}: years={len(region_years)}")
             region_bootstrap_rows.extend(
                 bootstrap_delta_rows(
                     region_by_year,
                     region_years,
                     (HEATCAST_MODEL, STACK_MODEL),
                     ENS_MODEL,
-                    int(args.bootstrap_reps),
+                    stratum_reps,
                     int(args.seed) + 2000 + len(region_bootstrap_rows),
                     f"region_{region_name}",
                 )
@@ -1069,28 +1081,40 @@ def main() -> None:
     driver_rows: List[Dict[str, object]] = summarize_driver_accumulators(driver_acc) if driver_acc else []
     driver_bootstrap_rows: List[Dict[str, object]] = []
     driver_parent_rows: List[Dict[str, object]] = []
-    for key, key_by_year in sorted(driver_year_acc.items()):
+    driver_items = sorted(driver_year_acc.items())
+    if driver_items:
+        print(f"Running paired driver Stack-vs-ENS bootstraps: strata={len(driver_items)}, reps={stratum_reps}")
+    for driver_index, (key, key_by_year) in enumerate(driver_items, start=1):
         key_years = sorted({year for _, year in key_by_year})
         if len(key_years) >= 2:
             axis, stratum = split_driver_key(key)
+            print(f"  driver bootstrap {driver_index}/{len(driver_items)} {axis}:{stratum}, years={len(key_years)}")
             driver_bootstrap_rows.extend(
                 bootstrap_delta_rows(
                     key_by_year,
                     key_years,
                     (HEATCAST_MODEL, STACK_MODEL),
                     ENS_MODEL,
-                    int(args.bootstrap_reps),
+                    stratum_reps,
                     int(args.seed) + 3000 + len(driver_bootstrap_rows),
                     f"{axis}:{stratum}",
                 )
             )
-    for child_key, parent_kind, parent_source, parent_key in driver_interaction_parent_pairs(driver_year_acc):
+    parent_pairs = driver_interaction_parent_pairs(driver_year_acc)
+    if parent_pairs:
+        print(f"Running paired driver parent-comparison bootstraps: pairs={len(parent_pairs)}, reps={stratum_reps}")
+    for pair_index, (child_key, parent_kind, parent_source, parent_key) in enumerate(parent_pairs, start=1):
         parent_by_year = (
             subset_year_acc[parent_key]
             if parent_source == "subset"
             else driver_year_acc.get(parent_key, {})
         )
         if parent_by_year:
+            child_axis, child_stratum = split_driver_key(child_key)
+            print(
+                f"  driver parent bootstrap {pair_index}/{len(parent_pairs)} "
+                f"{child_axis}:{child_stratum} vs {parent_kind}"
+            )
             driver_parent_rows.extend(
                 bootstrap_parent_delta_rows(
                     driver_year_acc[child_key],
@@ -1098,7 +1122,7 @@ def main() -> None:
                     child_key,
                     parent_key,
                     parent_kind,
-                    int(args.bootstrap_reps),
+                    stratum_reps,
                     int(args.seed) + 4000 + len(driver_parent_rows),
                 )
             )
