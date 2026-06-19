@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import zipfile
 
 import numpy as np
 
@@ -651,6 +652,9 @@ def test_generic_teleconnection_indices_parse_and_emit_strata(tmp_path: Path):
         teleconnection_names=("pna",),
         teleconnection_values=np.array([[0.7, -0.9]], dtype=np.float32),
         teleconnection_threshold=0.5,
+        alldata_names=("ridge_index",),
+        alldata_values=np.array([[-0.8, 0.2]], dtype=np.float32),
+        alldata_threshold=0.5,
         sidecars={0: {}},
         soil_rows={0: {0: 0}},
         soil_memmaps={0: np.asarray([[10.0, 50.0, 90.0]], dtype=np.float16)},
@@ -660,7 +664,40 @@ def test_generic_teleconnection_indices_parse_and_emit_strata(tmp_path: Path):
     with np.load(chunk_path, allow_pickle=False) as data:
         _, strata = lookup.sample_strata(0, chunk_path, data)
     assert strata["tele_pna"]["positive"].tolist() == [True, True, True]
-    assert set(strata) >= {"mjo_phase", "enso_state", "soil_moisture_tercile", "tele_pna"}
+    assert strata["alldata_ridge_index"]["negative"].tolist() == [True, True, True]
+    assert set(strata) >= {"mjo_phase", "enso_state", "soil_moisture_tercile", "tele_pna", "alldata_ridge_index"}
+
+
+def _write_minimal_xlsx(path: Path) -> None:
+    sheet_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Date</t></is></c>
+      <c r="B1" t="inlineStr"><is><t>PNA like</t></is></c>
+      <c r="C1" t="inlineStr"><is><t>Noise</t></is></c>
+    </row>
+    <row r="2"><c r="A2"><v>29707</v></c><c r="B2"><v>0.8</v></c><c r="C2"><v>1.0</v></c></row>
+    <row r="3"><c r="A3"><v>29708</v></c><c r="B3"><v>-0.6</v></c><c r="C3"><v>2.0</v></c></row>
+  </sheetData>
+</worksheet>
+"""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>")
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+
+
+def test_alldata_xlsx_drivers_align_without_openpyxl(tmp_path: Path):
+    workbook = tmp_path / "AllData.xlsx"
+    _write_minimal_xlsx(workbook)
+    names, values = build_driver_tables.build_alldata_drivers(
+        [0.0, 1.0],
+        workbook,
+        ("PNA like",),
+    )
+    assert names == ("pna_like",)
+    assert values.shape == (1, 2)
+    assert np.allclose(values[0], [0.8, -0.6])
 
 
 def test_extended_paper_parses_w34_per_lead_logs(tmp_path: Path):

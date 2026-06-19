@@ -7,6 +7,8 @@ import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence, Tuple
+import xml.etree.ElementTree as ET
+import zipfile
 
 import numpy as np
 
@@ -138,6 +140,190 @@ def parse_named_index_paths(text: str) -> Dict[str, Path]:
     return paths
 
 
+def parse_column_list(text: str) -> Tuple[str, ...]:
+    return tuple(value.strip() for value in str(text).split(",") if value.strip())
+
+
+def _xlsx_col_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in str(cell_ref) if ch.isalpha()).upper()
+    if not letters:
+        raise ValueError(f"Invalid XLSX cell reference: {cell_ref!r}")
+    value = 0
+    for ch in letters:
+        value = value * 26 + (ord(ch) - ord("A") + 1)
+    return value - 1
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> Sequence[str]:
+    try:
+        xml = archive.read("xl/sharedStrings.xml")
+    except KeyError:
+        return ()
+    root = ET.fromstring(xml)
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    strings = []
+    for item in root.findall("x:si", ns):
+        parts = [node.text or "" for node in item.findall(".//x:t", ns)]
+        strings.append("".join(parts))
+    return strings
+
+
+def _xlsx_cell_value(cell: ET.Element, shared_strings: Sequence[str]) -> object:
+    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        parts = [node.text or "" for node in cell.findall(".//x:t", ns)]
+        return "".join(parts)
+    value_node = cell.find("x:v", ns)
+    if value_node is None or value_node.text is None:
+        return ""
+    raw = value_node.text
+    if cell_type == "s":
+        index = int(float(raw))
+        return shared_strings[index] if 0 <= index < len(shared_strings) else ""
+    if cell_type == "b":
+        return bool(int(float(raw)))
+    return raw
+
+
+def read_first_xlsx_sheet(path: Path) -> Tuple[Sequence[str], Sequence[Sequence[object]]]:
+    """Read the first worksheet from an XLSX file using only the Python stdlib."""
+    if not path.exists():
+        raise FileNotFoundError(f"Missing AllData workbook: {path}")
+    with zipfile.ZipFile(path) as archive:
+        shared = _xlsx_shared_strings(archive)
+        sheet_names = sorted(
+            name for name in archive.namelist()
+            if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+        )
+        if not sheet_names:
+            raise RuntimeError(f"No worksheets found in {path}")
+        ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        root = ET.fromstring(archive.read(sheet_names[0]))
+        rows = []
+        max_col = 0
+        for row_node in root.findall(".//x:sheetData/x:row", ns):
+            values: Dict[int, object] = {}
+            for cell in row_node.findall("x:c", ns):
+                col = _xlsx_col_index(cell.attrib.get("r", "A1"))
+                values[col] = _xlsx_cell_value(cell, shared)
+                max_col = max(max_col, col)
+            rows.append([values.get(col, "") for col in range(max_col + 1)])
+    if not rows:
+        raise RuntimeError(f"No rows found in {path}")
+    headers = [str(value).strip() for value in rows[0]]
+    return headers, rows[1:]
+
+
+def _parse_alldata_date(value: object) -> np.datetime64:
+    if isinstance(value, np.datetime64):
+        return value.astype("datetime64[D]")
+    text = str(value).strip()
+    if not text:
+        raise ValueError("empty date")
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return np.datetime64(datetime.strptime(text.split()[0], fmt).date(), "D")
+        except ValueError:
+            pass
+    serial = float(text)
+    # Excel's effective date origin for serial values, including the 1900 leap-year bug.
+    return np.datetime64((datetime(1899, 12, 30) + timedelta(days=serial)).date(), "D")
+
+
+def _parse_float(value: object) -> float:
+    text = str(value).strip()
+    if not text:
+        return float("nan")
+    return float(text)
+
+
+def build_alldata_drivers(
+    time_values: Sequence[float],
+    workbook_path: Path | None,
+    requested_columns: Sequence[str],
+) -> Tuple[Tuple[str, ...], np.ndarray]:
+    if workbook_path is None or str(workbook_path).strip() == "":
+        return (), np.empty((0, len(time_values)), dtype=np.float32)
+    headers, rows = read_first_xlsx_sheet(Path(workbook_path))
+    normalized_headers = [sanitize_index_name(header) for header in headers]
+    try:
+        date_col = normalized_headers.index("date")
+    except ValueError as exc:
+        raise RuntimeError(f"{workbook_path}: could not find a Date column.") from exc
+
+    expected_dates = np.array(
+        [np.datetime64((BASE_DATE + timedelta(days=float(value))).date(), "D") for value in time_values],
+        dtype="datetime64[D]",
+    )
+    by_date: Dict[np.datetime64, Sequence[object]] = {}
+    for row in rows:
+        if date_col >= len(row):
+            continue
+        try:
+            date_value = _parse_alldata_date(row[date_col])
+        except Exception:
+            continue
+        if date_value in by_date:
+            raise RuntimeError(f"{workbook_path}: duplicate Date row for {date_value}.")
+        by_date[date_value] = row
+    missing = [str(date) for date in expected_dates if date not in by_date]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise RuntimeError(
+            f"{workbook_path}: Date column does not cover the HeatCast MJJAS axis; "
+            f"missing {len(missing)} dates, first={preview}."
+        )
+    if len(by_date) != len(expected_dates):
+        extra = len(by_date) - len(expected_dates)
+        raise RuntimeError(
+            f"{workbook_path}: Date row count differs from HeatCast axis "
+            f"({len(by_date)} vs {len(expected_dates)}, extra={extra})."
+        )
+
+    requested_clean = tuple(sanitize_index_name(value) for value in requested_columns)
+    selected: Dict[str, int] = {}
+    if requested_clean:
+        lookup = {name: idx for idx, name in enumerate(normalized_headers)}
+        for name in requested_clean:
+            if name not in lookup:
+                raise RuntimeError(f"{workbook_path}: requested AllData column {name!r} not found.")
+            if lookup[name] == date_col:
+                continue
+            selected[name] = lookup[name]
+    else:
+        for col, name in enumerate(normalized_headers):
+            if col == date_col or not name:
+                continue
+            values = []
+            for date_value in expected_dates:
+                row = by_date[date_value]
+                cell = row[col] if col < len(row) else ""
+                values.append(_parse_float(cell))
+            if np.all(np.isfinite(values)):
+                selected[name] = col
+
+    if not selected:
+        raise RuntimeError(
+            f"{workbook_path}: no usable numeric AllData columns found. "
+            "Set ALLDATA_COLUMNS to a comma-separated list if needed."
+        )
+    names = tuple(selected)
+    matrix = np.full((len(names), len(expected_dates)), np.nan, dtype=np.float32)
+    for row_index, (name, col) in enumerate(selected.items()):
+        for date_index, date_value in enumerate(expected_dates):
+            row = by_date[date_value]
+            cell = row[col] if col < len(row) else ""
+            matrix[row_index, date_index] = _parse_float(cell)
+        if np.any(~np.isfinite(matrix[row_index])):
+            raise RuntimeError(f"{workbook_path}: AllData column {name} has missing/non-numeric HeatCast dates.")
+    print(
+        f"AllData workbook matched HeatCast axis exactly: {workbook_path} "
+        f"({len(expected_dates)} MJJAS dates, columns={','.join(names)})"
+    )
+    return names, matrix
+
+
 def soil_percentile_against_train(
     train_values: np.ndarray,
     target_values: np.ndarray,
@@ -190,6 +376,9 @@ def build_global_driver_table(
     nino: Mapping[Tuple[int, int], float],
     teleconnections: Mapping[str, Mapping[Tuple[int, int], float]],
     teleconnection_threshold: float,
+    alldata_names: Sequence[str],
+    alldata_values: np.ndarray,
+    alldata_threshold: float,
     output_path: Path,
 ) -> None:
     dates = [BASE_DATE + timedelta(days=float(value)) for value in time_values]
@@ -198,6 +387,13 @@ def build_global_driver_table(
     nino34 = np.full(len(dates), np.nan, dtype=np.float32)
     tele_names = tuple(sorted(teleconnections))
     tele_values = np.full((len(tele_names), len(dates)), np.nan, dtype=np.float32)
+    alldata_names = tuple(str(value) for value in alldata_names)
+    alldata_values = np.asarray(alldata_values, dtype=np.float32)
+    if alldata_values.shape != (len(alldata_names), len(dates)):
+        raise RuntimeError(
+            f"AllData driver shape mismatch: values={alldata_values.shape}, "
+            f"names={len(alldata_names)}, dates={len(dates)}."
+        )
     for index, date in enumerate(dates):
         key = int(date.strftime("%Y%m%d"))
         if key in rmm:
@@ -216,6 +412,9 @@ def build_global_driver_table(
     for tele_idx, name in enumerate(tele_names):
         if np.any(~np.isfinite(tele_values[tele_idx, mjjas])):
             raise RuntimeError(f"Teleconnection index {name} does not cover every MJJAS month on the HeatCast time axis.")
+    for alldata_idx, name in enumerate(alldata_names):
+        if np.any(~np.isfinite(alldata_values[alldata_idx, mjjas])):
+            raise RuntimeError(f"AllData driver {name} does not cover every MJJAS date on the HeatCast time axis.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -227,8 +426,15 @@ def build_global_driver_table(
         teleconnection_names=np.array(tele_names, dtype="U64"),
         teleconnection_values=tele_values,
         teleconnection_threshold=np.array(float(teleconnection_threshold), dtype=np.float32),
+        alldata_names=np.array(alldata_names, dtype="U64"),
+        alldata_values=alldata_values,
+        alldata_threshold=np.array(float(alldata_threshold), dtype=np.float32),
     )
-    print(f"Saved global driver table: {output_path} (teleconnections={','.join(tele_names) or 'none'})")
+    print(
+        f"Saved global driver table: {output_path} "
+        f"(teleconnections={','.join(tele_names) or 'none'}, "
+        f"alldata={','.join(alldata_names) or 'none'})"
+    )
 
 
 def build_fold_soil_table(
@@ -342,6 +548,22 @@ def main() -> None:
         default=0.5,
         help="Fixed absolute threshold for generic monthly index positive/neutral/negative strata.",
     )
+    parser.add_argument(
+        "--alldata_path",
+        default="",
+        help="Optional AllData.xlsx workbook with a Date column exactly matching the HeatCast MJJAS axis.",
+    )
+    parser.add_argument(
+        "--alldata_columns",
+        default="",
+        help="Optional comma-separated AllData columns to stratify. Default: all finite numeric non-Date columns.",
+    )
+    parser.add_argument(
+        "--alldata_threshold",
+        type=float,
+        default=0.5,
+        help="Fixed absolute threshold for AllData positive/neutral/negative strata.",
+    )
     parser.add_argument("--input_root", default="exceedance_eval_incremental")
     parser.add_argument(
         "--run_names",
@@ -362,6 +584,11 @@ def main() -> None:
     cfm.apply_extended_global_fields()
     shared_data = cfm.prepare_shared_data(cfm.Config, rank=0, world_size=1, ddp=False)
     land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+    alldata_names, alldata_values = build_alldata_drivers(
+        shared_data["time_values"],
+        Path(args.alldata_path).expanduser() if str(args.alldata_path).strip() else None,
+        parse_column_list(args.alldata_columns),
+    )
     build_global_driver_table(
         shared_data["time_values"],
         parse_rmm_file(Path(args.rmm_path)),
@@ -371,6 +598,9 @@ def main() -> None:
             for name, path in parse_named_index_paths(args.teleconnection_index_paths).items()
         },
         float(args.teleconnection_threshold),
+        alldata_names,
+        alldata_values,
+        float(args.alldata_threshold),
         output_dir / "mjo_enso_by_init.npz",
     )
     for run_name in run_names:

@@ -142,6 +142,9 @@ class DriverLookup:
     teleconnection_names: Tuple[str, ...]
     teleconnection_values: np.ndarray
     teleconnection_threshold: float
+    alldata_names: Tuple[str, ...]
+    alldata_values: np.ndarray
+    alldata_threshold: float
     sidecars: Mapping[int, Mapping[int, int]]
     soil_rows: Mapping[int, Mapping[int, int]]
     soil_memmaps: Mapping[int, np.memmap]
@@ -169,6 +172,10 @@ class DriverLookup:
             strata[f"tele_{name}"] = {
                 teleconnection_stratum(self.teleconnection_values[index, init_t], self.teleconnection_threshold): full
             }
+        for index, name in enumerate(self.alldata_names):
+            strata[f"alldata_{name}"] = {
+                teleconnection_stratum(self.alldata_values[index, init_t], self.alldata_threshold): full
+            }
         return init_t, strata
 
 
@@ -187,10 +194,15 @@ def load_driver_lookup(
         tele_names = tuple(str(value) for value in np.asarray(data["teleconnection_names"], dtype=str).tolist()) if "teleconnection_names" in data else ()
         tele_values = np.asarray(data["teleconnection_values"], dtype=np.float32) if "teleconnection_values" in data else np.empty((0, phase.size), dtype=np.float32)
         tele_threshold = float(np.asarray(data["teleconnection_threshold"]).item()) if "teleconnection_threshold" in data else 0.5
+        alldata_names = tuple(str(value) for value in np.asarray(data["alldata_names"], dtype=str).tolist()) if "alldata_names" in data else ()
+        alldata_values = np.asarray(data["alldata_values"], dtype=np.float32) if "alldata_values" in data else np.empty((0, phase.size), dtype=np.float32)
+        alldata_threshold = float(np.asarray(data["alldata_threshold"]).item()) if "alldata_threshold" in data else 0.5
     if not (phase.size == amplitude.size == nino34.size):
         raise RuntimeError("Global slow-driver arrays have inconsistent lengths.")
     if tele_values.shape != (len(tele_names), phase.size):
         raise RuntimeError(f"Generic teleconnection arrays have inconsistent shape: {tele_values.shape}, names={len(tele_names)}, time={phase.size}.")
+    if alldata_values.shape != (len(alldata_names), phase.size):
+        raise RuntimeError(f"AllData driver arrays have inconsistent shape: {alldata_values.shape}, names={len(alldata_names)}, time={phase.size}.")
     sidecars: Dict[int, Mapping[int, int]] = {}
     soil_rows: Dict[int, Mapping[int, int]] = {}
     soil_memmaps: Dict[int, np.memmap] = {}
@@ -219,7 +231,20 @@ def load_driver_lookup(
             dtype=np.float16,
             shape=shape,
         )
-    return DriverLookup(phase, amplitude, nino34, tele_names, tele_values, tele_threshold, sidecars, soil_rows, soil_memmaps)
+    return DriverLookup(
+        phase,
+        amplitude,
+        nino34,
+        tele_names,
+        tele_values,
+        tele_threshold,
+        alldata_names,
+        alldata_values,
+        alldata_threshold,
+        sidecars,
+        soil_rows,
+        soil_memmaps,
+    )
 
 
 def assign_deciles(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -1093,7 +1118,11 @@ def run(args: argparse.Namespace) -> None:
     print(f"Year-block bootstrap reproducibility: PASS ({len(observed_years)} independent year blocks)")
 
     if driver_lookup is not None:
-        dynamic_driver_axes = tuple(BASE_DRIVER_AXES + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names))
+        dynamic_driver_axes = tuple(
+            BASE_DRIVER_AXES
+            + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names)
+            + tuple(f"alldata_{name}" for name in driver_lookup.alldata_names)
+        )
         if not bootstrap_axes:
             bootstrap_axes = dynamic_driver_axes
         elif "all_drivers" in bootstrap_axes:
@@ -1138,7 +1167,11 @@ def run(args: argparse.Namespace) -> None:
     reliability_plot(global_stats[("confidence", top_stratum)], out_dir / "reliability_top_band.png", "Top-decile Model C reliability")
     discard_curve_plot(summary_rows, out_dir / "bss_vs_confidence_percentile.png")
     if driver_lookup is not None:
-        driver_axis_prefixes = tuple(BASE_DRIVER_AXES + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names))
+        driver_axis_prefixes = tuple(
+            BASE_DRIVER_AXES
+            + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names)
+            + tuple(f"alldata_{name}" for name in driver_lookup.alldata_names)
+        )
         driver_rows = [
             row for row in summary_rows
             if any(str(row["axis"]).startswith(axis) for axis in driver_axis_prefixes)
@@ -1147,7 +1180,7 @@ def run(args: argparse.Namespace) -> None:
         write_csv(out_dir / "driver_interaction_paired_bootstrap.csv", paired_interaction_rows)
         driver_conditional_bss_plot(driver_rows, out_dir / "driver_conditional_bss.png")
         print(
-            "Slow-driver leakage audit: PASS (MJO/ENSO/generic teleconnections are external init-date indices; "
+            "Slow-driver leakage audit: PASS (MJO/ENSO/generic teleconnections/AllData drivers are external init-date indices; "
             "soil percentiles and interaction boundaries use fold train/calibration years only; "
             "no test outcomes define strata)."
         )

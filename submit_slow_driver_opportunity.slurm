@@ -21,6 +21,9 @@ RMM_PATH=${RMM_PATH:?Set RMM_PATH to the manually downloaded BOM rmm.74toRealtim
 NINO34_PATH=${NINO34_PATH:?Set NINO34_PATH to the manually downloaded NOAA PSL Nino3.4 text file}
 TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:-}
 TELECONNECTION_THRESHOLD=${TELECONNECTION_THRESHOLD:-0.5}
+ALLDATA_PATH=${ALLDATA_PATH:-}
+ALLDATA_COLUMNS=${ALLDATA_COLUMNS:-}
+ALLDATA_THRESHOLD=${ALLDATA_THRESHOLD:-0.5}
 BOOTSTRAP_AXES=${BOOTSTRAP_AXES:-all_drivers}
 
 cd "$WORK_DIR"
@@ -44,6 +47,9 @@ git pull --ff-only origin codex/tube_v1
   --nino34_path "$NINO34_PATH" \
   --teleconnection_index_paths "$TELECONNECTION_INDEX_PATHS" \
   --teleconnection_threshold "$TELECONNECTION_THRESHOLD" \
+  --alldata_path "$ALLDATA_PATH" \
+  --alldata_columns "$ALLDATA_COLUMNS" \
+  --alldata_threshold "$ALLDATA_THRESHOLD" \
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS" \
