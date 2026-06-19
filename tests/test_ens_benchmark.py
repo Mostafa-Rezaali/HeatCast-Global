@@ -586,6 +586,8 @@ def test_extended_paper_submission_is_cpu_only_and_auditable():
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script
     assert "--mem=64G" in script
+    assert "ENS_RUNS=${ENS_RUNS:-cvfold{F}" not in script
+    assert "ENS_RUNS='cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024'" in script
     assert "repo_integrity.py" in script
 
 

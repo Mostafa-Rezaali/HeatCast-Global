@@ -16,7 +16,9 @@ PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 WINDOW=${WINDOW:-window_15-16-17-18-19-20-21-22-23-24-25-26-27-28}
 LEADS=${LEADS:-15,16,17,18,19,20,21,22,23,24,25,26,27,28}
 HEATCAST_RUNS=${HEATCAST_RUNS:-cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dist_v1,cvfold4_w34_dist_v1}
-ENS_RUNS=${ENS_RUNS:-cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024}
+if [ -z "${ENS_RUNS:-}" ]; then
+  ENS_RUNS='cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024'
+fi
 
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
