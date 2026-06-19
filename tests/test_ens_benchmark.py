@@ -7,6 +7,8 @@ import numpy as np
 import ens_ingest as ingest
 import ens_compare
 import ens_score
+import build_driver_tables
+import forecasts_of_opportunity
 from ens_common import (
     apply_quantile_mapping,
     common_init_indices,
@@ -628,6 +630,37 @@ def test_journal_style_svg_smoke_text_is_selectable_and_legible(tmp_path: Path):
     sizes = [float(value) for value in __import__("re").findall(r"font-size:\s*([0-9.]+)px", svg)]
     assert not sizes or min(sizes) >= 5.0
     assert (tmp_path / "smoke.png").exists()
+
+
+def test_generic_teleconnection_indices_parse_and_emit_strata(tmp_path: Path):
+    pna_path = tmp_path / "pna.txt"
+    pna_path.write_text(
+        "1981 0.7 0.1 -0.2 0.0 1.0 -0.8 0.2 0.3 0.4 0.5 0.6 0.7\n",
+        encoding="utf-8",
+    )
+    parsed = build_driver_tables.parse_monthly_index_file(pna_path)
+    assert parsed[(1981, 1)] == 0.7
+    assert parsed[(1981, 6)] == -0.8
+    names = build_driver_tables.parse_named_index_paths(f"pna={pna_path},AO={pna_path}")
+    assert set(names) == {"pna", "ao"}
+
+    lookup = forecasts_of_opportunity.DriverLookup(
+        mjo_phase=np.array([1, 2], dtype=np.int8),
+        mjo_amplitude=np.array([1.2, 0.5], dtype=np.float32),
+        nino34=np.array([0.0, 0.8], dtype=np.float32),
+        teleconnection_names=("pna",),
+        teleconnection_values=np.array([[0.7, -0.9]], dtype=np.float32),
+        teleconnection_threshold=0.5,
+        sidecars={0: {}},
+        soil_rows={0: {0: 0}},
+        soil_memmaps={0: np.asarray([[10.0, 50.0, 90.0]], dtype=np.float16)},
+    )
+    chunk_path = tmp_path / "chunk_000000.npz"
+    np.savez_compressed(chunk_path, init_time_index=np.array(0, dtype=np.int32))
+    with np.load(chunk_path, allow_pickle=False) as data:
+        _, strata = lookup.sample_strata(0, chunk_path, data)
+    assert strata["tele_pna"]["positive"].tolist() == [True, True, True]
+    assert set(strata) >= {"mjo_phase", "enso_state", "soil_moisture_tercile", "tele_pna"}
 
 
 def test_extended_paper_parses_w34_per_lead_logs(tmp_path: Path):

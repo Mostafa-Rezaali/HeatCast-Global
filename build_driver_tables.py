@@ -15,6 +15,14 @@ BASE_DATE = datetime(1981, 5, 1)
 MJJAS_MONTHS = (5, 6, 7, 8, 9)
 
 
+def sanitize_index_name(name: str) -> str:
+    clean = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(name).strip())
+    clean = "_".join(part for part in clean.split("_") if part)
+    if not clean:
+        raise ValueError(f"Invalid teleconnection index name: {name!r}")
+    return clean
+
+
 def parse_rmm_file(path: Path) -> Dict[int, Tuple[int, float]]:
     if not path.exists():
         raise FileNotFoundError(f"Missing BOM RMM file: {path}")
@@ -72,6 +80,64 @@ def parse_nino34_file(path: Path) -> Dict[Tuple[int, int], float]:
     return output
 
 
+def parse_monthly_index_file(path: Path) -> Dict[Tuple[int, int], float]:
+    """Parse common monthly teleconnection-index text tables.
+
+    Supported formats:
+    - wide NOAA/PSL style: year jan feb ... dec
+    - long style: year month value [... optional columns], using the final value
+    Lines beginning with # are ignored.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Missing monthly teleconnection file: {path}")
+    output: Dict[Tuple[int, int], float] = {}
+    for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = stripped.replace(",", " ").split()
+        try:
+            year = int(float(parts[0]))
+        except Exception:
+            continue
+        if len(parts) >= 13:
+            try:
+                for month, value in enumerate(parts[1:13], start=1):
+                    output[(year, month)] = float(value)
+                continue
+            except ValueError:
+                pass
+        if len(parts) >= 3:
+            try:
+                month = int(float(parts[1]))
+                if 1 <= month <= 12:
+                    output[(year, month)] = float(parts[-1])
+            except ValueError:
+                continue
+    if not output:
+        raise RuntimeError(f"No monthly observations parsed from {path}")
+    return output
+
+
+def parse_named_index_paths(text: str) -> Dict[str, Path]:
+    paths: Dict[str, Path] = {}
+    for item in str(text).split(","):
+        spec = item.strip()
+        if not spec:
+            continue
+        if "=" not in spec:
+            raise ValueError(
+                "Teleconnection index paths must be NAME=/path/to/file entries "
+                f"separated by commas; got {spec!r}."
+            )
+        name, path = spec.split("=", 1)
+        clean = sanitize_index_name(name)
+        if clean in paths:
+            raise ValueError(f"Duplicate teleconnection index name after sanitizing: {clean}")
+        paths[clean] = Path(path).expanduser()
+    return paths
+
+
 def soil_percentile_against_train(
     train_values: np.ndarray,
     target_values: np.ndarray,
@@ -122,23 +188,34 @@ def build_global_driver_table(
     time_values: Sequence[float],
     rmm: Mapping[int, Tuple[int, float]],
     nino: Mapping[Tuple[int, int], float],
+    teleconnections: Mapping[str, Mapping[Tuple[int, int], float]],
+    teleconnection_threshold: float,
     output_path: Path,
 ) -> None:
     dates = [BASE_DATE + timedelta(days=float(value)) for value in time_values]
     phase = np.full(len(dates), -1, dtype=np.int8)
     amplitude = np.full(len(dates), np.nan, dtype=np.float32)
     nino34 = np.full(len(dates), np.nan, dtype=np.float32)
+    tele_names = tuple(sorted(teleconnections))
+    tele_values = np.full((len(tele_names), len(dates)), np.nan, dtype=np.float32)
     for index, date in enumerate(dates):
         key = int(date.strftime("%Y%m%d"))
         if key in rmm:
             phase[index], amplitude[index] = rmm[key]
         if (date.year, date.month) in nino:
             nino34[index] = nino[(date.year, date.month)]
+        for tele_idx, name in enumerate(tele_names):
+            values = teleconnections[name]
+            if (date.year, date.month) in values:
+                tele_values[tele_idx, index] = values[(date.year, date.month)]
     mjjas = np.array([date.month in MJJAS_MONTHS for date in dates])
     if np.any((phase[mjjas] < 1) | (phase[mjjas] > 8) | ~np.isfinite(amplitude[mjjas])):
         raise RuntimeError("RMM table does not cover every MJJAS date on the HeatCast time axis.")
     if np.any(~np.isfinite(nino34[mjjas])):
         raise RuntimeError("Nino3.4 table does not cover every MJJAS month on the HeatCast time axis.")
+    for tele_idx, name in enumerate(tele_names):
+        if np.any(~np.isfinite(tele_values[tele_idx, mjjas])):
+            raise RuntimeError(f"Teleconnection index {name} does not cover every MJJAS month on the HeatCast time axis.")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -147,8 +224,11 @@ def build_global_driver_table(
         mjo_phase=phase,
         mjo_amplitude=amplitude,
         nino34=nino34,
+        teleconnection_names=np.array(tele_names, dtype="U64"),
+        teleconnection_values=tele_values,
+        teleconnection_threshold=np.array(float(teleconnection_threshold), dtype=np.float32),
     )
-    print(f"Saved global driver table: {output_path}")
+    print(f"Saved global driver table: {output_path} (teleconnections={','.join(tele_names) or 'none'})")
 
 
 def build_fold_soil_table(
@@ -250,6 +330,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rmm_path", required=True)
     parser.add_argument("--nino34_path", required=True)
+    parser.add_argument(
+        "--teleconnection_index_paths",
+        default="",
+        help="Optional comma-separated NAME=/path monthly index files. "
+        "Common names: pna,nao,ao,pdo,amo,epo,wpo,npo.",
+    )
+    parser.add_argument(
+        "--teleconnection_threshold",
+        type=float,
+        default=0.5,
+        help="Fixed absolute threshold for generic monthly index positive/neutral/negative strata.",
+    )
     parser.add_argument("--input_root", default="exceedance_eval_incremental")
     parser.add_argument(
         "--run_names",
@@ -274,6 +366,11 @@ def main() -> None:
         shared_data["time_values"],
         parse_rmm_file(Path(args.rmm_path)),
         parse_nino34_file(Path(args.nino34_path)),
+        {
+            name: parse_monthly_index_file(path)
+            for name, path in parse_named_index_paths(args.teleconnection_index_paths).items()
+        },
+        float(args.teleconnection_threshold),
         output_dir / "mjo_enso_by_init.npz",
     )
     for run_name in run_names:

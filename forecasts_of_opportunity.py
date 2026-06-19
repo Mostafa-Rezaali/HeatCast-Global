@@ -17,7 +17,8 @@ import numpy as np
 HIST_BINS = 512
 EXPECTED_YEARS = set(range(1981, 2024))
 TOP_CONFIDENCE_PERCENTILE = 90
-DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
+BASE_DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
+DRIVER_AXES = BASE_DRIVER_AXES
 _AUC_FROM_HIST = None
 
 
@@ -80,6 +81,16 @@ def enso_stratum(nino34: float) -> str:
     return "neutral"
 
 
+def teleconnection_stratum(value: float, threshold: float) -> str:
+    if not np.isfinite(value):
+        raise RuntimeError("Missing generic teleconnection-index value at init.")
+    if float(value) >= float(threshold):
+        return "positive"
+    if float(value) <= -float(threshold):
+        return "negative"
+    return "neutral"
+
+
 def soil_tercile_selections(percentile: np.ndarray) -> Dict[str, np.ndarray]:
     values = np.asarray(percentile)
     finite = np.isfinite(values)
@@ -128,6 +139,9 @@ class DriverLookup:
     mjo_phase: np.ndarray
     mjo_amplitude: np.ndarray
     nino34: np.ndarray
+    teleconnection_names: Tuple[str, ...]
+    teleconnection_values: np.ndarray
+    teleconnection_threshold: float
     sidecars: Mapping[int, Mapping[int, int]]
     soil_rows: Mapping[int, Mapping[int, int]]
     soil_memmaps: Mapping[int, np.memmap]
@@ -146,11 +160,16 @@ class DriverLookup:
             raise RuntimeError(f"{chunk_path}: no fold-{fold} soil-percentile row for init {init_t}.")
         soil = np.asarray(self.soil_memmaps[fold][soil_row], dtype=np.float32)
         full = np.ones(soil.shape, dtype=bool)
-        return init_t, {
+        strata = {
             "mjo_phase": {mjo_stratum(self.mjo_phase[init_t], self.mjo_amplitude[init_t]): full},
             "enso_state": {enso_stratum(self.nino34[init_t]): full},
             "soil_moisture_tercile": soil_tercile_selections(soil),
         }
+        for index, name in enumerate(self.teleconnection_names):
+            strata[f"tele_{name}"] = {
+                teleconnection_stratum(self.teleconnection_values[index, init_t], self.teleconnection_threshold): full
+            }
+        return init_t, strata
 
 
 def load_driver_lookup(
@@ -165,8 +184,13 @@ def load_driver_lookup(
         phase = np.asarray(data["mjo_phase"], dtype=np.int8)
         amplitude = np.asarray(data["mjo_amplitude"], dtype=np.float32)
         nino34 = np.asarray(data["nino34"], dtype=np.float32)
+        tele_names = tuple(str(value) for value in np.asarray(data["teleconnection_names"], dtype=str).tolist()) if "teleconnection_names" in data else ()
+        tele_values = np.asarray(data["teleconnection_values"], dtype=np.float32) if "teleconnection_values" in data else np.empty((0, phase.size), dtype=np.float32)
+        tele_threshold = float(np.asarray(data["teleconnection_threshold"]).item()) if "teleconnection_threshold" in data else 0.5
     if not (phase.size == amplitude.size == nino34.size):
         raise RuntimeError("Global slow-driver arrays have inconsistent lengths.")
+    if tele_values.shape != (len(tele_names), phase.size):
+        raise RuntimeError(f"Generic teleconnection arrays have inconsistent shape: {tele_values.shape}, names={len(tele_names)}, time={phase.size}.")
     sidecars: Dict[int, Mapping[int, int]] = {}
     soil_rows: Dict[int, Mapping[int, int]] = {}
     soil_memmaps: Dict[int, np.memmap] = {}
@@ -195,7 +219,7 @@ def load_driver_lookup(
             dtype=np.float16,
             shape=shape,
         )
-    return DriverLookup(phase, amplitude, nino34, sidecars, soil_rows, soil_memmaps)
+    return DriverLookup(phase, amplitude, nino34, tele_names, tele_values, tele_threshold, sidecars, soil_rows, soil_memmaps)
 
 
 def assign_deciles(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -882,7 +906,12 @@ def print_driver_verdicts(
     axis_bootstrap: Mapping[Tuple[str, str], Mapping[str, float]],
 ) -> None:
     pooled = global_stats[("confidence", "all")].metrics()["bss_unconditional"]
-    for axis in DRIVER_AXES:
+    driver_axes = sorted({
+        axis
+        for axis, _ in global_stats
+        if axis in BASE_DRIVER_AXES or axis.startswith("tele_")
+    })
+    for axis in driver_axes:
         candidates = [
             (stratum, stats.metrics())
             for (candidate_axis, stratum), stats in global_stats.items()
@@ -1063,6 +1092,16 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("Bootstrap reproducibility assert failed.")
     print(f"Year-block bootstrap reproducibility: PASS ({len(observed_years)} independent year blocks)")
 
+    if driver_lookup is not None:
+        dynamic_driver_axes = tuple(BASE_DRIVER_AXES + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names))
+        if not bootstrap_axes:
+            bootstrap_axes = dynamic_driver_axes
+        elif "all_drivers" in bootstrap_axes:
+            bootstrap_axes = tuple(
+                axis
+                for axis in bootstrap_axes
+                if axis != "all_drivers"
+            ) + dynamic_driver_axes
     expanded_bootstrap_axes = tuple(dict.fromkeys(
         candidate
         for axis in bootstrap_axes
@@ -1099,15 +1138,16 @@ def run(args: argparse.Namespace) -> None:
     reliability_plot(global_stats[("confidence", top_stratum)], out_dir / "reliability_top_band.png", "Top-decile Model C reliability")
     discard_curve_plot(summary_rows, out_dir / "bss_vs_confidence_percentile.png")
     if driver_lookup is not None:
+        driver_axis_prefixes = tuple(BASE_DRIVER_AXES + tuple(f"tele_{name}" for name in driver_lookup.teleconnection_names))
         driver_rows = [
             row for row in summary_rows
-            if any(str(row["axis"]).startswith(axis) for axis in DRIVER_AXES)
+            if any(str(row["axis"]).startswith(axis) for axis in driver_axis_prefixes)
         ]
         write_csv(out_dir / "driver_opportunity_summary.csv", driver_rows)
         write_csv(out_dir / "driver_interaction_paired_bootstrap.csv", paired_interaction_rows)
         driver_conditional_bss_plot(driver_rows, out_dir / "driver_conditional_bss.png")
         print(
-            "Slow-driver leakage audit: PASS (MJO/ENSO are external init-date indices; "
+            "Slow-driver leakage audit: PASS (MJO/ENSO/generic teleconnections are external init-date indices; "
             "soil percentiles and interaction boundaries use fold train/calibration years only; "
             "no test outcomes define strata)."
         )
@@ -1160,8 +1200,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--bootstrap_axes",
-        default="",
-        help="Comma-separated slow-driver axes to year-block bootstrap.",
+        default="all_drivers",
+        help="Comma-separated slow-driver axes to year-block bootstrap. Use all_drivers to include MJO, ENSO, soil, and every tele_* index.",
     )
     parser.add_argument("--seed", type=int, default=42)
     return parser

@@ -19,6 +19,9 @@ INPUT_ROOT=${INPUT_ROOT:-exceedance_eval_incremental}
 DRIVER_DIR=${DRIVER_DIR:-data_cache/slow_driver_tables}
 RMM_PATH=${RMM_PATH:?Set RMM_PATH to the manually downloaded BOM rmm.74toRealtime.txt file}
 NINO34_PATH=${NINO34_PATH:?Set NINO34_PATH to the manually downloaded NOAA PSL Nino3.4 text file}
+TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:-}
+TELECONNECTION_THRESHOLD=${TELECONNECTION_THRESHOLD:-0.5}
+BOOTSTRAP_AXES=${BOOTSTRAP_AXES:-all_drivers}
 
 cd "$WORK_DIR"
 unset PYTHONHOME PYTHONPATH
@@ -39,6 +42,8 @@ git pull --ff-only origin codex/tube_v1
 "$PY" -u build_driver_tables.py \
   --rmm_path "$RMM_PATH" \
   --nino34_path "$NINO34_PATH" \
+  --teleconnection_index_paths "$TELECONNECTION_INDEX_PATHS" \
+  --teleconnection_threshold "$TELECONNECTION_THRESHOLD" \
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS" \
@@ -49,7 +54,7 @@ git pull --ff-only origin codex/tube_v1
   --run_names "$RUNS" \
   --window_leads "$LEADS" \
   --driver_table_dir "$DRIVER_DIR" \
-  --bootstrap_axes mjo_phase,enso_state,soil_moisture_tercile \
+  --bootstrap_axes "$BOOTSTRAP_AXES" \
   --n_bootstrap 2000
 
 echo "SLOW-DRIVER OPPORTUNITY STRATIFICATION COMPLETE"

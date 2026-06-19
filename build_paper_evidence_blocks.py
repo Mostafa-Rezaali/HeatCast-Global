@@ -204,7 +204,7 @@ def build_mechanism_block(stack_dir: Path, opportunity_dir: Path) -> List[Dict[s
     driver_summary = read_csv(opportunity_dir / "driver_opportunity_summary.csv", required=False)
     for row in driver_summary:
         axis = row.get("axis", "")
-        if axis in {"mjo_phase", "enso_state", "soil_moisture_tercile"}:
+        if axis in {"mjo_phase", "enso_state", "soil_moisture_tercile"} or axis.startswith("tele_"):
             rows.append({
                 "evidence_type": "heatcast_driver_stratification",
                 "axis": axis,
@@ -309,7 +309,7 @@ def write_summary(path: Path, headline: Mapping[str, object], mechanism: Sequenc
         "",
         "## Mechanism Block",
         "- Use paired Stack-vs-ENS regional, opportunity, and driver rows as primary mechanism evidence.",
-        "- Treat HeatCast-only MJO/ENSO/soil rows as secondary context when paired driver rows are absent or sparse.",
+        "- Treat HeatCast-only MJO/ENSO/soil/generic teleconnection rows as secondary context when paired driver rows are absent or sparse.",
         "- Strongest paired regional candidates are listed in mechanism_block.csv.",
         "",
         "## Operational Block",
