@@ -434,7 +434,7 @@ def update_extended_products(
             year_acc.update(name, prob, truth, mask, month)
 
     event_fraction = float(np.nanmean(truth[valid])) if np.any(valid) else float("nan")
-    products.sample_case_rows.append({
+    case_row = {
         "fold": fold,
         "year": year,
         "month": month,
@@ -443,16 +443,33 @@ def update_extended_products(
         "event_fraction": event_fraction,
         "stack_mean_probability": float(np.nanmean(stack[valid])) if np.any(valid) else float("nan"),
         "ens_mean_probability": float(np.nanmean(ens[valid])) if np.any(valid) else float("nan"),
-        "payload_index": len(products.case_payloads),
-    })
-    if len(products.case_payloads) < 64:
+    }
+    case_payload = {
+        "truth": truth.astype(np.float32),
+        "stack": stack.astype(np.float32),
+        "ens": ens.astype(np.float32),
+        "heatcast": heat.astype(np.float32),
+    }
+    max_case_payloads = 64
+    if len(products.case_payloads) < max_case_payloads:
+        case_row["payload_index"] = len(products.case_payloads)
+        products.sample_case_rows.append(case_row)
+        case_payload["meta"] = dict(case_row)
         products.case_payloads.append({
-            "truth": truth.astype(np.float32),
-            "stack": stack.astype(np.float32),
-            "ens": ens.astype(np.float32),
-            "heatcast": heat.astype(np.float32),
-            "meta": dict(products.sample_case_rows[-1]),
+            **case_payload,
         })
+    elif math.isfinite(event_fraction):
+        stored_events = np.asarray([f(row.get("event_fraction")) for row in products.sample_case_rows], dtype=np.float64)
+        finite = np.isfinite(stored_events)
+        replace_pos = int(np.nanargmin(np.where(finite, stored_events, np.inf))) if np.any(finite) else -1
+        if replace_pos >= 0 and event_fraction > float(stored_events[replace_pos]):
+            payload_index = int(products.sample_case_rows[replace_pos]["payload_index"])
+            case_row["payload_index"] = payload_index
+            products.sample_case_rows[replace_pos] = case_row
+            case_payload["meta"] = dict(case_row)
+            products.case_payloads[payload_index] = {
+                **case_payload,
+            }
 
 
 def confidence_thresholds_from_calibration(fold_info: Mapping[str, object]) -> Dict[str, float]:
@@ -629,7 +646,11 @@ def write_case_studies(products: ExtendedProducts, out_dir: Path, sources: Dict[
     if products is None or products.land_mask is None:
         write_csv(out_dir / CASE_CSV, [{"status": "not_available", "reason": sources.get("chunk_streaming_status", "")}])
         return
-    top_rows = sorted(products.sample_case_rows, key=lambda row: f(row["event_fraction"]), reverse=True)[:int(n_cases)]
+    valid_rows = [
+        row for row in products.sample_case_rows
+        if 0 <= int(row.get("payload_index", -1)) < len(products.case_payloads)
+    ]
+    top_rows = sorted(valid_rows, key=lambda row: f(row["event_fraction"]), reverse=True)[:int(n_cases)]
     if not top_rows:
         write_csv(out_dir / CASE_CSV, [{"status": "not_available", "reason": "no case payloads"}])
         return
