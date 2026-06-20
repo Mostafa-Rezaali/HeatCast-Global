@@ -272,6 +272,33 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "OMP_NUM_THREADS=1",
         ),
     ))
+
+    results.append(_required_tokens_check(
+        root,
+        "s2s.teleconnection_stack_submission_contract",
+        "submit_teleconnection_stack_analysis.slurm",
+        (
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "git pull --ff-only origin codex/tube_v1",
+            '"$PY" repo_integrity.py',
+            "TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:?",
+            "data_cache/slow_driver_tables_w34_teleconnections",
+            "ens_heatcast_stack_opportunity_teleconnections",
+            "--teleconnection_index_paths \"$TELECONNECTION_INDEX_PATHS\"",
+            "--driver_table_dir \"$DRIVER_DIR\"",
+            "--fold_workers \"$FOLD_WORKERS\"",
+            "TELECONNECTION STACK ANALYSIS COMPLETE",
+        ),
+    ))
+    tele_submit = _text(root, "submit_teleconnection_stack_analysis.slurm")
+    results.append(_result(
+        "s2s.teleconnection_stack_cpu_only_submission",
+        "--gres=gpu" not in tele_submit
+        and "module load cuda" not in tele_submit
+        and "--partition=hpg-b200" not in tele_submit,
+        "Teleconnection Stack-vs-ENS postprocessing is CPU-only and does not request B200 GPUs",
+    ))
     stack_submit = _text(root, "submit_ens_stack_opportunity.slurm")
     results.append(_result(
         "s2s.stack_opportunity_cpu_only_submission",
@@ -592,6 +619,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "submit_ens_score_compare.slurm",
         "submit_ens_widen_cycles.slurm",
         "submit_slow_driver_opportunity.slurm",
+        "submit_teleconnection_stack_analysis.slurm",
         "submit_paper_figures_tables.slurm",
     ):
         text = _text(root, relative)

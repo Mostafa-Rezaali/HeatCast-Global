@@ -485,6 +485,21 @@ def test_paper_evidence_blocks_are_cpu_only_and_cover_required_sections():
     assert "build_paper_evidence_blocks.py" in script
 
 
+def test_teleconnection_stack_submission_is_cpu_only_and_explicit():
+    root = Path(__file__).resolve().parents[1]
+    script = (root / "submit_teleconnection_stack_analysis.slurm").read_text(encoding="utf-8")
+    assert "--mem=500G" in script
+    assert "--gres=gpu" not in script
+    assert "module load cuda" not in script
+    assert "--partition=hpg-b200" not in script
+    assert "TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:?" in script
+    assert "data_cache/slow_driver_tables_w34_teleconnections" in script
+    assert "ens_heatcast_stack_opportunity_teleconnections" in script
+    assert "--teleconnection_index_paths \"$TELECONNECTION_INDEX_PATHS\"" in script
+    assert "--driver_table_dir \"$DRIVER_DIR\"" in script
+    assert "TELECONNECTION STACK ANALYSIS COMPLETE" in script
+
+
 def test_paper_figures_tables_package_is_cpu_only_and_records_claim_boundaries():
     root = Path(__file__).resolve().parents[1]
     source = (root / "build_paper_figures_tables.py").read_text(encoding="utf-8")
