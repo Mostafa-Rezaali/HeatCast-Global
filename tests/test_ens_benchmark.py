@@ -602,10 +602,13 @@ def test_extended_paper_submission_is_cpu_only_and_auditable():
     assert "figure_6_reliability_decomposition" in source
     assert "figure_7_case_studies" in source
     assert "figure_8_per_lead_profile" in source
+    assert "figure_9_teleconnection_ranking" in source
     assert "figure_9_opportunity_discard_curve" in source
+    assert "figure_10a_leave_one_out_robustness" in source
     assert "table_7_stack_ablation_probability" in source
     assert "table_8_per_year_head_to_head" in source
-    assert "table_9_computational_cost_comparison" in source
+    assert "table_9_teleconnection_ranking" in source
+    assert "table_10_computational_cost_comparison" in source
     assert "reproducibility_manifest.json" in source
     assert "--gres=gpu" not in script
     assert "module load cuda" not in script

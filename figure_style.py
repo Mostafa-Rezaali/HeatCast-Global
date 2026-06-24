@@ -29,6 +29,19 @@ SYSTEM_LABELS = {
     "heatcast_ens_stack": "HeatCast+ENS",
 }
 
+TELECONNECTION_COLORS = {
+    "AO": "#0072B2",
+    "NAO": "#009E73",
+    "PNA": "#D55E00",
+    "PDO": "#CC79A7",
+}
+
+GROUP_COLORS = {
+    "fold": "#0072B2",
+    "month": "#009E73",
+    "year": "#D55E00",
+}
+
 
 def mm_to_inch(value_mm: float) -> float:
     return float(value_mm) / MM_PER_INCH
@@ -75,6 +88,14 @@ def system_label(model: str) -> str:
     return SYSTEM_LABELS.get(str(model), str(model))
 
 
+def teleconnection_color(name: str, fallback: str = "#333333") -> str:
+    return TELECONNECTION_COLORS.get(str(name).upper(), fallback)
+
+
+def group_color(name: str, fallback: str = "#666666") -> str:
+    return GROUP_COLORS.get(str(name), fallback)
+
+
 def panel_label(ax, label: str, x: float = -0.08, y: float = 1.04) -> None:
     ax.text(
         x,
@@ -93,4 +114,3 @@ def save_figure(fig, path_base: Path, dpi: int = 600) -> None:
     path_base.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path_base.with_suffix(".svg"), bbox_inches="tight")
     fig.savefig(path_base.with_suffix(".png"), dpi=int(dpi), bbox_inches="tight")
-

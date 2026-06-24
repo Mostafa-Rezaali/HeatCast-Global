@@ -27,7 +27,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
-from figure_style import DOUBLE_COLUMN_MM, figure_size, panel_label, system_color
+from figure_style import DOUBLE_COLUMN_MM, figure_size, group_color, panel_label, system_color, teleconnection_color
 from build_paper_figures_tables import (
     ENS_MODEL,
     HEATCAST_MODEL,
@@ -61,7 +61,14 @@ RELIABILITY_CSV = "figure_6_reliability_decomposition.csv"
 CASE_CSV = "figure_7_case_study_fields.csv"
 PER_LEAD_CSV = "figure_8_per_lead_profile.csv"
 DISCARD_CSV = "figure_9_discard_curve.csv"
+TELECONNECTION_CSV = "figure_9_teleconnection_ranking.csv"
+LEAVE_ONE_OUT_CSV = "figure_10a_leave_one_out_robustness.csv"
 PER_YEAR_BASE_RATE_CSV = "figure_10_per_year_base_rate.csv"
+PARENT_CAVEAT = (
+    "Parent-comparison tests do not establish that an interaction stratum beats "
+    "its broader driver or opportunity parent; these rows are regime-stratified "
+    "evidence, not a standalone causal mechanism."
+)
 
 
 def git_output(args: Sequence[str], root: Path) -> str:
@@ -520,7 +527,32 @@ def stream_chunk_products(args: argparse.Namespace, manifest_sources: Dict[str, 
 
 def write_spatial_skill(products: ExtendedProducts, out_dir: Path, reps: int, seed: int, sources: Dict[str, object]) -> None:
     if products is None or products.land_mask is None:
-        raise RuntimeError(f"Cannot build Figure 5: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
+        existing = out_dir / SPATIAL_CSV
+        rows = read_csv(existing, required=False)
+        if not real_numeric_rows(rows, ("stack_bss", "delta_bss_stack_minus_ens", "stack_roc_auc")):
+            raise RuntimeError(f"Cannot build Figure 5: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
+        plt = ensure_matplotlib()
+        fig, axes = plt.subplots(1, 3, figsize=(13.5, 3.5), constrained_layout=True)
+        panels = [
+            ("Stack BSS", "stack_bss", "RdBu_r", -0.10, 0.10),
+            ("Stack - ENS BSS", "delta_bss_stack_minus_ens", "RdBu_r", -0.06, 0.06),
+            ("Stack ROC-AUC", "stack_roc_auc", "viridis", 0.5, 0.8),
+        ]
+        lon = np.asarray([f(row.get("lon")) for row in rows], dtype=float)
+        lat = np.asarray([f(row.get("lat")) for row in rows], dtype=float)
+        for ax, (title, field, cmap, vmin, vmax) in zip(axes, panels):
+            values = np.asarray([f(row.get(field)) for row in rows], dtype=float)
+            valid = np.isfinite(lon) & np.isfinite(lat) & np.isfinite(values)
+            sc = ax.scatter(lon[valid], lat[valid], c=values[valid], s=0.2, cmap=cmap, vmin=vmin, vmax=vmax, rasterized=True)
+            ax.set_title(title)
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            fig.colorbar(sc, ax=ax, fraction=0.035, pad=0.02)
+        fig.suptitle("Spatial probabilistic W34 skill")
+        savefig(fig, out_dir / "figure_5_spatial_skill")
+        plt.close(fig)
+        sources["figure_5_spatial_skill"] = source_entry(existing, ["stack_bss", "delta_bss_stack_minus_ens", "stack_roc_auc", "ci_excludes_zero"], "replotted from existing numeric Figure 5 CSV because chunk arrays were unavailable in this checkout")
+        return
     valid_count = np.maximum(products.valid_count, 1.0)
     base_brier = products.brier_sum[REFERENCE_MODEL] / valid_count
     stack_brier = products.brier_sum[STACK_MODEL] / valid_count
@@ -599,7 +631,39 @@ def write_spatial_skill(products: ExtendedProducts, out_dir: Path, reps: int, se
 
 def write_reliability_decomposition(products: ExtendedProducts, stack_dir: Path, evidence_dir: Path, out_dir: Path, sources: Dict[str, object]) -> None:
     if products is None:
-        raise RuntimeError(f"Cannot build Figure 6: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
+        rows = read_csv(out_dir / RELIABILITY_CSV, required=False)
+        if not real_numeric_rows([row for row in rows if not row.get("row_type")], ("reliability", "resolution", "uncertainty")):
+            raise RuntimeError(f"Cannot build Figure 6: chunk products unavailable ({sources.get('chunk_streaming_status', '')}).")
+        plt = ensure_matplotlib()
+        fig, axes = plt.subplots(1, 2, figsize=(10.5, 4), constrained_layout=True)
+        for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
+            rel_rows = [row for row in rows if row.get("row_type") == "reliability_bin" and row.get("model") == model]
+            x = np.asarray([f(row.get("mean_forecast_probability")) for row in rel_rows], dtype=float)
+            y = np.asarray([f(row.get("observed_frequency")) for row in rel_rows], dtype=float)
+            valid = np.isfinite(x) & np.isfinite(y)
+            axes[0].plot(x[valid], y[valid], marker="o", color=system_color(model), label=model_label(model))
+        axes[0].plot([0, 1], [0, 1], color="black", linestyle="--", linewidth=0.8)
+        axes[0].set_xlabel("Forecast probability")
+        axes[0].set_ylabel("Observed frequency")
+        axes[0].set_title("Reliability")
+        axes[0].legend(frameon=False)
+        dec_rows = [row for row in rows if row.get("model") in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL) and not row.get("row_type")]
+        models = [row["model"] for row in dec_rows]
+        x = np.arange(len(models))
+        width = 0.23
+        axes[1].bar(x - width, [f(row.get("reliability")) for row in dec_rows], width=width, label="Reliability")
+        axes[1].bar(x, [f(row.get("resolution")) for row in dec_rows], width=width, label="Resolution")
+        axes[1].bar(x + width, [f(row.get("uncertainty")) for row in dec_rows], width=width, label="Uncertainty")
+        axes[1].set_xticks(x, [model_label(model) for model in models], rotation=20, ha="right")
+        axes[1].set_ylabel("Brier decomposition term")
+        axes[1].set_title("Murphy decomposition")
+        axes[1].legend(frameon=False)
+        for ax in axes:
+            ax.spines[["top", "right"]].set_visible(False)
+        savefig(fig, out_dir / "figure_6_reliability_decomposition")
+        plt.close(fig)
+        sources["figure_6_reliability_decomposition"] = source_entry(out_dir / RELIABILITY_CSV, ["mean_forecast_probability", "observed_frequency", "reliability", "resolution", "uncertainty"], "replotted from existing numeric Figure 6 CSV because chunk arrays were unavailable in this checkout")
+        return
     rows: List[Dict[str, object]] = []
     for model in (ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
         dec = products.reliability[model].decomposition()
@@ -866,6 +930,173 @@ def write_discard_curve(products: ExtendedProducts, out_dir: Path, sources: Dict
     sources["figure_9_opportunity_discard_curve"] = source_entry(out_dir / DISCARD_CSV, ["retained_fraction", "bss", "roc_auc", "ece"], "computed from stack probabilities and validation-year confidence thresholds")
 
 
+def parent_comparison_lookup(parent_rows: Sequence[Mapping[str, str]]) -> Dict[Tuple[str, str], Dict[str, bool]]:
+    lookup: Dict[Tuple[str, str], Dict[str, bool]] = {}
+    for row in parent_rows:
+        if row.get("candidate_model") != STACK_MODEL:
+            continue
+        if row.get("baseline_model") != ENS_MODEL:
+            continue
+        if row.get("metric") != "delta_bss_stack_vs_ens_child_minus_parent":
+            continue
+        axis = str(row.get("interaction_axis", ""))
+        stratum = str(row.get("interaction_stratum", ""))
+        if not axis or not stratum:
+            continue
+        state = lookup.setdefault((axis, stratum), {})
+        state[str(row.get("parent_kind", ""))] = str(row.get("ci_excludes_zero", "")).lower() == "true"
+    return lookup
+
+
+def write_teleconnection_ranking(teleconnection_stack_dir: Path, out_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
+    boot_path = teleconnection_stack_dir / "driver_pair_bootstrap.csv"
+    parent_path = teleconnection_stack_dir / "driver_pair_parent_bootstrap.csv"
+    boot_rows = read_csv(boot_path)
+    parent_rows = read_csv(parent_path, required=False)
+    parent_lookup = parent_comparison_lookup(parent_rows)
+    rows: List[Dict[str, object]] = []
+    for row in boot_rows:
+        if row.get("driver_family") != "generic_teleconnection":
+            continue
+        if row.get("candidate_model") != STACK_MODEL or row.get("baseline_model") != ENS_MODEL:
+            continue
+        if row.get("metric") != "delta_bss_heatcast_ens_stack_minus_ens_calibrated":
+            continue
+        axis = str(row.get("axis", ""))
+        stratum = str(row.get("stratum", ""))
+        parent_state = parent_lookup.get((axis, stratum), {})
+        parent_resolved = bool(parent_state) and all(parent_state.values())
+        rows.append({
+            "axis": axis,
+            "stratum": stratum,
+            "teleconnection": axis.replace("tele_", "").replace("_x_top_confidence", "").replace("_x_low_sigma", "").upper(),
+            "display_label": f"{axis.replace('tele_', '').upper()} {stratum}",
+            "delta_bss_stack_minus_ens": float(row["point_estimate"]),
+            "ci_low": float(row["ci_low"]),
+            "ci_high": float(row["ci_high"]),
+            "ci_excludes_zero": str(row.get("ci_excludes_zero", "")).lower() == "true",
+            "independent_year_blocks": int(f(row.get("independent_year_blocks"))),
+            "parent_comparison_resolved": parent_resolved,
+            "parent_caveat": PARENT_CAVEAT,
+        })
+    rows = sorted(rows, key=lambda item: float(item["delta_bss_stack_minus_ens"]), reverse=True)
+    if not rows:
+        raise RuntimeError(f"No generic teleconnection Stack-vs-ENS BSS rows found in {boot_path}.")
+    write_csv(out_dir / TELECONNECTION_CSV, rows)
+
+    resolved = [row for row in rows if row["ci_excludes_zero"]]
+    unresolved_large = [row for row in rows if not row["ci_excludes_zero"] and float(row["delta_bss_stack_minus_ens"]) > 0.0]
+    table_rows: List[Dict[str, object]] = []
+    for group_name, group_rows in (("resolved_ci_excludes_zero", resolved), ("unresolved_ci_crosses_zero", unresolved_large[:12])):
+        for row in group_rows:
+            table_rows.append({
+                "block": group_name,
+                "teleconnection": row["teleconnection"],
+                "state": row["stratum"],
+                "delta_bss_stack_minus_ens": fmt(row["delta_bss_stack_minus_ens"]),
+                "ci_low": fmt(row["ci_low"]),
+                "ci_high": fmt(row["ci_high"]),
+                "parent_comparison_resolved": row["parent_comparison_resolved"],
+                "interpretation": "resolved regime-stratified gain" if row["ci_excludes_zero"] else "large point estimate; CI crosses zero",
+            })
+    write_csv(table_dir / "table_9_teleconnection_ranking.csv", table_rows)
+    write_markdown_table(table_dir / "table_9_teleconnection_ranking.md", table_rows)
+
+    plt = ensure_matplotlib()
+    plot_rows = rows[: min(24, len(rows))]
+    y = np.arange(len(plot_rows))
+    points = np.asarray([float(row["delta_bss_stack_minus_ens"]) for row in plot_rows], dtype=float)
+    lows = np.asarray([float(row["ci_low"]) for row in plot_rows], dtype=float)
+    highs = np.asarray([float(row["ci_high"]) for row in plot_rows], dtype=float)
+    fig, ax = plt.subplots(figsize=figure_size(DOUBLE_COLUMN_MM, max(80.0, 4.0 * len(plot_rows))), constrained_layout=True)
+    for idx, row in enumerate(plot_rows):
+        tele = str(row["teleconnection"])
+        color = teleconnection_color(tele)
+        marker_face = color if row["ci_excludes_zero"] else "white"
+        ax.errorbar(
+            points[idx],
+            y[idx],
+            xerr=[[points[idx] - lows[idx]], [highs[idx] - points[idx]]],
+            fmt="o",
+            color=color,
+            markerfacecolor=marker_face,
+            markeredgecolor=color,
+            markersize=4.0,
+            elinewidth=0.8,
+            capsize=2.0,
+        )
+        if row["ci_excludes_zero"]:
+            ax.text(highs[idx] + 0.003, y[idx], "*", va="center", ha="left", fontsize=8)
+    ax.axvline(0.0, color="black", linewidth=0.7)
+    ax.axvline(0.0212, color="#555555", linewidth=0.8, linestyle="--", label="All-stack delta BSS")
+    ax.set_yticks(y, [str(row["display_label"]).replace("_", " ") for row in plot_rows])
+    ax.invert_yaxis()
+    ax.set_xlabel("Stack - ENS BSS")
+    ax.set_title("Teleconnection-stratified additive skill")
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, loc="lower right")
+    savefig(fig, out_dir / "figure_9_teleconnection_ranking")
+    plt.close(fig)
+    sources["figure_9_teleconnection_ranking"] = source_entry(
+        out_dir / TELECONNECTION_CSV,
+        ["axis", "stratum", "delta_bss_stack_minus_ens", "ci_low", "ci_high", "ci_excludes_zero"],
+        "read from the teleconnection Stack-vs-ENS driver bootstrap CSV; resolved markers require CI excluding zero",
+    )
+    sources["table_9_teleconnection_ranking"] = [
+        source_entry(boot_path, ["driver_family", "candidate_model", "metric", "point_estimate", "ci_low", "ci_high"], "teleconnection Stack-vs-ENS bootstrap rows"),
+        source_entry(parent_path, ["parent_kind", "point_estimate", "ci_low", "ci_high"], "parent-comparison caveat rows"),
+    ]
+
+
+def write_leave_one_out_robustness(stack_dir: Path, out_dir: Path, sources: Dict[str, object]) -> None:
+    source = stack_dir / "robustness_leave_one_out.csv"
+    rows = [
+        row for row in read_csv(source)
+        if row.get("candidate_model") == STACK_MODEL and row.get("baseline_model") == ENS_MODEL
+    ]
+    if not rows:
+        raise RuntimeError(f"No Stack-vs-ENS leave-one-out rows found in {source}.")
+    rows = sorted(rows, key=lambda row: (str(row.get("dropped_group_type", "")), str(row.get("dropped_group_value", ""))))
+    values = np.asarray([f(row["delta_bss_candidate_minus_baseline"]) for row in rows], dtype=float)
+    if np.any(~np.isfinite(values)):
+        raise RuntimeError("Leave-one-out rows contain non-finite Stack-vs-ENS delta BSS.")
+    write_csv(out_dir / LEAVE_ONE_OUT_CSV, rows)
+    positive_count = int(np.sum(values > 0.0))
+    if positive_count != len(values):
+        raise RuntimeError(f"Leave-one-out robustness expected all positive rows; got {positive_count}/{len(values)}.")
+
+    plt = ensure_matplotlib()
+    fig, ax = plt.subplots(figsize=figure_size(DOUBLE_COLUMN_MM, max(88.0, 3.4 * len(rows))), constrained_layout=True)
+    groups = [str(row.get("dropped_group_type", "")) for row in rows]
+    labels = [f"{row.get('dropped_group_type')} {row.get('dropped_group_value')}" for row in rows]
+    y = np.arange(len(rows))
+    ax.barh(y, values, color=[group_color(group) for group in groups], alpha=0.85)
+    ax.axvline(0.0, color="black", linewidth=0.7)
+    ax.axvline(0.0212, color="#555555", linestyle="--", linewidth=0.8, label="Full sample")
+    ax.set_yticks(y, labels)
+    ax.invert_yaxis()
+    ax.set_xlabel("Stack - ENS BSS after dropping one group")
+    ax.set_title("Leave-one-out robustness")
+    ax.text(
+        0.98,
+        0.02,
+        f"{positive_count}/{len(values)} positive; range {np.nanmin(values):+.4f} to {np.nanmax(values):+.4f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=7,
+    )
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.legend(frameon=False, loc="lower right")
+    savefig(fig, out_dir / "figure_10a_leave_one_out_robustness")
+    plt.close(fig)
+    sources["figure_10a_leave_one_out_robustness"] = source_entry(
+        out_dir / LEAVE_ONE_OUT_CSV,
+        ["dropped_group_type", "dropped_group_value", "delta_bss_candidate_minus_baseline"],
+        "read directly from robustness_leave_one_out.csv Stack-vs-ENS rows",
+    )
+
+
 def write_figure_captions(out_dir: Path, sources: Mapping[str, object]) -> None:
     lines = [
         "# Figure Captions",
@@ -884,10 +1115,16 @@ def write_figure_captions(out_dir: Path, sources: Mapping[str, object]) -> None:
         "## Figure 8. Per-lead W34 profile.",
         f"Per-lead TAC and MSE from the latest converged W34 per-lead diagnostics across folds. Source CSV: `{PER_LEAD_CSV}`. Lines show fold means; bands show across-fold standard deviation.",
         "",
-        "## Figure 9. Forecasts-of-opportunity discard curve.",
+        "## Figure 9. Teleconnection-stratified additive skill.",
+        f"Horizontal forest plot of Stack-minus-ENS BSS by AO/NAO/PNA/PDO state. Source CSV: `{TELECONNECTION_CSV}` from the teleconnection stack directory. Filled markers indicate intervals excluding zero; open markers indicate unresolved intervals. {PARENT_CAVEAT}",
+        "",
+        "## Figure S. Forecasts-of-opportunity discard curve.",
         f"Stack BSS after retaining the highest-confidence forecast cells. Source CSV: `{DISCARD_CSV}`. Confidence thresholds are validation-year quantities applied to held-out test chunks.",
         "",
-        "## Figure 10. Per-year base-rate sensitivity.",
+        "## Figure 10A. Leave-one-out robustness.",
+        f"Stack-minus-ENS BSS after dropping each fold, month, or year. Source CSV: `{LEAVE_ONE_OUT_CSV}`. All drops remaining positive supports the additive-stack result.",
+        "",
+        "## Figure 10B. Per-year base-rate sensitivity.",
         f"Per-year Stack-minus-ENS BSS and ROC-AUC versus the year-specific q95 event base rate. Source CSV: `{PER_YEAR_BASE_RATE_CSV}`. The two lowest-base-rate years are labeled to show where BSS is most unstable under rare events.",
         "",
         "## Audit Notes",
@@ -903,14 +1140,24 @@ def write_figure_captions(out_dir: Path, sources: Mapping[str, object]) -> None:
 
 
 def write_table_7(stack_dir: Path, fig_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
-    score_rows = [row for row in read_csv(stack_dir / "heatcast_ens_stack_head_to_head.csv") if row.get("section") == "score"]
+    h2h_path = stack_dir / "heatcast_ens_stack_head_to_head.csv"
+    all_rows = read_csv(h2h_path)
+    score_rows = [row for row in all_rows if row.get("section") == "score"]
     by_model = {row["model"]: row for row in score_rows}
+    boot_by_model = {
+        row["candidate_model"]: row
+        for row in all_rows
+        if row.get("section") == "bootstrap"
+        and row.get("baseline_model") == ENS_MODEL
+        and str(row.get("metric", "")).startswith("delta_bss_")
+    }
     dec_rows = read_csv(fig_dir / RELIABILITY_CSV, required=False)
     dec_by_model = {row.get("model"): row for row in dec_rows if row.get("model") in MODEL_NAMES and not row.get("row_type")}
     output = []
     for model in (REFERENCE_MODEL, ENS_MODEL, HEATCAST_MODEL, STACK_MODEL):
         row = by_model.get(model, {})
         dec = dec_by_model.get(model, {})
+        boot = boot_by_model.get(model, {})
         output.append({
             "model": model_label(model),
             "bss": fmt(row.get("bss_vs_monthly_climo")),
@@ -920,11 +1167,23 @@ def write_table_7(stack_dir: Path, fig_dir: Path, table_dir: Path, sources: Dict
             "resolution": fmt(dec.get("resolution"), signed=False),
             "sharpness_proxy_uncertainty": fmt(dec.get("uncertainty"), signed=False),
             "brier": fmt(row.get("brier"), signed=False),
+            "delta_bss_vs_ens": "" if model in (REFERENCE_MODEL, ENS_MODEL) else fmt(boot.get("point_estimate")),
+            "delta_bss_vs_ens_ci": "" if model in (REFERENCE_MODEL, ENS_MODEL) else f"[{fmt(boot.get('ci_low'))}, {fmt(boot.get('ci_high'))}]",
+            "delta_bss_vs_ens_ci_excludes_zero": "" if model in (REFERENCE_MODEL, ENS_MODEL) else str(boot.get("ci_excludes_zero", "")),
+            "claim_boundary": (
+                "reference"
+                if model == REFERENCE_MODEL else
+                "benchmark"
+                if model == ENS_MODEL else
+                "standalone CI crosses zero; do not claim HeatCast alone beats ENS"
+                if model == HEATCAST_MODEL else
+                "additive stack CI excludes zero; central claim"
+            ),
         })
     write_csv(table_dir / "table_7_stack_ablation_probability.csv", output)
     write_markdown_table(table_dir / "table_7_stack_ablation_probability.md", output)
     sources["table_7_stack_ablation_probability"] = [
-        source_entry(stack_dir / "heatcast_ens_stack_head_to_head.csv", ["bss_vs_monthly_climo", "roc_auc", "reliability_slope", "ece", "brier"], "read from existing head-to-head score rows"),
+        source_entry(h2h_path, ["bss_vs_monthly_climo", "roc_auc", "reliability_slope", "ece", "brier", "ci_low", "ci_high"], "read from existing head-to-head score and bootstrap rows; HeatCast-C alone crosses zero while stack excludes zero"),
         source_entry(fig_dir / RELIABILITY_CSV, ["resolution", "uncertainty"], "Murphy decomposition emitted by figure 6"),
     ]
 
@@ -1099,7 +1358,7 @@ def write_figure_10_per_year_base_rate(stack_dir: Path, table_dir: Path, out_dir
     sources["figure_10_per_year_base_rate"] = source_entry(out_dir / PER_YEAR_BASE_RATE_CSV, ["year", "base_rate", "delta_bss_stack_minus_ens", "delta_auc_stack_minus_ens"], "joined Table 8 per-year deltas with robustness_by_year climatology base rates")
 
 
-def write_table_9(root: Path, stack_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
+def write_table_10(root: Path, stack_dir: Path, table_dir: Path, sources: Dict[str, object]) -> None:
     count = "4.6M"
     logs = sorted(root.glob("*.log"))
     output = [
@@ -1120,9 +1379,9 @@ def write_table_9(root: Path, stack_dir: Path, table_dir: Path, sources: Dict[st
             "notes": "Order-of-magnitude operational cost requires a cited external source; intentionally blank until sourced.",
         },
     ]
-    write_csv(table_dir / "table_9_computational_cost_comparison.csv", output)
-    write_markdown_table(table_dir / "table_9_computational_cost_comparison.md", output)
-    sources["table_9_computational_cost_comparison"] = {
+    write_csv(table_dir / "table_10_computational_cost_comparison.csv", output)
+    write_markdown_table(table_dir / "table_10_computational_cost_comparison.md", output)
+    sources["table_10_computational_cost_comparison"] = {
         "heatcast_parameter_count": "training log text, approximate recurring parameter count",
         "logs_found": [str(path) for path in logs[:20]],
         "ens_cost": "blank until a citable source is supplied",
@@ -1151,6 +1410,9 @@ def copy_inputs_to_repro(root: Path, out_dir: Path, args: argparse.Namespace) ->
         Path(args.stack_dir) / "opportunity_pair_bootstrap.csv",
         Path(args.stack_dir) / "driver_pair_summary.csv",
         Path(args.stack_dir) / "driver_pair_parent_bootstrap.csv",
+        Path(args.teleconnection_stack_dir) / "driver_pair_bootstrap.csv",
+        Path(args.teleconnection_stack_dir) / "driver_pair_parent_bootstrap.csv",
+        Path(args.teleconnection_stack_dir) / "driver_pair_summary.csv",
         Path(args.evidence_dir) / "operational_block.csv",
         Path(args.evidence_dir) / "mechanism_block.csv",
         Path(args.opportunity_dir) / "driver_opportunity_summary.csv",
@@ -1167,6 +1429,7 @@ def copy_inputs_to_repro(root: Path, out_dir: Path, args: argparse.Namespace) ->
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--stack_dir", default=f"ens_heatcast_stack_opportunity/{WINDOW_LABEL}")
+    parser.add_argument("--teleconnection_stack_dir", default=f"ens_heatcast_stack_opportunity_teleconnections/{WINDOW_LABEL}")
     parser.add_argument("--evidence_dir", default=f"paper_evidence_blocks/{WINDOW_LABEL}")
     parser.add_argument("--opportunity_dir", default=f"exceedance_eval_incremental/opportunity_{WINDOW_LABEL}")
     parser.add_argument("--output_dir", default=f"{EXTENDED_FIGURE_DIR}/{WINDOW_LABEL}")
@@ -1209,6 +1472,7 @@ def main() -> None:
         path.mkdir(parents=True, exist_ok=True)
     sources: Dict[str, object] = {
         "headline": source_entry(Path(args.stack_dir) / "heatcast_ens_stack_head_to_head.csv", ["section", "model", "bss_vs_monthly_climo", "roc_auc"], "existing stack headline CSV"),
+        "teleconnection_headline": source_entry(Path(args.teleconnection_stack_dir) / "driver_pair_bootstrap.csv", ["driver_family", "axis", "stratum", "point_estimate", "ci_low", "ci_high"], "AO/NAO/PNA/PDO teleconnection stack directory; not the MJO/ENSO/soil directory"),
         "operational": source_entry(Path(args.evidence_dir) / "operational_block.csv", ["model", "bss", "roc_auc", "reliability_slope", "ece"], "existing paper evidence operational block"),
     }
 
@@ -1218,10 +1482,12 @@ def main() -> None:
     write_case_studies(products, fig_dir, sources)
     write_per_lead_profile(args, fig_dir, sources)
     write_discard_curve(products, fig_dir, sources, int(args.spatial_bootstrap_reps), int(args.seed))
+    write_teleconnection_ranking(Path(args.teleconnection_stack_dir), fig_dir, table_dir, sources)
+    write_leave_one_out_robustness(Path(args.stack_dir), fig_dir, sources)
     write_table_7(Path(args.stack_dir), fig_dir, table_dir, sources)
     write_table_8(Path(args.stack_dir), table_dir, sources)
     write_figure_10_per_year_base_rate(Path(args.stack_dir), table_dir, fig_dir, sources)
-    write_table_9(root, Path(args.stack_dir), table_dir, sources)
+    write_table_10(root, Path(args.stack_dir), table_dir, sources)
     write_figure_captions(out_dir, sources)
     copy_inputs_to_repro(root, out_dir, args)
     update_manifest(out_dir, sources, root)

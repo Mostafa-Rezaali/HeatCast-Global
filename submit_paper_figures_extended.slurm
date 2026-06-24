@@ -34,6 +34,7 @@ git pull --ff-only origin codex/tube_v1
 
 "$PY" -u build_paper_figures_extended.py \
   --stack_dir "ens_heatcast_stack_opportunity/${WINDOW}" \
+  --teleconnection_stack_dir "ens_heatcast_stack_opportunity_teleconnections/${WINDOW}" \
   --evidence_dir "paper_evidence_blocks/${WINDOW}" \
   --opportunity_dir "exceedance_eval_incremental/opportunity_${WINDOW}" \
   --output_dir "paper_figures_extended/${WINDOW}" \
