@@ -28,6 +28,11 @@ hindcast_stats/
 hindcast_paper_data/
 paper_figures/
 
+# Old model launch configurations; keep current W34/ENS/paper scripts tracked.
+submit_tube7_*.slurm
+submit_weekly7_*.slurm
+submit_multiseed_*.slurm
+
 # Archives, papers, screenshots, and local review packets
 *.zip
 *.pdf
