@@ -21,6 +21,7 @@ RUNS=cvfold0_w34_dist_v1,cvfold1_w34_dist_v1,cvfold2_w34_dist_v1,cvfold3_w34_dis
 INPUT_ROOT=exceedance_eval_incremental
 CHECKPOINT_CHOICE_FILE=${CHECKPOINT_CHOICE_FILE:-w34_checkpoint_choice.txt}
 CHECKPOINT_OVERRIDE=${CHECKPOINT_OVERRIDE:-}
+DRIVER_DIR=${DRIVER_DIR:-data_cache/slow_driver_tables_w34}
 
 cd "$WORK_DIR"
 module load cuda/12.9.1
@@ -79,6 +80,7 @@ done
   --input_root "$INPUT_ROOT" \
   --run_names "$RUNS" \
   --window_leads "$LEADS" \
+  --driver_table_dir "$DRIVER_DIR" \
   --n_bootstrap 2000
 
 echo "WEEK 3-4 EVALUATION, STITCH, AND OPPORTUNITY VERIFICATION COMPLETE"
