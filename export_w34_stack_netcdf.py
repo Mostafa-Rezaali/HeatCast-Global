@@ -102,6 +102,19 @@ def land_vector_to_grid(values: np.ndarray, land_mask: np.ndarray, fill_value: f
     return grid
 
 
+def assert_continuous_heatcast_chunks(heat_name: str, chunks: Sequence[Path]) -> None:
+    for path in chunks:
+        with np.load(path, allow_pickle=False) as data:
+            if "mu_z" not in data.files or "truth_z" not in data.files:
+                init_idx = int(data["init_time_index"]) if "init_time_index" in data.files else -1
+                target_idx = int(data["target_center_time_index"]) if "target_center_time_index" in data.files else -1
+                raise RuntimeError(
+                    f"{heat_name}: stale incremental chunk lacks mu_z/truth_z: {path} "
+                    f"(init_time_index={init_idx}, target_center_time_index={target_idx}). "
+                    "Rerun submit_w34_eval_stitch.slurm after pulling the schema-v2 code."
+                )
+
+
 def build_fold_inputs(args: argparse.Namespace, window_leads: Sequence[int]) -> Dict[int, Dict[str, object]]:
     heatcast_runs = parse_csv_list(args.heatcast_runs)
     ens_runs = parse_csv_list(args.ens_runs)
@@ -109,6 +122,8 @@ def build_fold_inputs(args: argparse.Namespace, window_leads: Sequence[int]) -> 
     fold_inputs: Dict[int, Dict[str, object]] = {}
     for heat_name in heatcast_runs:
         manifest, calibration, chunks = load_fold_inputs(Path(args.heatcast_root), heat_name, window_leads)
+        if bool(args.require_continuous_fields):
+            assert_continuous_heatcast_chunks(heat_name, chunks)
         fold = int(manifest["source_fold"])
         if fold in fold_inputs:
             raise RuntimeError(f"Duplicate HeatCast source_fold={fold}.")
