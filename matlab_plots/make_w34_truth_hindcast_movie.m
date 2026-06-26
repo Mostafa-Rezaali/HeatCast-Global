@@ -259,12 +259,8 @@ if isequal(sort(fieldSize), [621 1405])
     staleLon = min(lon1) < -126 || max(lon1) > -65;
     staleLat = min(lat1) > 24.2 || max(lat1) > 49.95;
     if staleLon || staleLat
-        if numel(lat1) == fieldSize(1) && numel(lon1) == fieldSize(2)
+        if numel(lat1) == 621 && numel(lon1) == 1405
             [lat1, lon1] = prismAxisVectors(numel(lat1), numel(lon1));
-        elseif numel(lat1) == fieldSize(2) && numel(lon1) == fieldSize(1)
-            [tmpLat, tmpLon] = prismAxisVectors(numel(lon1), numel(lat1));
-            lat1 = tmpLon;
-            lon1 = tmpLat;
         end
     end
 end
