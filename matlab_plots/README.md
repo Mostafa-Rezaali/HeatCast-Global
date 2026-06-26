@@ -2,20 +2,33 @@
 
 This folder contains MATLAB scripts for plotting HeatCast W34 NetCDF exports.
 
-Primary script:
+Continuous W34 z-score movie:
 
 ```matlab
-make_w34_truth_hindcast_movie('w34_heatcast_ens_stack.nc')
+addpath('matlab_plots')
+make_w34_continuous_movie('matlab_exports/w34_heatcast_ens_stack.nc')
 ```
 
-The movie shows observed continuous W34 truth on the left and HeatCast continuous
-W34 hindcast on the right. Both fields are read from the NetCDF one time slice
-at a time, so MATLAB does not need to keep the full 3-D arrays in memory.
+The continuous movie shows observed W34 truth on the left and HeatCast W34
+hindcast on the right. Both are 14-day mean z-score fields.
+
+Exceedance-probability movie:
+
+```matlab
+addpath('matlab_plots')
+make_w34_truth_hindcast_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
+    'TruthVar','truth_exceedance', ...
+    'HindcastVar','prob_heatcast_ens_stack')
+```
+
+Both paths read the NetCDF one time slice at a time, so MATLAB does not need to
+keep the full 3-D arrays in memory.
 
 Expected NetCDF variables:
 
-- `ground_truth_3d(lat, lon, time)`: continuous observed W34 mean z-score
-- `model_output_3d(lat, lon, time)`: continuous HeatCast W34 mean z-score
+- `ground_truth_3d(y, x, time)`: continuous observed W34 mean z-score
+- `model_output_3d(y, x, time)`: continuous HeatCast W34 mean z-score
+- `truth_exceedance(y, x, time)`: observed W34 exceedance label
+- `prob_heatcast_ens_stack(y, x, time)`: HeatCast+ENS exceedance probability
 - `target_date_yyyymmdd(time)`: target window center date labels
 - `lat`, `lon`: plotting grids
-
