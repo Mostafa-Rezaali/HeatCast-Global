@@ -100,8 +100,9 @@ baseTimeDim = [];
 if hasBaseField
     [base0, baseTimeDim] = readMatchedTimeSlice(ncFile, baseVar, startIndex, nt, lat, lon, truthTimeDim); %#ok<NASGU>
 end
-[truth0, latPlot, lonPlot] = orientFieldToGrid(lat, lon, truth0);
-hind0 = orientFieldToGrid(lat, lon, hind0);
+[latPlot, lonPlot] = orientGridToField(lat, lon, truth0);
+displayMask = orientMaskToField(displayMask, truth0);
+hind0 = orientFieldToPlot(hind0, truth0);
 
 lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
 latLim = [min(latPlot(:), [], 'omitnan'), max(latPlot(:), [], 'omitnan')];
@@ -154,12 +155,12 @@ for t = startIndex:frameStep:endIndex
     hindcast = readMatchedTimeSlice(ncFile, hindcastVar, t, nt, lat, lon, hindTimeDim);
     if hasBaseField
         base = readMatchedTimeSlice(ncFile, baseVar, t, nt, lat, lon, baseTimeDim);
-        base = orientFieldToGrid(lat, lon, base);
+        base = orientFieldToPlot(base, truth0);
     else
         base = [];
     end
-    truth = orientFieldToGrid(lat, lon, truth);
-    hindcast = orientFieldToGrid(lat, lon, hindcast);
+    truth = orientFieldToPlot(truth, truth0);
+    hindcast = orientFieldToPlot(hindcast, truth0);
 
     if useBasemap
         truthMask = sampleMask.base & displayMaskForBasemap(truth, true, exceedanceMode, opt.ProbabilityDisplayThreshold);
@@ -723,6 +724,30 @@ else
 end
 latOut = lat;
 lonOut = lon;
+end
+
+function fieldOut = orientFieldToPlot(field, referenceField)
+% Return field in the same orientation as the reference plot field.
+if isequal(size(field), size(referenceField))
+    fieldOut = field;
+elseif isequal(size(field'), size(referenceField))
+    fieldOut = field';
+else
+    error('field size %s does not match reference field size %s or its transpose.', ...
+        mat2str(size(field)), mat2str(size(referenceField)));
+end
+end
+
+function maskOut = orientMaskToField(mask, field)
+% Return logical mask in the same orientation as a displayed field.
+if isequal(size(mask), size(field))
+    maskOut = logical(mask);
+elseif isequal(size(mask'), size(field))
+    maskOut = logical(mask');
+else
+    error('mask size %s does not match field size %s or its transpose.', ...
+        mat2str(size(mask)), mat2str(size(field)));
+end
 end
 
 function setSurfaceAlpha(h, field)
