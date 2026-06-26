@@ -17,7 +17,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 % latitude x longitude maps with time as the third dimension.
 
 if nargin < 1 || isempty(ncFile)
-    ncFile = 'matlab_exports/w34_heatcast_ens_stack.nc';
+    ncFile = 'w34_heatcast_ens_stack.nc';
 end
 if nargin < 2 || isempty(outMovie)
     outMovie = fullfile('matlab_plots', 'outputs', 'w34_truth_hindcast_movie.mp4');
@@ -35,6 +35,7 @@ parse(p, varargin{:});
 opt = p.Results;
 
 ncFile = char(ncFile);
+ncFile = resolveNetcdfPath(ncFile);
 outMovie = char(outMovie);
 truthVar = char(opt.TruthVar);
 hindcastVar = char(opt.HindcastVar);
@@ -122,6 +123,46 @@ end
 
 fprintf('Wrote movie: %s\n', outMovie);
 
+end
+
+function ncFile = resolveNetcdfPath(ncFile)
+% Resolve common local/HPC export locations and fail with useful candidates.
+if isfile(ncFile)
+    return;
+end
+
+[~, name, ext] = fileparts(ncFile);
+if isempty(ext)
+    ext = '.nc';
+end
+
+candidates = {
+    ncFile
+    fullfile('matlab_plots', [name ext])
+    fullfile('matlab_exports', [name ext])
+    fullfile('.', [name ext])
+    fullfile('matlab_plots', 'w34_heatcast_ens_stack.nc')
+    fullfile('matlab_exports', 'w34_heatcast_ens_stack.nc')
+    fullfile('.', 'w34_heatcast_ens_stack.nc')
+    };
+
+for i = 1:numel(candidates)
+    if isfile(candidates{i})
+        ncFile = candidates{i};
+        fprintf('Using NetCDF file: %s\n', ncFile);
+        return;
+    end
+end
+
+matches = [dir('*.nc'); dir(fullfile('matlab_plots', '*.nc')); dir(fullfile('matlab_exports', '*.nc'))];
+fprintf('Could not open requested NetCDF: %s\n', ncFile);
+if ~isempty(matches)
+    fprintf('Available NetCDF candidates:\n');
+    for i = 1:numel(matches)
+        fprintf('  %s\n', fullfile(matches(i).folder, matches(i).name));
+    end
+end
+error('NetCDF file not found. Pass one of the available paths printed above.');
 end
 
 function [latOut, lonOut] = orientGridToField(lat, lon, field)
