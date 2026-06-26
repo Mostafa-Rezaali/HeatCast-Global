@@ -100,8 +100,9 @@ if hasBaseField
     [base0, baseTimeDim] = readMatchedTimeSlice(ncFile, baseVar, startIndex, nt, lat, lon, truthTimeDim); %#ok<NASGU>
 end
 [latPlot, lonPlot] = coordinateGridForField(ncFile, lat, lon, truth0);
+truth0 = orientFieldToShape(truth0, size(latPlot), truthVar);
+hind0 = orientFieldToShape(hind0, size(latPlot), hindcastVar);
 displayMask = readDisplayMask(ncFile, latPlot, lonPlot, opt.ConusBounds);
-hind0 = orientFieldToPlot(hind0, truth0);
 
 lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
 latLim = [min(latPlot(:), [], 'omitnan'), max(latPlot(:), [], 'omitnan')];
@@ -154,12 +155,12 @@ for t = startIndex:frameStep:endIndex
     hindcast = readMatchedTimeSlice(ncFile, hindcastVar, t, nt, lat, lon, hindTimeDim);
     if hasBaseField
         base = readMatchedTimeSlice(ncFile, baseVar, t, nt, lat, lon, baseTimeDim);
-        base = orientFieldToPlot(base, truth0);
+        base = orientFieldToShape(base, size(latPlot), baseVar);
     else
         base = [];
     end
-    truth = orientFieldToPlot(truth, truth0);
-    hindcast = orientFieldToPlot(hindcast, truth0);
+    truth = orientFieldToShape(truth, size(latPlot), truthVar);
+    hindcast = orientFieldToShape(hindcast, size(latPlot), hindcastVar);
 
     if useBasemap
         truthMask = sampleMask.base & displayMaskForBasemap(truth, true, exceedanceMode, opt.ProbabilityDisplayThreshold);
@@ -227,9 +228,10 @@ yticks(ax, 25:5:50);
 end
 
 function [latPlot, lonPlot] = coordinateGridForField(ncFile, lat2d, lon2d, field)
-% Build coordinates in the same orientation as the displayed field.
+% Build canonical [latitude, longitude] coordinates for plotting.
 % Prefer 1-D coordinates because MATLAB can transpose 2-D NetCDF grids
-% independently of the 3-D y,x,time fields.
+% independently of the 3-D y,x,time fields. Data fields are transposed to
+% this grid later; the grid itself is not transposed to match a raw field.
 if hasVariable(ncFile, 'lat_1d') && hasVariable(ncFile, 'lon_1d')
     lat1 = double(ncread(ncFile, 'lat_1d'));
     lon1 = double(ncread(ncFile, 'lon_1d'));
@@ -237,13 +239,8 @@ if hasVariable(ncFile, 'lat_1d') && hasVariable(ncFile, 'lon_1d')
     if numel(fieldSize) ~= 2
         error('Displayed field must be 2-D, got size %s.', mat2str(fieldSize));
     end
-    if numel(lat1) == fieldSize(1) && numel(lon1) == fieldSize(2)
+    if isequal(sort([numel(lat1), numel(lon1)]), sort(fieldSize))
         [lonPlot, latPlot] = meshgrid(lon1, lat1);
-        return;
-    elseif numel(lat1) == fieldSize(2) && numel(lon1) == fieldSize(1)
-        [lonGrid, latGrid] = meshgrid(lon1, lat1);
-        latPlot = latGrid';
-        lonPlot = lonGrid';
         return;
     end
     warning('lat_1d/lon_1d lengths [%d %d] do not match field size %s; falling back to 2-D lat/lon.', ...
@@ -254,15 +251,31 @@ end
 
 function displayMask = readDisplayMask(ncFile, lat, lon, conusBounds)
 displayMask = isfinite(lat) & isfinite(lon);
-if hasVariable(ncFile, 'land_mask')
+if hasVariable(ncFile, 'row_land') && hasVariable(ncFile, 'col_land')
+    rows = double(ncread(ncFile, 'row_land')) + 1;
+    cols = double(ncread(ncFile, 'col_land')) + 1;
+    landMask = false(size(lat));
+    valid = rows >= 1 & rows <= size(lat, 1) & cols >= 1 & cols <= size(lat, 2);
+    if any(valid)
+        landMask(sub2ind(size(lat), rows(valid), cols(valid))) = true;
+        displayMask = displayMask & landMask;
+    else
+        warning('row_land/col_land indices do not match lat/lon size %s; falling back to land_mask.', ...
+            mat2str(size(lat)));
+    end
+elseif hasVariable(ncFile, 'land_mask')
     landMask = ncread(ncFile, 'land_mask') ~= 0;
     if isequal(size(landMask), size(lat))
         displayMask = displayMask & landMask;
     elseif isequal(size(landMask'), size(lat))
         displayMask = displayMask & landMask';
     else
-        warning('land_mask size %s does not match lat/lon size %s; using finite lat/lon display mask only.', ...
-            mat2str(size(landMask)), mat2str(size(lat)));
+        try
+            displayMask = displayMask & orientFieldToShape(landMask, size(lat), 'land_mask');
+        catch
+            warning('land_mask size %s does not match lat/lon size %s; using finite lat/lon display mask only.', ...
+                mat2str(size(landMask)), mat2str(size(lat)));
+        end
     end
 end
 latMin = conusBounds(1);
@@ -760,6 +773,18 @@ elseif isequal(size(field'), size(referenceField))
 else
     error('field size %s does not match reference field size %s or its transpose.', ...
         mat2str(size(field)), mat2str(size(referenceField)));
+end
+end
+
+function fieldOut = orientFieldToShape(field, targetSize, varName)
+% Return a 2-D field in canonical [latitude, longitude] plot orientation.
+if isequal(size(field), targetSize)
+    fieldOut = field;
+elseif isequal(size(field'), targetSize)
+    fieldOut = field';
+else
+    error('%s size %s does not match canonical plot size %s or its transpose.', ...
+        varName, mat2str(size(field)), mat2str(targetSize));
 end
 end
 
