@@ -12,6 +12,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'CLim'         : color limits for z-score fields. Default: [-2.5 2.5]
 %   'TruthVar'     : NetCDF truth variable. Default: 'ground_truth_3d'
 %   'HindcastVar'  : NetCDF hindcast variable. Default: 'model_output_3d'
+%   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
 % The script reads one time slice at a time. Output arrays are displayed as
 % latitude x longitude maps with time as the third dimension.
@@ -31,6 +32,7 @@ addParameter(p, 'EndIndex', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) 
 addParameter(p, 'CLim', [-2.5 2.5], @(x) isnumeric(x) && numel(x) == 2);
 addParameter(p, 'TruthVar', 'ground_truth_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'HindcastVar', 'model_output_3d', @(x) ischar(x) || isstring(x));
+addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 opt = p.Results;
 
@@ -74,9 +76,11 @@ if ~isempty(outDir) && ~exist(outDir, 'dir')
     mkdir(outDir);
 end
 
-writer = VideoWriter(outMovie, 'MPEG-4');
+[writer, outMovie] = makeVideoWriter(outMovie, char(opt.VideoProfile));
 writer.FrameRate = opt.FrameRate;
-writer.Quality = 95;
+if isprop(writer, 'Quality')
+    writer.Quality = 95;
+end
 open(writer);
 cleanupObj = onCleanup(@() close(writer));
 
@@ -124,6 +128,53 @@ end
 
 fprintf('Wrote movie: %s\n', outMovie);
 
+end
+
+function [writer, outMovie] = makeVideoWriter(outMovie, requestedProfile)
+% Prefer MP4, but fall back to Motion JPEG AVI when MATLAB lacks MPEG-4.
+if strcmpi(requestedProfile, 'auto')
+    profiles = {'MPEG-4', 'Motion JPEG AVI'};
+else
+    profiles = {requestedProfile};
+end
+
+lastError = [];
+for i = 1:numel(profiles)
+    profile = profiles{i};
+    candidate = outMovieWithProfileExtension(outMovie, profile);
+    try
+        writer = VideoWriter(candidate, profile);
+        requestedMovie = outMovie;
+        outMovie = candidate;
+        if ~strcmp(candidate, requestedMovie)
+            fprintf('Using video profile %s: %s\n', profile, candidate);
+        else
+            fprintf('Using video profile %s: %s\n', profile, outMovie);
+        end
+        return;
+    catch err
+        lastError = err;
+        if ~strcmpi(requestedProfile, 'auto')
+            rethrow(err);
+        end
+    end
+end
+
+error('No supported VideoWriter profile found. Last error: %s', lastError.message);
+end
+
+function outMovie = outMovieWithProfileExtension(outMovie, profile)
+[folder, name, ext] = fileparts(outMovie);
+if strcmpi(profile, 'Motion JPEG AVI')
+    wantedExt = '.avi';
+elseif strcmpi(profile, 'MPEG-4')
+    wantedExt = '.mp4';
+else
+    wantedExt = ext;
+end
+if isempty(ext) || ~strcmpi(ext, wantedExt)
+    outMovie = fullfile(folder, [name wantedExt]);
+end
 end
 
 function ncFile = resolveNetcdfPath(ncFile)
