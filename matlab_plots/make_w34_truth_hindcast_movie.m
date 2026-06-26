@@ -116,7 +116,11 @@ cleanupObj = onCleanup(@() close(writer));
 
 fig = figure('Color', 'w', 'Position', [100 100 1600 720]);
 tl = tiledlayout(fig, 1, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-colormap(fig, blueWhiteRed(256));
+if exceedanceMode
+    colormap(fig, probabilityWhiteRed(256));
+else
+    colormap(fig, blueWhiteRed(256));
+end
 
 useBasemap = logical(opt.UseBasemap);
 sampleMask = [];
@@ -678,4 +682,27 @@ red = [0.698, 0.094, 0.168];
 lower = [linspace(blue(1), white(1), half)', linspace(blue(2), white(2), half)', linspace(blue(3), white(3), half)'];
 upper = [linspace(white(1), red(1), n - half)', linspace(white(2), red(2), n - half)', linspace(white(3), red(3), n - half)'];
 cmap = [lower; upper];
+end
+
+function cmap = probabilityWhiteRed(n)
+if nargin < 1
+    n = 256;
+end
+n = max(2, round(n));
+white = [1, 1, 1];
+lightRed = [0.984, 0.705, 0.682];
+red = [0.698, 0.094, 0.168];
+breakPoint = max(2, round(0.55 * n));
+lower = [linspace(white(1), lightRed(1), breakPoint)', ...
+         linspace(white(2), lightRed(2), breakPoint)', ...
+         linspace(white(3), lightRed(3), breakPoint)'];
+upperN = n - breakPoint;
+if upperN > 0
+    upper = [linspace(lightRed(1), red(1), upperN)', ...
+             linspace(lightRed(2), red(2), upperN)', ...
+             linspace(lightRed(3), red(3), upperN)'];
+    cmap = [lower; upper];
+else
+    cmap = lower;
+end
 end
