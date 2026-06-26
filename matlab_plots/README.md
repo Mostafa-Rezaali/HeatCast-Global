@@ -6,7 +6,8 @@ Continuous W34 z-score movie:
 
 ```matlab
 addpath('matlab_plots')
-make_w34_continuous_movie('matlab_exports/w34_heatcast_ens_stack.nc')
+make_w34_truth_hindcast_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
+    'Mode','continuous')
 ```
 
 The continuous movie shows observed W34 truth on the left and HeatCast W34
@@ -17,8 +18,7 @@ Exceedance-probability movie:
 ```matlab
 addpath('matlab_plots')
 make_w34_truth_hindcast_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
-    'TruthVar','truth_exceedance', ...
-    'HindcastVar','prob_heatcast_ens_stack')
+    'Mode','exceedance')
 ```
 
 Both paths read the NetCDF one time slice at a time, so MATLAB does not need to

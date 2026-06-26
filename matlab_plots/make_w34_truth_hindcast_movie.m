@@ -5,6 +5,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   make_w34_truth_hindcast_movie('w34_heatcast_ens_stack.nc')
 %
 % Optional name-value arguments:
+%   'Mode'         : 'auto', 'continuous', or 'exceedance'. Default: 'auto'
 %   'FrameStep'    : plot every Nth time slice. Default: 1
 %   'FrameRate'    : movie frame rate. Default: 8
 %   'StartIndex'   : first time index. Default: 1
@@ -39,6 +40,7 @@ addParameter(p, 'FrameRate', 8, @(x) isnumeric(x) && isscalar(x) && x > 0);
 addParameter(p, 'StartIndex', 1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'EndIndex', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x >= 1));
 addParameter(p, 'CLim', [-2.5 2.5], @(x) isnumeric(x) && numel(x) == 2);
+addParameter(p, 'Mode', 'auto', @(x) any(strcmpi(char(x), {'auto','continuous','exceedance'})));
 addParameter(p, 'TruthVar', 'ground_truth_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'HindcastVar', 'model_output_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'BaseVar', 'prob_climatology', @(x) ischar(x) || isstring(x));
@@ -57,8 +59,8 @@ opt = p.Results;
 ncFile = char(ncFile);
 ncFile = resolveNetcdfPath(ncFile);
 outMovie = char(outMovie);
-truthVar = char(opt.TruthVar);
-hindcastVar = char(opt.HindcastVar);
+mode = lower(char(opt.Mode));
+[truthVar, hindcastVar] = modeVariables(mode, char(opt.TruthVar), char(opt.HindcastVar));
 baseVar = char(opt.BaseVar);
 exceedanceMode = isExceedanceMovie(truthVar, hindcastVar);
 if exceedanceMode && isequal(opt.CLim, [-2.5 2.5])
@@ -224,6 +226,21 @@ frame(1:copyH, 1:copyW, :) = cdata(1:copyH, 1:copyW, :);
 frameOut = frameIn;
 frameOut.cdata = frame;
 frameOut.colormap = [];
+end
+
+function [truthVar, hindcastVar] = modeVariables(mode, truthVar, hindcastVar)
+switch lower(mode)
+    case 'continuous'
+        truthVar = 'ground_truth_3d';
+        hindcastVar = 'model_output_3d';
+    case 'exceedance'
+        truthVar = 'truth_exceedance';
+        hindcastVar = 'prob_heatcast_ens_stack';
+    case 'auto'
+        % Keep explicitly supplied variable names.
+    otherwise
+        error('Unknown mode: %s', mode);
+end
 end
 
 function values = readOptionalVector(ncFile, varName)
