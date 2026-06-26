@@ -20,6 +20,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'MapPointStride': Geographic basemap point stride. Default: 3
 %   'MapMarkerSize': Geographic basemap marker size. Default: 5
 %   'ProbabilityDisplayThreshold': Hide lower probabilities on basemap. Default: 0.05
+%   'ConusBounds'   : Display bounds [latMin latMax lonMin lonMax]. Default: [24 50 -125 -66]
 %   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
 % The script reads one time slice at a time. Output arrays are displayed as
@@ -48,6 +49,7 @@ addParameter(p, 'Basemap', 'grayland', @(x) ischar(x) || isstring(x));
 addParameter(p, 'MapPointStride', 3, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'MapMarkerSize', 5, @(x) isnumeric(x) && isscalar(x) && x > 0);
 addParameter(p, 'ProbabilityDisplayThreshold', 0.05, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
+addParameter(p, 'ConusBounds', [24 50 -125 -66], @(x) isnumeric(x) && numel(x) == 4);
 addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
 opt = p.Results;
@@ -82,6 +84,7 @@ frameStep = max(1, round(opt.FrameStep));
 
 lat = ncread(ncFile, 'lat');
 lon = ncread(ncFile, 'lon');
+displayMask = readDisplayMask(ncFile, lat, lon, opt.ConusBounds);
 
 truthInfo = ncinfo(ncFile, truthVar);
 truthSize = truthInfo.Size;
@@ -129,7 +132,7 @@ sampleMask = [];
 try
     if useBasemap
         [axTruth, axHind, hTruth, hHind, sampleMask] = initializeBasemapPanels( ...
-            tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim);
+            tl, latPlot, lonPlot, displayMask, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim);
     else
         error('Basemap disabled by UseBasemap=false.');
     end
@@ -174,7 +177,7 @@ for t = startIndex:frameStep:endIndex
 
     [windowText, initText, centerText] = windowDateText(targetDate(t), initDate, t, windowLeads);
     if exceedanceMode
-        metricsText = exceedanceMetricsText(truth, hindcast, base, opt.EventThreshold, round(opt.ReliabilityBins));
+        metricsText = exceedanceMetricsText(truth, hindcast, base, displayMask, opt.EventThreshold, round(opt.ReliabilityBins));
         title(axTruth, sprintf('Observed W34 exceedance label | %s', centerText));
         title(axHind, sprintf('%s probability | %s', hindcastDisplayName(hindcastVar), centerText));
         sgtitle(tl, sprintf(['W34 exceedance probability | %d-day mean over leads +%d..+%d (%s) | ', ...
@@ -182,7 +185,7 @@ for t = startIndex:frameStep:endIndex
             numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, metricsText), ...
             'FontWeight', 'bold');
     else
-        metrics = fieldMetrics(truth, hindcast);
+        metrics = fieldMetrics(truth, hindcast, displayMask);
         title(axTruth, sprintf('Observed W34 truth | %s', centerText));
         title(axHind, sprintf('HeatCast W34 hindcast | %s', centerText));
         sgtitle(tl, sprintf(['W34 continuous z-score fields | %d-day mean over leads +%d..+%d (%s) | ', ...
@@ -223,12 +226,32 @@ xticks(ax, -130:10:-60);
 yticks(ax, 25:5:50);
 end
 
+function displayMask = readDisplayMask(ncFile, lat, lon, conusBounds)
+displayMask = isfinite(lat) & isfinite(lon);
+if hasVariable(ncFile, 'land_mask')
+    landMask = ncread(ncFile, 'land_mask') ~= 0;
+    if isequal(size(landMask), size(lat))
+        displayMask = displayMask & landMask;
+    elseif isequal(size(landMask'), size(lat))
+        displayMask = displayMask & landMask';
+    else
+        warning('land_mask size %s does not match lat/lon size %s; using finite lat/lon display mask only.', ...
+            mat2str(size(landMask)), mat2str(size(lat)));
+    end
+end
+latMin = conusBounds(1);
+latMax = conusBounds(2);
+lonMin = conusBounds(3);
+lonMax = conusBounds(4);
+displayMask = displayMask & lat >= latMin & lat <= latMax & lon >= lonMin & lon <= lonMax;
+end
+
 function [axTruth, axHind, hTruth, hHind, sampleMask] = initializeBasemapPanels( ...
-    tl, latPlot, lonPlot, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim)
+    tl, latPlot, lonPlot, displayMask, truth0, hind0, opt, exceedanceMode, hindcastVar, latLim, lonLim)
 stride = max(1, round(opt.MapPointStride));
 baseMask = false(size(latPlot));
 baseMask(1:stride:end, 1:stride:end) = true;
-baseMask = baseMask & isfinite(latPlot) & isfinite(lonPlot);
+baseMask = baseMask & displayMask;
 sampleMask = struct();
 sampleMask.base = baseMask;
 if ~any(baseMask(:))
@@ -397,8 +420,8 @@ switch lower(hindcastVar)
 end
 end
 
-function text = exceedanceMetricsText(truth, prob, base, eventThreshold, reliabilityBins)
-metrics = exceedanceMetrics(truth, prob, base, eventThreshold, reliabilityBins);
+function text = exceedanceMetricsText(truth, prob, base, displayMask, eventThreshold, reliabilityBins)
+metrics = exceedanceMetrics(truth, prob, base, displayMask, eventThreshold, reliabilityBins);
 if isfinite(metrics.bss)
     bssText = sprintf('BSS=%.3f', metrics.bss);
 else
@@ -410,8 +433,8 @@ text = sprintf(['Brier=%.4f  %s  ECE=%.3f  rel_slope=%.3f  hit=%.3f  FAR=%.3f  '
     metrics.obsRate, metrics.meanProb, eventThreshold, formatInteger(metrics.n));
 end
 
-function metrics = exceedanceMetrics(truth, prob, base, eventThreshold, reliabilityBins)
-valid = isfinite(truth) & isfinite(prob);
+function metrics = exceedanceMetrics(truth, prob, base, displayMask, eventThreshold, reliabilityBins)
+valid = displayMask & isfinite(truth) & isfinite(prob);
 y = double(truth(valid) > 0.5);
 p = min(max(double(prob(valid)), 0), 1);
 metrics.n = numel(y);
@@ -495,8 +518,8 @@ else
 end
 end
 
-function metrics = fieldMetrics(truth, pred)
-valid = isfinite(truth) & isfinite(pred);
+function metrics = fieldMetrics(truth, pred, displayMask)
+valid = displayMask & isfinite(truth) & isfinite(pred);
 t = double(truth(valid));
 p = double(pred(valid));
 metrics.n = numel(t);
