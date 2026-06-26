@@ -60,9 +60,10 @@ if numel(truthSize) ~= 3
     error('%s must be a 3-D variable.', truthVar);
 end
 
-% Read first slice to determine MATLAB's ncread orientation.
-truth0 = squeeze(ncread(ncFile, truthVar, [1 1 startIndex], [Inf Inf 1]));
-hind0 = squeeze(ncread(ncFile, hindcastVar, [1 1 startIndex], [Inf Inf 1]));
+% Read first slice by discovering the actual NetCDF time dimension. MATLAB's
+% ncread dimension order can differ from the y,x,time wording used in Python.
+[truth0, truthTimeDim] = readMatchedTimeSlice(ncFile, truthVar, startIndex, nt, lat, lon, []);
+[hind0, hindTimeDim] = readMatchedTimeSlice(ncFile, hindcastVar, startIndex, nt, lat, lon, truthTimeDim);
 [latPlot, lonPlot] = orientGridToField(lat, lon, truth0);
 
 lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
@@ -106,8 +107,8 @@ ylabel(axHind, 'Latitude');
 set(hHind, 'AlphaData', isfinite(hind0));
 
 for t = startIndex:frameStep:endIndex
-    truth = squeeze(ncread(ncFile, truthVar, [1 1 t], [Inf Inf 1]));
-    hindcast = squeeze(ncread(ncFile, hindcastVar, [1 1 t], [Inf Inf 1]));
+    truth = readMatchedTimeSlice(ncFile, truthVar, t, nt, lat, lon, truthTimeDim);
+    hindcast = readMatchedTimeSlice(ncFile, hindcastVar, t, nt, lat, lon, hindTimeDim);
 
     set(hTruth, 'CData', truth, 'AlphaData', isfinite(truth));
     set(hHind, 'CData', hindcast, 'AlphaData', isfinite(hindcast));
@@ -163,6 +164,50 @@ if ~isempty(matches)
     end
 end
 error('NetCDF file not found. Pass one of the available paths printed above.');
+end
+
+function [field, timeDim] = readMatchedTimeSlice(ncFile, varName, t, nt, lat, lon, preferredTimeDim)
+% Read one time slice and return a 2-D field matching lat/lon or their transpose.
+info = ncinfo(ncFile, varName);
+sz = info.Size;
+if numel(sz) ~= 3
+    error('%s must be a 3-D variable.', varName);
+end
+
+dimNames = {info.Dimensions.Name};
+timeByName = find(strcmp(dimNames, 'time'), 1);
+timeBySize = find(sz == nt);
+candidates = unique([preferredTimeDim, timeByName, timeBySize, 1:numel(sz)], 'stable');
+candidates = candidates(candidates >= 1 & candidates <= numel(sz));
+
+for i = 1:numel(candidates)
+    dim = candidates(i);
+    if sz(dim) < t
+        continue;
+    end
+    start = ones(1, numel(sz));
+    count = sz;
+    start(dim) = t;
+    count(dim) = 1;
+    raw = squeeze(ncread(ncFile, varName, start, count));
+    if isvector(raw)
+        continue;
+    end
+    if isGridCompatible(raw, lat, lon)
+        field = raw;
+        timeDim = dim;
+        return;
+    end
+end
+
+tried = sprintf('%d ', candidates);
+error('%s: could not read a 2-D time slice compatible with lat/lon. var size=%s, lat size=%s, lon size=%s, tried time dims=[%s].', ...
+    varName, mat2str(sz), mat2str(size(lat)), mat2str(size(lon)), strtrim(tried));
+end
+
+function ok = isGridCompatible(field, lat, lon)
+ok = (isequal(size(field), size(lat)) && isequal(size(field), size(lon))) || ...
+     (isequal(size(field), size(lat')) && isequal(size(field), size(lon')));
 end
 
 function [latOut, lonOut] = orientGridToField(lat, lon, field)
