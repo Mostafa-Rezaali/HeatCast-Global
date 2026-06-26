@@ -84,7 +84,6 @@ frameStep = max(1, round(opt.FrameStep));
 
 lat = ncread(ncFile, 'lat');
 lon = ncread(ncFile, 'lon');
-displayMask = readDisplayMask(ncFile, lat, lon, opt.ConusBounds);
 
 truthInfo = ncinfo(ncFile, truthVar);
 truthSize = truthInfo.Size;
@@ -100,8 +99,8 @@ baseTimeDim = [];
 if hasBaseField
     [base0, baseTimeDim] = readMatchedTimeSlice(ncFile, baseVar, startIndex, nt, lat, lon, truthTimeDim); %#ok<NASGU>
 end
-[latPlot, lonPlot] = orientGridToField(lat, lon, truth0);
-displayMask = orientMaskToField(displayMask, truth0);
+[latPlot, lonPlot] = coordinateGridForField(ncFile, lat, lon, truth0);
+displayMask = readDisplayMask(ncFile, latPlot, lonPlot, opt.ConusBounds);
 hind0 = orientFieldToPlot(hind0, truth0);
 
 lonLim = [min(lonPlot(:), [], 'omitnan'), max(lonPlot(:), [], 'omitnan')];
@@ -225,6 +224,32 @@ ax.GridAlpha = 0.35;
 ax.Layer = 'top';
 xticks(ax, -130:10:-60);
 yticks(ax, 25:5:50);
+end
+
+function [latPlot, lonPlot] = coordinateGridForField(ncFile, lat2d, lon2d, field)
+% Build coordinates in the same orientation as the displayed field.
+% Prefer 1-D coordinates because MATLAB can transpose 2-D NetCDF grids
+% independently of the 3-D y,x,time fields.
+if hasVariable(ncFile, 'lat_1d') && hasVariable(ncFile, 'lon_1d')
+    lat1 = double(ncread(ncFile, 'lat_1d'));
+    lon1 = double(ncread(ncFile, 'lon_1d'));
+    fieldSize = size(field);
+    if numel(fieldSize) ~= 2
+        error('Displayed field must be 2-D, got size %s.', mat2str(fieldSize));
+    end
+    if numel(lat1) == fieldSize(1) && numel(lon1) == fieldSize(2)
+        [lonPlot, latPlot] = meshgrid(lon1, lat1);
+        return;
+    elseif numel(lat1) == fieldSize(2) && numel(lon1) == fieldSize(1)
+        [lonGrid, latGrid] = meshgrid(lon1, lat1);
+        latPlot = latGrid';
+        lonPlot = lonGrid';
+        return;
+    end
+    warning('lat_1d/lon_1d lengths [%d %d] do not match field size %s; falling back to 2-D lat/lon.', ...
+        numel(lat1), numel(lon1), mat2str(fieldSize));
+end
+[latPlot, lonPlot] = orientGridToField(lat2d, lon2d, field);
 end
 
 function displayMask = readDisplayMask(ncFile, lat, lon, conusBounds)
