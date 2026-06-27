@@ -17,8 +17,17 @@ Exceedance-probability movie:
 
 ```matlab
 addpath('matlab_plots')
-make_w34_truth_hindcast_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
-    'Mode','exceedance')
+make_w34_exceedance_movie('matlab_exports/w34_heatcast_ens_stack.nc')
+```
+
+For a shorter interactive run with a pause after each plotted frame:
+
+```matlab
+addpath('matlab_plots')
+runShort = make_w34_exceedance_movie('matlab_exports/w34_heatcast_ens_stack.nc', [], ...
+    'FrameStep',14, ...
+    'FramePauseSeconds',0.05);
+runShort()
 ```
 
 Both paths read the NetCDF one time slice at a time, so MATLAB does not need to

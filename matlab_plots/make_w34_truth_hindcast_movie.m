@@ -8,6 +8,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'Mode'         : 'auto', 'continuous', or 'exceedance'. Default: 'auto'
 %   'FrameStep'    : plot every Nth time slice. Default: 1
 %   'FrameRate'    : movie frame rate. Default: 8
+%   'FramePauseSeconds': Pause after each plotted frame. Default: 0
 %   'StartIndex'   : first time index. Default: 1
 %   'EndIndex'     : last time index. Default: all times
 %   'CLim'         : color limits for z-score fields. Default: [-2.5 2.5]
@@ -21,7 +22,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'Basemap'      : MATLAB basemap name. Default: 'grayland'
 %   'MapPointStride': Geographic basemap point stride. Default: 3
 %   'MapMarkerSize': Geographic basemap marker size. Default: 5
-%   'ProbabilityDisplayThreshold': Hide lower probabilities on basemap. Default: 0.05
+%   'ProbabilityDisplayThreshold': Hide lower probabilities on basemap. Default: 0.15
 %   'ConusBounds'   : Display bounds [latMin latMax lonMin lonMax]. Default: [24 50 -125 -66]
 %   'VideoProfile' : VideoWriter profile. Default: auto MP4, fallback AVI
 %
@@ -38,6 +39,7 @@ end
 p = inputParser;
 addParameter(p, 'FrameStep', 1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'FrameRate', 8, @(x) isnumeric(x) && isscalar(x) && x > 0);
+addParameter(p, 'FramePauseSeconds', 0, @(x) isnumeric(x) && isscalar(x) && x >= 0);
 addParameter(p, 'StartIndex', 1, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'EndIndex', [], @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x >= 1));
 addParameter(p, 'CLim', [-2.5 2.5], @(x) isnumeric(x) && numel(x) == 2);
@@ -52,7 +54,7 @@ addParameter(p, 'UseBasemap', true, @(x) islogical(x) || (isnumeric(x) && isscal
 addParameter(p, 'Basemap', 'grayland', @(x) ischar(x) || isstring(x));
 addParameter(p, 'MapPointStride', 3, @(x) isnumeric(x) && isscalar(x) && x >= 1);
 addParameter(p, 'MapMarkerSize', 5, @(x) isnumeric(x) && isscalar(x) && x > 0);
-addParameter(p, 'ProbabilityDisplayThreshold', 0.05, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
+addParameter(p, 'ProbabilityDisplayThreshold', 0.15, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
 addParameter(p, 'ConusBounds', [24 50 -125 -66], @(x) isnumeric(x) && numel(x) == 4);
 addParameter(p, 'VideoProfile', 'auto', @(x) ischar(x) || isstring(x));
 parse(p, varargin{:});
@@ -204,6 +206,9 @@ for t = startIndex:frameStep:endIndex
     end
 
     drawnow;
+    if opt.FramePauseSeconds > 0
+        pause(opt.FramePauseSeconds);
+    end
     frame = fixedSizeFrame(getframe(fig), movieSize);
     writeVideo(writer, frame);
 end
