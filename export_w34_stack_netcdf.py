@@ -150,6 +150,40 @@ def load_land_metadata() -> Dict[str, np.ndarray]:
     }
 
 
+def load_fold_norm_scales(
+    fold_inputs: Mapping[int, Mapping[str, object]],
+    window_leads: Sequence[int],
+) -> Dict[int, Tuple[float, float]]:
+    """Return fold-specific target normalization mean/std in degrees C."""
+    import cfm_mesh_train as cfm
+
+    original = {
+        "CV_VAL_OFFSETS": tuple(cfm.Config.CV_VAL_OFFSETS),
+        "CV_TEST_OFFSETS": tuple(cfm.Config.CV_TEST_OFFSETS),
+        "MULTI_LEAD_TUBE": bool(getattr(cfm.Config, "MULTI_LEAD_TUBE", False)),
+        "PREDICTION_LEADS": tuple(getattr(cfm.Config, "PREDICTION_LEADS", ())),
+        "LEAD_TIME": int(getattr(cfm.Config, "LEAD_TIME", 15)),
+    }
+    leads = tuple(int(lead) for lead in window_leads)
+    if not leads:
+        raise ValueError("window_leads must not be empty.")
+    out: Dict[int, Tuple[float, float]] = {}
+    try:
+        for fold in sorted(fold_inputs):
+            cfm.Config.CV_TEST_OFFSETS = (int(fold),)
+            cfm.Config.CV_VAL_OFFSETS = ((int(fold) + 1) % int(cfm.Config.CV_STRIDE),)
+            cfm.Config.MULTI_LEAD_TUBE = True
+            cfm.Config.PREDICTION_LEADS = leads
+            cfm.Config.LEAD_TIME = original["LEAD_TIME"] if original["LEAD_TIME"] in leads else leads[0]
+            stats_path = cfm.get_norm_stats_path(cfm.Config)
+            stats = cfm.load_norm_stats_npz(stats_path)
+            out[int(fold)] = (float(stats["hi_mean"]), float(stats["hi_std"]))
+    finally:
+        for key, value in original.items():
+            setattr(cfm.Config, key, value)
+    return out
+
+
 def finite_or_fill(values: np.ndarray, fill_value: float) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32)
     return np.where(np.isfinite(arr), arr, np.float32(fill_value)).astype(np.float32)
@@ -338,6 +372,7 @@ def write_netcdf(
     fill = np.float32(args.fill_value)
     chunk_samples = max(1, min(int(args.chunk_samples), sample_count))
     variables = set(parse_csv_list(args.variables))
+    fold_norm_scales = load_fold_norm_scales(fold_inputs, ee.parse_int_list(args.window_leads))
 
     with Dataset(path, "w", format="NETCDF4") as ds:
         ds.createDimension("time", sample_count)
@@ -416,6 +451,24 @@ def write_netcdf(
         split_var.flag_meanings = "train validation test"
         year_var = create_var(ds, "year", "i2", ("time",), zlib=False)
         month_var = create_var(ds, "month", "i1", ("time",), zlib=False)
+        z_mean_var = create_var(
+            ds,
+            "z_score_mean_c",
+            "f4",
+            ("time",),
+            zlib=False,
+            units="degree_C",
+            long_name="Fold-specific target normalization mean used for z-score fields",
+        )
+        z_std_var = create_var(
+            ds,
+            "z_score_std_c",
+            "f4",
+            ("time",),
+            zlib=False,
+            units="degree_C",
+            long_name="Fold-specific target normalization standard deviation used to convert z-score errors to degrees C",
+        )
 
         map_chunks = (
             int(np.asarray(land_meta["mask"]).shape[0]),
@@ -477,6 +530,7 @@ def write_netcdf(
             split_var[idx] = 2
             year_var[idx] = int(data["year"])
             month_var[idx] = int(data["month"])
+            z_mean_var[idx], z_std_var[idx] = fold_norm_scales[int(record["fold"])]
 
             arrays = {
                 "model_output": np.asarray(

@@ -14,6 +14,7 @@ function make_w34_truth_hindcast_movie(ncFile, outMovie, varargin)
 %   'TruthVar'     : NetCDF truth variable. Default: 'ground_truth_3d'
 %   'HindcastVar'  : NetCDF hindcast variable. Default: 'model_output_3d'
 %   'BaseVar'      : Climatology probability variable for BSS. Default: 'prob_climatology'
+%   'ZScoreStdC'   : Fallback z-score standard deviation in deg C. Default: 1
 %   'EventThreshold' : Probability threshold for hit/FAR. Default: 0.5
 %   'ReliabilityBins': Number of reliability bins. Default: 10
 %   'UseBasemap'   : Use MATLAB geographic axes basemap if available. Default: true
@@ -44,6 +45,7 @@ addParameter(p, 'Mode', 'auto', @(x) any(strcmpi(char(x), {'auto','continuous','
 addParameter(p, 'TruthVar', 'ground_truth_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'HindcastVar', 'model_output_3d', @(x) ischar(x) || isstring(x));
 addParameter(p, 'BaseVar', 'prob_climatology', @(x) ischar(x) || isstring(x));
+addParameter(p, 'ZScoreStdC', 1, @(x) isnumeric(x) && isscalar(x) && x > 0);
 addParameter(p, 'EventThreshold', 0.5, @(x) isnumeric(x) && isscalar(x) && x >= 0 && x <= 1);
 addParameter(p, 'ReliabilityBins', 10, @(x) isnumeric(x) && isscalar(x) && x >= 2);
 addParameter(p, 'UseBasemap', true, @(x) islogical(x) || (isnumeric(x) && isscalar(x)));
@@ -72,6 +74,7 @@ time = ncread(ncFile, 'time');
 targetDate = ncread(ncFile, 'target_date_yyyymmdd');
 initDate = readOptionalVector(ncFile, 'init_date_yyyymmdd');
 windowLeads = readOptionalVector(ncFile, 'window_lead');
+zScoreStdC = readOptionalVector(ncFile, 'z_score_std_c');
 if isempty(windowLeads)
     windowLeads = 15:28;
 end
@@ -189,11 +192,12 @@ for t = startIndex:frameStep:endIndex
             numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, metricsText), ...
             'FontWeight', 'bold');
     else
-        metrics = fieldMetrics(truth, hindcast, displayMask);
+        metricsScaleC = zScoreScaleForFrame(zScoreStdC, t, opt.ZScoreStdC);
+        metrics = fieldMetrics(truth, hindcast, displayMask, metricsScaleC);
         title(axTruth, sprintf('Observed W34 truth | %s', centerText));
         title(axHind, sprintf('HeatCast W34 hindcast | %s', centerText));
         sgtitle(tl, sprintf(['W34 continuous z-score fields | %d-day mean over leads +%d..+%d (%s) | ', ...
-            'init %s | frame %d/%d\nMAE=%.3f  RMSE=%.3f  bias=%.3f  r=%.3f  R2=%.3f  N=%s land cells'], ...
+            'init %s | frame %d/%d\nMAE=%.2f degC  RMSE=%.2f degC  bias=%.2f degC  r=%.3f  R2=%.3f  N=%s land cells'], ...
             numel(windowLeads), min(windowLeads), max(windowLeads), windowText, initText, t, nt, ...
             metrics.mae, metrics.rmse, metrics.bias, metrics.r, metrics.r2, formatInteger(metrics.n)), ...
             'FontWeight', 'bold');
@@ -248,6 +252,14 @@ if hasVariable(ncFile, varName)
     values = ncread(ncFile, varName);
 else
     values = [];
+end
+end
+
+function scale = zScoreScaleForFrame(zScoreStdC, t, fallback)
+if ~isempty(zScoreStdC) && numel(zScoreStdC) >= t && isfinite(double(zScoreStdC(t))) && double(zScoreStdC(t)) > 0
+    scale = double(zScoreStdC(t));
+else
+    scale = double(fallback);
 end
 end
 
@@ -624,7 +636,7 @@ else
 end
 end
 
-function metrics = fieldMetrics(truth, pred, displayMask)
+function metrics = fieldMetrics(truth, pred, displayMask, zScoreStdC)
 valid = displayMask & isfinite(truth) & isfinite(pred);
 t = double(truth(valid));
 p = double(pred(valid));
@@ -637,7 +649,7 @@ if metrics.n == 0
     metrics.r2 = NaN;
     return;
 end
-err = p - t;
+err = (p - t) * double(zScoreStdC);
 metrics.mae = mean(abs(err));
 metrics.rmse = sqrt(mean(err .^ 2));
 metrics.bias = mean(err);
