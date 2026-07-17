@@ -1,4 +1,9 @@
 # HeatCast
+
+<p align="center">
+  <img src="docs/assets/model_output_heatcast.gif" width="100%" alt="Observed and HeatCast-hindcast 14-day mean temperature anomaly fields over CONUS for week 3-4 leads 15 through 28">
+</p>
+
 [![License: MIT](https://img.shields.io/github/license/Mostafa-Rezaali/HeatCast)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/LICENSE)
 [![CI](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml/badge.svg?branch=main)](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
