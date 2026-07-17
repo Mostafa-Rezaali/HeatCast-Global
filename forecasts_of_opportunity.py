@@ -22,6 +22,13 @@ DRIVER_AXES = BASE_DRIVER_AXES
 _AUC_FROM_HIST = None
 
 
+def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is None:
+        trapezoid = np.trapz
+    return float(trapezoid(y, x))
+
+
 def parse_int_list(text: str) -> Tuple[int, ...]:
     return tuple(int(value.strip()) for value in str(text).split(",") if value.strip())
 
@@ -266,8 +273,7 @@ def roc_auc_from_hist(pos_hist: np.ndarray, neg_hist: np.ndarray) -> float:
     fp = np.cumsum(np.asarray(neg_hist, dtype=np.float64)[::-1])
     tpr = np.r_[0.0, tp / pos_total, 1.0]
     fpr = np.r_[0.0, fp / neg_total, 1.0]
-    trapezoid = getattr(np, "trapezoid", np.trapz)
-    return float(trapezoid(tpr, fpr))
+    return _trapezoid_integral(tpr, fpr)
 
 
 @dataclass

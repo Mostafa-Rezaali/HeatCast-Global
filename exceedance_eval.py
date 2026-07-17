@@ -39,6 +39,13 @@ MJJAS_MONTHS = (5, 6, 7, 8, 9)
 BASE_DATE = datetime(1981, 5, 1)
 
 
+def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is None:
+        trapezoid = np.trapz
+    return float(trapezoid(y, x))
+
+
 def time_datetimes(time_values: Sequence[float]) -> List[datetime]:
     return [BASE_DATE + timedelta(days=float(v)) for v in time_values]
 
@@ -1040,10 +1047,10 @@ class MetricAccumulator:
         fp = np.cumsum(self.auc_hist_neg[::-1])
         tpr = np.r_[0.0, tp / pos_total, 1.0]
         fpr = np.r_[0.0, fp / neg_total, 1.0]
-        roc_auc = float(np.trapz(tpr, fpr))
+        roc_auc = _trapezoid_integral(tpr, fpr)
         precision = tp / np.maximum(tp + fp, 1.0)
         recall = tp / pos_total
-        pr_auc = float(np.trapz(np.r_[precision[0], precision], np.r_[0.0, recall]))
+        pr_auc = _trapezoid_integral(np.r_[precision[0], precision], np.r_[0.0, recall])
         return roc_auc, pr_auc
 
     def threshold_scores(self, thresholds: Sequence[float]) -> Dict[str, float]:
@@ -1158,7 +1165,7 @@ def _roc_auc_from_hist(pos_hist: np.ndarray, neg_hist: np.ndarray) -> float:
     fp = np.cumsum(np.asarray(neg_hist, dtype=np.float64)[::-1])
     tpr = np.r_[0.0, tp / pos_total, 1.0]
     fpr = np.r_[0.0, fp / neg_total, 1.0]
-    return float(np.trapz(tpr, fpr))
+    return _trapezoid_integral(tpr, fpr)
 
 
 def year_block_bootstrap_incremental_comparison(
