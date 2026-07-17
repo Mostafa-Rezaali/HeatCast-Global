@@ -108,6 +108,87 @@ def test_closed_form_crps_matches_numerical_quadrature():
     assert gaussian_crps_numerical_check(num_points=8, num_samples=20001) < 1e-4
 
 
+def test_shared_meshflow_factory_preserves_constructor_and_runtime_config(monkeypatch):
+    class CapturingModel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    config = SimpleNamespace(
+        IMAGE_CHANNELS=2,
+        NUM_SPATIAL_CONDITIONS=25,
+        CONDITION_DIM=5,
+        MESH_LATENT_DIM=128,
+        MESH_PROCESSOR_ROUNDS=8,
+        IMAGE_SIZE=(621, 1405),
+        NUM_GLOBAL_CHANNELS=118,
+        GLOBAL_ENCODER_DIM=64,
+        DETERMINISTIC=True,
+        DROPOUT_RATE=0.15,
+        PREDICT_PERSISTENCE_RESIDUAL=True,
+        MULTI_LEAD_TUBE=True,
+        PREDICTION_LEADS=tuple(range(15, 29)),
+        LEAD_TIME=21,
+        TUBE_TEMPORAL_HEADS=4,
+        TUBE_DECODE_CHUNK_SIZE=2,
+        TUBE_LOSS_DAILY_WEIGHT=0.9,
+        TUBE_LOSS_CENTER_WEIGHT=0.1,
+        TUBE_LOSS_WEEKLY_WEIGHT=0.0,
+        GRADIENT_LOSS_WEIGHT=0.0,
+        ENABLE_EXCEEDANCE_HEAD=False,
+        EXCEEDANCE_INITIAL_PROB=0.05,
+        DISTRIBUTIONAL_HEAD=True,
+        SIGMA_FLOOR=0.1,
+        CRPS_LOSS=True,
+        MSE_ANCHOR_WEIGHT=0.0,
+        EXCEEDANCE_BCE_WEIGHT=0.2,
+        EXCEEDANCE_COUNT_WEIGHT=0.05,
+        EXCEEDANCE_POS_WEIGHT=1.0,
+        EXCEEDANCE_FOCAL_GAMMA=0.0,
+    )
+    mesh = object()
+    device = torch.device("cpu")
+    monkeypatch.setattr(cfm, "MeshFlowNet", CapturingModel)
+
+    model = cfm.build_meshflow_model(config, mesh, device)
+
+    assert model.device == device
+    assert model.kwargs == {
+        "img_channels": 2,
+        "spatial_cond_channels": 25,
+        "condition_dim": 5,
+        "latent_dim": 128,
+        "hidden_dim": 256,
+        "num_processor_rounds": 8,
+        "mesh": mesh,
+        "image_size": (621, 1405),
+        "num_global_channels": 118,
+        "global_encoder_dim": 64,
+        "deterministic": True,
+        "dropout": 0.15,
+        "predict_persistence_residual": True,
+        "multi_lead_tube": True,
+        "prediction_leads": tuple(range(15, 29)),
+        "tube_temporal_heads": 4,
+        "tube_decode_chunk_size": 2,
+        "tube_loss_weights": (0.9, 0.1, 0.0),
+        "gradient_loss_weight": 0.0,
+        "enable_exceedance_head": False,
+        "exceedance_initial_logit": np.log(0.05 / 0.95),
+        "distributional_head": True,
+        "sigma_floor": 0.1,
+    }
+    assert model.crps_loss is True
+    assert model.mse_anchor_weight == 0.0
+    assert model.exceedance_bce_weight == 0.2
+    assert model.exceedance_count_weight == 0.05
+    assert model.exceedance_pos_weight == 1.0
+    assert model.exceedance_focal_gamma == 0.0
+
+
 def test_w34_model_parameter_budget_and_decoder_chunking_do_not_change_weights():
     common = dict(
         mesh=None,

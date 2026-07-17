@@ -34,7 +34,7 @@ PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 
 cd "$WORK_DIR"
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 
 "$PY" -m py_compile ens_heatcast_stack_opportunity.py ens_compare.py exceedance_eval.py stitch_exceedance_folds.py forecasts_of_opportunity.py
 "$PY" repo_integrity.py

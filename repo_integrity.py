@@ -132,7 +132,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--gres=gpu:8",
             "--mem=500G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "--multi_lead_tube",
             "--tube_decode_chunk_size 2",
             "--distributional_head",
@@ -258,7 +258,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=500G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "ens_heatcast_stack_opportunity.py",
             "cvfold{F}_ens_w34,cvfold{F}_ens_w34_rt2024",
             "--bootstrap_reps 5000",
@@ -280,7 +280,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=500G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             '"$PY" repo_integrity.py',
             "TELECONNECTION_INDEX_PATHS=${TELECONNECTION_INDEX_PATHS:?",
             "data_cache/slow_driver_tables_w34_teleconnections",
@@ -332,7 +332,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=16G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "build_paper_evidence_blocks.py",
             "paper_evidence_blocks/window_15-16-17-18-19-20-21-22-23-24-25-26-27-28",
         ),
@@ -379,7 +379,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=32G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "build_paper_figures_tables.py",
             "paper_figures_tables/${WINDOW}",
             "OPENBLAS_NUM_THREADS=1",
@@ -424,7 +424,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=64G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "build_paper_figures_extended.py",
             "paper_figures_extended/${WINDOW}",
             "OPENBLAS_NUM_THREADS=1",
@@ -446,7 +446,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         (
             "--mem=64G",
             f"--mail-user={EMAIL}",
-            "git pull --ff-only origin codex/tube_v1",
+            "git pull --ff-only origin main",
             "figure_style.py",
             "build_paper_figures_tables.py",
             "build_paper_figures_extended.py",
@@ -628,7 +628,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         text = _text(root, relative)
         results.append(_result(
             f"submission.preflight.{relative}",
-            "git pull --ff-only origin codex/tube_v1" in text
+            "git pull --ff-only origin main" in text
             and '"$PY" repo_integrity.py' in text,
             f"{relative}: pulls current code and runs repository integrity preflight",
         ))

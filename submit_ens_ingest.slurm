@@ -25,7 +25,7 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 "$PY" -m py_compile repo_integrity.py ens_common.py ens_ingest.py
 "$PY" repo_integrity.py
 "$PY" -u ens_ingest.py \

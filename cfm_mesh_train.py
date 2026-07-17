@@ -429,6 +429,49 @@ def tube_mean_display_label(config=Config):
     return f"{len(prediction_leads(config))}-day mean"
 
 
+def build_meshflow_model(config, mesh, device):
+    """Build the shared MeshFlowNet used by training, export, and test paths."""
+    model = MeshFlowNet(
+        img_channels=config.IMAGE_CHANNELS,
+        spatial_cond_channels=config.NUM_SPATIAL_CONDITIONS,
+        condition_dim=config.CONDITION_DIM,
+        latent_dim=config.MESH_LATENT_DIM,
+        hidden_dim=config.MESH_LATENT_DIM * 2,
+        num_processor_rounds=config.MESH_PROCESSOR_ROUNDS,
+        mesh=mesh,
+        image_size=config.IMAGE_SIZE,
+        num_global_channels=config.NUM_GLOBAL_CHANNELS,
+        global_encoder_dim=config.GLOBAL_ENCODER_DIM,
+        deterministic=config.DETERMINISTIC,
+        dropout=config.DROPOUT_RATE,
+        predict_persistence_residual=config.PREDICT_PERSISTENCE_RESIDUAL,
+        multi_lead_tube=config.MULTI_LEAD_TUBE,
+        prediction_leads=prediction_leads(config),
+        tube_temporal_heads=config.TUBE_TEMPORAL_HEADS,
+        tube_decode_chunk_size=config.TUBE_DECODE_CHUNK_SIZE,
+        tube_loss_weights=(
+            config.TUBE_LOSS_DAILY_WEIGHT,
+            config.TUBE_LOSS_CENTER_WEIGHT,
+            config.TUBE_LOSS_WEEKLY_WEIGHT,
+        ),
+        gradient_loss_weight=config.GRADIENT_LOSS_WEIGHT,
+        enable_exceedance_head=config.ENABLE_EXCEEDANCE_HEAD,
+        exceedance_initial_logit=math.log(
+            float(config.EXCEEDANCE_INITIAL_PROB)
+            / max(1.0 - float(config.EXCEEDANCE_INITIAL_PROB), 1e-6)
+        ),
+        distributional_head=config.DISTRIBUTIONAL_HEAD,
+        sigma_floor=config.SIGMA_FLOOR,
+    ).to(device)
+    model.crps_loss = bool(config.CRPS_LOSS)
+    model.mse_anchor_weight = float(config.MSE_ANCHOR_WEIGHT)
+    model.exceedance_bce_weight = float(config.EXCEEDANCE_BCE_WEIGHT)
+    model.exceedance_count_weight = float(config.EXCEEDANCE_COUNT_WEIGHT)
+    model.exceedance_pos_weight = float(config.EXCEEDANCE_POS_WEIGHT)
+    model.exceedance_focal_gamma = float(config.EXCEEDANCE_FOCAL_GAMMA)
+    return model
+
+
 def validate_prediction_lead_config(config=Config, max_supported_lead=28):
     """Fail early when a requested tube cannot be indexed or shaped safely."""
     leads = prediction_leads(config)
@@ -3967,44 +4010,7 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
     # Build mesh + model
     mesh = build_mesh_once(Config, conus_mask, device, ddp=ddp)
 
-    model = MeshFlowNet(
-        img_channels=Config.IMAGE_CHANNELS,
-        spatial_cond_channels=Config.NUM_SPATIAL_CONDITIONS,
-        condition_dim=Config.CONDITION_DIM,
-        latent_dim=Config.MESH_LATENT_DIM,
-        hidden_dim=Config.MESH_LATENT_DIM * 2,
-        num_processor_rounds=Config.MESH_PROCESSOR_ROUNDS,
-        mesh=mesh,
-        image_size=Config.IMAGE_SIZE,
-        num_global_channels=Config.NUM_GLOBAL_CHANNELS,
-        global_encoder_dim=Config.GLOBAL_ENCODER_DIM,
-        deterministic=Config.DETERMINISTIC,
-        dropout=Config.DROPOUT_RATE,
-        predict_persistence_residual=Config.PREDICT_PERSISTENCE_RESIDUAL,
-        multi_lead_tube=Config.MULTI_LEAD_TUBE,
-        prediction_leads=prediction_leads(Config),
-        tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
-        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
-        tube_loss_weights=(
-            Config.TUBE_LOSS_DAILY_WEIGHT,
-            Config.TUBE_LOSS_CENTER_WEIGHT,
-            Config.TUBE_LOSS_WEEKLY_WEIGHT,
-        ),
-        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
-        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
-        exceedance_initial_logit=math.log(
-            float(Config.EXCEEDANCE_INITIAL_PROB)
-            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
-        ),
-        distributional_head=Config.DISTRIBUTIONAL_HEAD,
-        sigma_floor=Config.SIGMA_FLOOR,
-    ).to(device)
-    model.crps_loss = bool(Config.CRPS_LOSS)
-    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
-    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
-    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
-    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
-    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
+    model = build_meshflow_model(Config, mesh, device)
     if Config.ENABLE_EXCEEDANCE_HEAD:
         model.exceedance_region_masks = build_exceedance_region_mask_tensor(Config, conus_mask).to(device)
 
@@ -4960,44 +4966,7 @@ def _load_meshflownet_checkpoint(checkpoint_path, mesh, device):
         Config.IMAGE_CHANNELS = 2
         Config.CRPS_LOSS = bool(checkpoint.get("crps_loss", Config.CRPS_LOSS))
         Config.SIGMA_FLOOR = float(checkpoint.get("sigma_floor", Config.SIGMA_FLOOR))
-    model = MeshFlowNet(
-        img_channels=Config.IMAGE_CHANNELS,
-        spatial_cond_channels=Config.NUM_SPATIAL_CONDITIONS,
-        condition_dim=Config.CONDITION_DIM,
-        latent_dim=Config.MESH_LATENT_DIM,
-        hidden_dim=Config.MESH_LATENT_DIM * 2,
-        num_processor_rounds=Config.MESH_PROCESSOR_ROUNDS,
-        mesh=mesh,
-        image_size=Config.IMAGE_SIZE,
-        num_global_channels=Config.NUM_GLOBAL_CHANNELS,
-        global_encoder_dim=Config.GLOBAL_ENCODER_DIM,
-        deterministic=Config.DETERMINISTIC,
-        dropout=Config.DROPOUT_RATE,
-        predict_persistence_residual=Config.PREDICT_PERSISTENCE_RESIDUAL,
-        multi_lead_tube=Config.MULTI_LEAD_TUBE,
-        prediction_leads=prediction_leads(Config),
-        tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
-        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
-        tube_loss_weights=(
-            Config.TUBE_LOSS_DAILY_WEIGHT,
-            Config.TUBE_LOSS_CENTER_WEIGHT,
-            Config.TUBE_LOSS_WEEKLY_WEIGHT,
-        ),
-        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
-        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
-        exceedance_initial_logit=math.log(
-            float(Config.EXCEEDANCE_INITIAL_PROB)
-            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
-        ),
-        distributional_head=Config.DISTRIBUTIONAL_HEAD,
-        sigma_floor=Config.SIGMA_FLOOR,
-    ).to(device)
-    model.crps_loss = bool(Config.CRPS_LOSS)
-    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
-    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
-    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
-    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
-    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
+    model = build_meshflow_model(Config, mesh, device)
 
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if Config.MULTI_LEAD_TUBE and any(
@@ -5167,44 +5136,7 @@ def _test(args):
         Config.CRPS_LOSS = bool(checkpoint.get("crps_loss", Config.CRPS_LOSS))
         Config.SIGMA_FLOOR = float(checkpoint.get("sigma_floor", Config.SIGMA_FLOOR))
 
-    model = MeshFlowNet(
-        img_channels=Config.IMAGE_CHANNELS,
-        spatial_cond_channels=Config.NUM_SPATIAL_CONDITIONS,
-        condition_dim=Config.CONDITION_DIM,
-        latent_dim=Config.MESH_LATENT_DIM,
-        hidden_dim=Config.MESH_LATENT_DIM * 2,
-        num_processor_rounds=Config.MESH_PROCESSOR_ROUNDS,
-        mesh=mesh,
-        image_size=Config.IMAGE_SIZE,
-        num_global_channels=Config.NUM_GLOBAL_CHANNELS,
-        global_encoder_dim=Config.GLOBAL_ENCODER_DIM,
-        deterministic=Config.DETERMINISTIC,
-        dropout=Config.DROPOUT_RATE,
-        predict_persistence_residual=Config.PREDICT_PERSISTENCE_RESIDUAL,
-        multi_lead_tube=Config.MULTI_LEAD_TUBE,
-        prediction_leads=prediction_leads(Config),
-        tube_temporal_heads=Config.TUBE_TEMPORAL_HEADS,
-        tube_decode_chunk_size=Config.TUBE_DECODE_CHUNK_SIZE,
-        tube_loss_weights=(
-            Config.TUBE_LOSS_DAILY_WEIGHT,
-            Config.TUBE_LOSS_CENTER_WEIGHT,
-            Config.TUBE_LOSS_WEEKLY_WEIGHT,
-        ),
-        gradient_loss_weight=Config.GRADIENT_LOSS_WEIGHT,
-        enable_exceedance_head=Config.ENABLE_EXCEEDANCE_HEAD,
-        exceedance_initial_logit=math.log(
-            float(Config.EXCEEDANCE_INITIAL_PROB)
-            / max(1.0 - float(Config.EXCEEDANCE_INITIAL_PROB), 1e-6)
-        ),
-        distributional_head=Config.DISTRIBUTIONAL_HEAD,
-        sigma_floor=Config.SIGMA_FLOOR,
-    ).to(device)
-    model.crps_loss = bool(Config.CRPS_LOSS)
-    model.mse_anchor_weight = float(Config.MSE_ANCHOR_WEIGHT)
-    model.exceedance_bce_weight = float(Config.EXCEEDANCE_BCE_WEIGHT)
-    model.exceedance_count_weight = float(Config.EXCEEDANCE_COUNT_WEIGHT)
-    model.exceedance_pos_weight = float(Config.EXCEEDANCE_POS_WEIGHT)
-    model.exceedance_focal_gamma = float(Config.EXCEEDANCE_FOCAL_GAMMA)
+    model = build_meshflow_model(Config, mesh, device)
 
     state_dict = checkpoint.get('ema_state_dict', checkpoint['model_state_dict'])
     if list(state_dict.keys())[0].startswith('module.'):

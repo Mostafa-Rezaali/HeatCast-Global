@@ -5,9 +5,9 @@ name: Python package
 
 on:
   push:
-    branches: [ "codex/tube_v1" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "codex/tube_v1" ]
+    branches: [ "main" ]
 
 jobs:
   build:

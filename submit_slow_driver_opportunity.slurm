@@ -33,7 +33,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 "$PY" -m py_compile repo_integrity.py forecasts_of_opportunity.py recover_chunk_init_dates.py build_driver_tables.py
 "$PY" repo_integrity.py
 

@@ -26,7 +26,7 @@ unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 "$PY" -m py_compile repo_integrity.py cfm_mesh_train.py mesh_backbone.py mode_dispatch.py exceedance_eval.py
 "$PY" repo_integrity.py
 

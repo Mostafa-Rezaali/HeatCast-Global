@@ -23,7 +23,7 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 
 cd "$WORK_DIR"
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 
 "$PY" -m py_compile export_w34_stack_netcdf.py repo_integrity.py
 "$PY" repo_integrity.py

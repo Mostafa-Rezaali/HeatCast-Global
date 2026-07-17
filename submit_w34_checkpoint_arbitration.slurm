@@ -27,7 +27,7 @@ unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 "$PY" -m py_compile cfm_mesh_train.py exceedance_eval.py w34_checkpoint_arbitration.py
 
 for SELECTOR in best_tac best_monitor; do

@@ -35,7 +35,7 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 "$PY" -m py_compile repo_integrity.py exceedance_eval.py ens_compare.py stitch_exceedance_folds.py
 "$PY" repo_integrity.py
 

@@ -19,7 +19,7 @@ PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 WORK_DIR=/blue/nessie/mostafarezaali/Teleconnection
 
 cd "$WORK_DIR"
-git pull --ff-only origin codex/tube_v1
+git pull --ff-only origin main
 
 "$PY" -m py_compile build_paper_evidence_blocks.py
 "$PY" repo_integrity.py
