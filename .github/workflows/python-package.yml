@@ -27,7 +27,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install flake8 pytest
+        python -m pip install flake8 pytest numpy scipy netCDF4 tqdm matplotlib
+        python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
     - name: Compile core scripts
       run: |
@@ -50,7 +51,7 @@ jobs:
     - name: Test with pytest
       run: |
         if find . \( -name "test_*.py" -o -name "*_test.py" \) | grep -q .; then
-          pytest
+          python -m pytest
         else
           echo "No pytest tests found; skipping pytest."
         fi
