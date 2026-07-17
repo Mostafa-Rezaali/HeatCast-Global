@@ -1,5 +1,5 @@
 # HeatCast
-
+[![License: MIT](https://img.shields.io/github/license/Mostafa-Rezaali/HeatCast)](https://github.com/Mostafa-Rezaali/HeatCast/blob/main/LICENSE)
 [![CI](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml/badge.svg?branch=main)](https://github.com/Mostafa-Rezaali/HeatCast/actions/workflows/python-package.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-distributional%20mesh%20GNN-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org/)
