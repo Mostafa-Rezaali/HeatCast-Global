@@ -23,6 +23,7 @@ CURRENT_SUBMISSIONS = (
     "slurm/submit_ens_stack_opportunity.slurm",
     "slurm/submit_ens_widen_cycles.slurm",
     "slurm/submit_export_w34_stack_netcdf.slurm",
+    "slurm/submit_global_data_build.slurm",
     "slurm/submit_paper_evidence_blocks.slurm",
     "slurm/submit_paper_figures_journal.slurm",
     "slurm/submit_teleconnection_stack_analysis.slurm",
@@ -159,6 +160,74 @@ def audit_repository(root: Path) -> list[CheckResult]:
         and "np.cos(np.deg2rad(values))" in spatial_weights
         and "def weighted_spatial_mean(" in spatial_weights,
         "Shared NumPy/PyTorch cosine-latitude weighting helpers are present",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.era5_download_contract",
+        "src/data_pipeline/download_era5.py",
+        (
+            'PREFERRED_DAILY_DATASET = "derived-era5-single-levels-daily-statistics"',
+            'HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"',
+            'PRESSURE_LEVEL_DATASET = None  # TODO(USER)',
+            'YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))',
+            'target.with_suffix(target.suffix + ".part")',
+            'partial.replace(target)',
+            '"target_source": task.source_choice',
+            'ThreadPoolExecutor(max_workers=int(workers))',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.regrid_cache_contract",
+        "src/data_pipeline/regrid.py",
+        (
+            "def conservative_regrid_scipy(",
+            "def bilinear_regrid_scipy(",
+            "periodic=True",
+            "weights_path",
+            'method not in ("conservative", "bilinear")',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.lazy_zarr_contract",
+        "src/data_pipeline/build_cache.py",
+        (
+            'chunks=(1, grid.shape[0], grid.shape[1], len(CACHE_CHANNELS))',
+            'root = zarr.open_group(str(path), mode="a")',
+            'Resume date mismatch at index',
+            "class LazyGlobalZarrDataset(Dataset):",
+            "self._store = None",
+            "def __getstate__(self):",
+            "def _ensure_open(self):",
+            "root = self._ensure_open()",
+            "fold_sidecar_path(",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.data_build_submission_contract",
+        "slurm/submit_global_data_build.slurm",
+        (
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/",
+            "module load cuda/12.9.1",
+            "ERA5_PRESSURE_DATASET",
+            "data_pipeline.download_era5",
+            "data_pipeline.build_cache",
+        ),
+    ))
+
+    global_data_slurm = _text(root, "slurm/submit_global_data_build.slurm")
+    results.append(_result(
+        "global.data_build_cpu_only_submission",
+        "--gres=" not in global_data_slurm,
+        "Global ERA5 download/regrid/cache build is CPU-only",
     ))
 
     results.append(_result(
@@ -576,8 +645,13 @@ def audit_repository(root: Path) -> list[CheckResult]:
             capture_output=True,
             text=True,
         ).stdout.splitlines()
-        forbidden_suffixes = (".pth", ".pt", ".npy", ".npz", ".nc", ".pkl", ".grib", ".log", ".err")
-        forbidden = sorted(path for path in tracked if path.lower().endswith(forbidden_suffixes))
+        forbidden_suffixes = (
+            ".pth", ".pt", ".npy", ".npz", ".nc", ".pkl", ".grib", ".grib2", ".log", ".err"
+        )
+        forbidden = sorted(
+            path for path in tracked
+            if path.lower().endswith(forbidden_suffixes) or ".zarr/" in path.lower()
+        )
         results.append(_result(
             "repository.no_tracked_runtime_artifacts",
             not forbidden,

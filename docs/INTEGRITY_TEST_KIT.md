@@ -23,6 +23,10 @@ not merely that Python files compile.
 - The ECMWF downloader and evaluation import one full-W34-valid MJJAS
   Monday/Thursday initialization calendar.
 - Global spatial reductions use the shared normalized cosine-latitude helper.
+- ERA5 requests are monthly, resumable, atomic, source-recorded, and blocked
+  when an unspecified CDS dataset identifier would otherwise be guessed.
+- Conservative target and bilinear predictor regridding have a pure-SciPy
+  fallback; zarr uses `time=1` chunks and opens only within Dataset workers.
 
 ## Commands
 
