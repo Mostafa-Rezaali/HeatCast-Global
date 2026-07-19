@@ -196,8 +196,9 @@ class MeshProcessor(nn.Module):
     Without this, the processor is blind to t after the encoder.
     """
     def __init__(self, latent_dim, edge_dim, hidden_dim, num_rounds=8,
-                 time_dim=None, dropout=0.0):
+                 time_dim=None, dropout=0.0, gradient_checkpointing=False):
         super().__init__()
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.edge_encoder = MLP(edge_dim, hidden_dim, latent_dim, num_layers=1, residual=False)
         self.rounds = nn.ModuleList([
             InteractionNetwork(node_dim=latent_dim, edge_dim=latent_dim, hidden_dim=hidden_dim, dropout=dropout)
@@ -222,14 +223,24 @@ class MeshProcessor(nn.Module):
         for b in range(B):
             h, e = mesh_features[b], edge_h.clone()
             for i, rnd in enumerate(self.rounds):
-                e_in = e
-                h, e = rnd(h, h, mesh_edge_index, e)
-                e = e + e_in
-                # Per-round FiLM conditioning
-                if self.time_film is not None and t_emb is not None:
-                    film_out = self.time_film[i](t_emb[b])  # (latent_dim * 2,)
-                    scale, shift = film_out.chunk(2, dim=-1)  # each (latent_dim,)
-                    h = h * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
+                film_module = self.time_film[i] if self.time_film is not None else None
+
+                def processor_block(h_in, e_in, round_module=rnd, film=film_module, batch_index=b):
+                    h_out, e_out = round_module(h_in, h_in, mesh_edge_index, e_in)
+                    e_out = e_out + e_in
+                    if film is not None and t_emb is not None:
+                        film_out = film(t_emb[batch_index])
+                        scale, shift = film_out.chunk(2, dim=-1)
+                        h_out = h_out * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
+                    return h_out, e_out
+
+                if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                    h, e = checkpoint(
+                        processor_block, h, e,
+                        use_reentrant=False, preserve_rng_state=True,
+                    )
+                else:
+                    h, e = processor_block(h, e)
             all_h.append(h)
         return torch.stack(all_h, dim=0)
 
@@ -374,6 +385,7 @@ class MeshFlowNet(nn.Module):
         exceedance_initial_logit=-2.9444389791664403,
         distributional_head=False,
         sigma_floor=0.1,
+        gradient_checkpointing=False,
     ):
         super().__init__()
         self.img_channels = img_channels
@@ -392,6 +404,7 @@ class MeshFlowNet(nn.Module):
         self.enable_exceedance_head = bool(enable_exceedance_head)
         self.distributional_head = bool(distributional_head)
         self.sigma_floor = float(sigma_floor)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
         self.last_exceedance_logits = None
 
         if deterministic:
@@ -413,9 +426,12 @@ class MeshFlowNet(nn.Module):
                 output_dim=latent_dim, time_dim=time_dim,
             )
 
+        mesh_pos_dim = int(mesh.mesh_node_features.shape[1]) if hasattr(mesh, "mesh_node_features") else 9
+        g2m_edge_dim = int(mesh.g2m_edge_attr.shape[1]) if hasattr(mesh, "g2m_edge_attr") else 3
+        m2g_edge_dim = int(mesh.m2g_edge_attr.shape[1]) if hasattr(mesh, "m2g_edge_attr") else 3
         self.encoder = Grid2MeshEncoder(
-            grid_input_dim=grid_input_dim, mesh_pos_dim=9,
-            latent_dim=latent_dim, edge_dim=3,
+            grid_input_dim=grid_input_dim, mesh_pos_dim=mesh_pos_dim,
+            latent_dim=latent_dim, edge_dim=g2m_edge_dim,
             hidden_dim=hidden_dim, time_dim=time_dim, cond_dim=condition_dim,
             dropout=dropout,
         )
@@ -425,9 +441,10 @@ class MeshFlowNet(nn.Module):
             latent_dim=latent_dim, edge_dim=4,
             hidden_dim=hidden_dim, num_rounds=num_processor_rounds,
             time_dim=time_dim, dropout=dropout,
+            gradient_checkpointing=self.gradient_checkpointing,
         )
         self.decoder = Mesh2GridDecoder(
-            latent_dim=latent_dim, edge_dim=3,
+            latent_dim=latent_dim, edge_dim=m2g_edge_dim,
             hidden_dim=hidden_dim, output_dim=img_channels,
             time_dim=time_dim, dropout=dropout,
         )
@@ -460,27 +477,34 @@ class MeshFlowNet(nn.Module):
         # checkpoints load safely and begin with identical behavior.
         refine_dim = max(16, min(64, latent_dim // 4))
         self.refine_channels = 1 if self.distributional_head else img_channels
+        conv = PeriodicLonConv2d if bool(getattr(mesh, "global_domain", False)) else nn.Conv2d
         self.grid_refiner = nn.Sequential(
-            nn.Conv2d(self.refine_channels, refine_dim, kernel_size=3, padding=1),
+            conv(self.refine_channels, refine_dim, kernel_size=3, padding=1),
             nn.GELU(),
             nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-            nn.Conv2d(refine_dim, refine_dim, kernel_size=3, padding=1),
+            conv(refine_dim, refine_dim, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(refine_dim, self.refine_channels, kernel_size=3, padding=1),
+            conv(refine_dim, self.refine_channels, kernel_size=3, padding=1),
         )
-        nn.init.zeros_(self.grid_refiner[-1].weight)
-        nn.init.zeros_(self.grid_refiner[-1].bias)
+        final_refiner = self.grid_refiner[-1].conv if isinstance(self.grid_refiner[-1], PeriodicLonConv2d) else self.grid_refiner[-1]
+        nn.init.zeros_(final_refiner.weight)
+        nn.init.zeros_(final_refiner.bias)
         if self.enable_exceedance_head:
             self.exceedance_head = nn.Sequential(
-                nn.Conv2d(img_channels, refine_dim, kernel_size=3, padding=1),
+                conv(img_channels, refine_dim, kernel_size=3, padding=1),
                 nn.GELU(),
                 nn.Dropout2d(dropout) if dropout > 0 else nn.Identity(),
-                nn.Conv2d(refine_dim, refine_dim, kernel_size=3, padding=1),
+                conv(refine_dim, refine_dim, kernel_size=3, padding=1),
                 nn.GELU(),
-                nn.Conv2d(refine_dim, img_channels, kernel_size=3, padding=1),
+                conv(refine_dim, img_channels, kernel_size=3, padding=1),
             )
-            nn.init.zeros_(self.exceedance_head[-1].weight)
-            nn.init.constant_(self.exceedance_head[-1].bias, float(exceedance_initial_logit))
+            final_exceedance = (
+                self.exceedance_head[-1].conv
+                if isinstance(self.exceedance_head[-1], PeriodicLonConv2d)
+                else self.exceedance_head[-1]
+            )
+            nn.init.zeros_(final_exceedance.weight)
+            nn.init.constant_(final_exceedance.bias, float(exceedance_initial_logit))
         self._mesh = mesh
 
     def set_mesh(self, mesh):

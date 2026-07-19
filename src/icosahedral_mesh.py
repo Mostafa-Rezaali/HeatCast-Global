@@ -1,4 +1,10 @@
-"""
+"""Regional and global icosahedral connectivity for the HeatCast mesh GNN.
+
+The global path keeps the complete sphere, uses unit-vector XYZ node and edge
+features, and connects every configured latitude-longitude cell through a
+periodic spherical nearest-neighbor query. The original regional CONUS path is
+retained unchanged behind ``global_domain=False``.
+
 ================================================================================
 Icosahedral Mesh Construction for GraphCast-style GNN
 ================================================================================
@@ -228,7 +234,7 @@ def extract_regional_mesh(vertices, edges, lat_range, lon_range, buffer_deg=5.0)
 # =============================================================================
 
 def build_grid2mesh_graph(grid_lat, grid_lon, mesh_lat, mesh_lon,
-                          land_mask=None, k_neighbors=3):
+                          land_mask=None, k_neighbors=3, edge_feature_mode="latlon"):
     """
     Build bipartite edges from grid nodes to their k nearest mesh nodes.
 
@@ -277,19 +283,24 @@ def build_grid2mesh_graph(grid_lat, grid_lon, mesh_lat, mesh_lon,
     src = np.repeat(np.arange(num_grid), k_neighbors)  # grid node indices (local)
     dst = mesh_neighbors.ravel()  # mesh node indices
 
-    # Edge features: relative position
-    dlat = mesh_lat[dst] - flat_lat[grid_indices[src]]
-    dlon = shortest_lon_delta(mesh_lon[dst], flat_lon[grid_indices[src]])
     dist = dists.ravel()
+    if edge_feature_mode == "xyz":
+        displacement = mesh_xyz[dst] - grid_xyz[src]
+        edge_attr = np.concatenate([displacement, dist[:, None]], axis=-1).astype(np.float32)
+    elif edge_feature_mode == "latlon":
+        dlat = mesh_lat[dst] - flat_lat[grid_indices[src]]
+        dlon = shortest_lon_delta(mesh_lon[dst], flat_lon[grid_indices[src]])
+        edge_attr = np.stack([dlat, dlon, dist], axis=-1).astype(np.float32)
+    else:
+        raise ValueError("edge_feature_mode must be 'latlon' or 'xyz'.")
 
     edge_index = np.stack([src, dst], axis=0).astype(np.int64)
-    edge_attr = np.stack([dlat, dlon, dist], axis=-1).astype(np.float32)
 
     return edge_index, edge_attr, grid_indices
 
 
 def build_mesh2grid_graph(grid_lat, grid_lon, mesh_lat, mesh_lon,
-                          land_mask=None, k_neighbors=3):
+                          land_mask=None, k_neighbors=3, edge_feature_mode="latlon"):
     """
     Build bipartite edges from mesh nodes to grid nodes.
 
@@ -302,14 +313,14 @@ def build_mesh2grid_graph(grid_lat, grid_lon, mesh_lat, mesh_lon,
     """
     # Reuse grid2mesh but flip edge direction
     g2m_edges, g2m_attr, grid_indices = build_grid2mesh_graph(
-        grid_lat, grid_lon, mesh_lat, mesh_lon, land_mask, k_neighbors
+        grid_lat, grid_lon, mesh_lat, mesh_lon, land_mask, k_neighbors, edge_feature_mode
     )
 
     # Flip: (grid, mesh) -> (mesh, grid)
     edge_index = np.stack([g2m_edges[1], g2m_edges[0]], axis=0)
     # Negate relative positions since direction is reversed
     edge_attr = g2m_attr.copy()
-    edge_attr[:, :2] *= -1
+    edge_attr[:, :-1] *= -1
 
     return edge_index, edge_attr, grid_indices
 
@@ -427,10 +438,12 @@ class IcosahedralMesh:
         k_grid2mesh=3,
         k_mesh2grid=3,
         multimesh_levels=None,
+        global_domain=False,
     ):
         self.refinement_level = refinement_level
         self.lat_range = lat_range
         self.lon_range = lon_range
+        self.global_domain = bool(global_domain)
 
         print(f"\n{'='*70}")
         print(f"Building Icosahedral Mesh (refinement level {refinement_level})")
@@ -446,19 +459,26 @@ class IcosahedralMesh:
         for lvl, v in enumerate(all_verts):
             print(f"  Level {lvl}: {len(v)} vertices, {len(all_edges[lvl])} edges")
 
-        # Step 2: Extract regional mesh at finest level
+        # Step 2: keep the complete sphere globally or extract the CONUS region.
         finest_verts = all_verts[-1]
         finest_edges = all_edges[-1]
-
-        (self.mesh_vertices, self.mesh_edges,
-         self.mesh_lat, self.mesh_lon,
-         self.keep_mask, self.old_to_new) = extract_regional_mesh(
-            finest_verts, finest_edges, lat_range, lon_range, buffer_deg
-        )
+        if self.global_domain:
+            self.mesh_vertices = finest_verts
+            self.mesh_edges = finest_edges
+            self.mesh_lat, self.mesh_lon = xyz_to_latlon(finest_verts)
+            self.keep_mask = np.ones(len(finest_verts), dtype=bool)
+            self.old_to_new = {index: index for index in range(len(finest_verts))}
+        else:
+            (self.mesh_vertices, self.mesh_edges,
+             self.mesh_lat, self.mesh_lon,
+             self.keep_mask, self.old_to_new) = extract_regional_mesh(
+                finest_verts, finest_edges, lat_range, lon_range, buffer_deg
+            )
 
         self.num_mesh_nodes = len(self.mesh_vertices)
         self.num_mesh_edges_undirected = len(self.mesh_edges)
-        print(f"\n  Regional mesh: {self.num_mesh_nodes} nodes, "
+        domain_label = "Global" if self.global_domain else "Regional"
+        print(f"\n  {domain_label} mesh: {self.num_mesh_nodes} nodes, "
               f"{self.num_mesh_edges_undirected} undirected edges")
 
         # Step 3: Multi-resolution mesh edges for the processor
@@ -492,7 +512,10 @@ class IcosahedralMesh:
         print(f"  Multi-mesh total: {len(self.multimesh_edges)} undirected edges")
 
         # Step 4: Mesh node positional features
-        self.mesh_node_features = compute_mesh_node_features(self.mesh_vertices)
+        self.mesh_node_features = (
+            self.mesh_vertices.astype(np.float32)
+            if self.global_domain else compute_mesh_node_features(self.mesh_vertices)
+        )
 
         # Step 5: Mesh-to-mesh directed edges + features
         self.mesh_edge_index = build_mesh2mesh_edges(self.multimesh_edges)
@@ -512,13 +535,13 @@ class IcosahedralMesh:
             self.g2m_edge_index, self.g2m_edge_attr, self.grid_node_indices = \
                 build_grid2mesh_graph(
                     grid_lat, grid_lon, self.mesh_lat, self.mesh_lon,
-                    mask_np, k_grid2mesh
+                    mask_np, k_grid2mesh, "xyz" if self.global_domain else "latlon"
                 )
 
             self.m2g_edge_index, self.m2g_edge_attr, _ = \
                 build_mesh2grid_graph(
                     grid_lat, grid_lon, self.mesh_lat, self.mesh_lon,
-                    mask_np, k_mesh2grid
+                    mask_np, k_mesh2grid, "xyz" if self.global_domain else "latlon"
                 )
 
             self.num_grid_nodes = len(self.grid_node_indices)
@@ -550,6 +573,7 @@ class IcosahedralMesh:
     def summary(self):
         return {
             'refinement_level': self.refinement_level,
+            'global_domain': self.global_domain,
             'num_mesh_nodes': self.num_mesh_nodes,
             'num_mesh_edges': self.mesh_edge_index.shape[1],
             'num_multimesh_edges_undirected': len(self.multimesh_edges),

@@ -240,6 +240,7 @@ class Config:
         "HEATCAST_TARGET_MODE",
         "climatology_anomaly" if DOMAIN == "global" else "zscore_persistence",
     )
+    VALID_PRECISIONS = ("fp32", "bf16")
     PRECISION = os.environ.get("HEATCAST_PRECISION", "fp32")
     GRAD_CHECKPOINT = False
     GRAD_ACCUM = 1
@@ -584,6 +585,7 @@ def build_meshflow_model(config, mesh, device):
         ),
         distributional_head=config.DISTRIBUTIONAL_HEAD,
         sigma_floor=config.SIGMA_FLOOR,
+        gradient_checkpointing=getattr(config, "GRAD_CHECKPOINT", False),
     ).to(device)
     model.crps_loss = bool(config.CRPS_LOSS)
     model.mse_anchor_weight = float(config.MSE_ANCHOR_WEIGHT)
@@ -628,6 +630,16 @@ def parse_int_tuple(text):
     if not values:
         raise ValueError("Expected a comma-separated list of integers.")
     return values
+
+
+def optimizer_step_boundary(batch_index, num_batches, accumulation_steps, max_batches=None):
+    """Return whether this micro-batch closes an optimizer accumulation group."""
+    accumulation_steps = max(1, int(accumulation_steps))
+    effective_batches = int(num_batches)
+    if max_batches is not None:
+        effective_batches = min(effective_batches, int(max_batches))
+    completed = int(batch_index) + 1
+    return completed % accumulation_steps == 0 or completed >= effective_batches
 
 
 def early_stop_score(metric_name, improved_metrics, val_mse, val_ssim):
@@ -1013,9 +1025,13 @@ def build_crossval_split(valid_indices, time_values, val_stride=None, test_strid
 # BUILD MESH
 # ======================================================================================
 def build_mesh_once(config, conus_mask, device, ddp=False):
-    cache_path = os.path.join(config.OUTPUT_DIR, "data_cache",
-                               f"mesh_level{config.MESH_REFINEMENT_LEVEL}"
-                               f"_g2m{config.K_GRID2MESH}_m2g{config.K_MESH2GRID}.pkl")
+    H, W = config.IMAGE_SIZE
+    cache_path = os.path.join(
+        config.OUTPUT_DIR,
+        "data_cache",
+        f"mesh_{config.DOMAIN}_{H}x{W}_level{config.MESH_REFINEMENT_LEVEL}"
+        f"_g2m{config.K_GRID2MESH}_m2g{config.K_MESH2GRID}.pkl",
+    )
 
     if not ddp or dist.get_rank() == 0:
         if os.path.exists(cache_path):
@@ -1023,21 +1039,30 @@ def build_mesh_once(config, conus_mask, device, ddp=False):
             with open(cache_path, 'rb') as f:
                 mesh = pickle.load(f)
         else:
-            H, W = config.IMAGE_SIZE
-            grid_lat = np.linspace(config.CONUS_LAT_RANGE[0], config.CONUS_LAT_RANGE[1], H)
-            grid_lon = np.linspace(config.CONUS_LON_RANGE[0], config.CONUS_LON_RANGE[1], W)
-            mask_raw = conus_mask.squeeze().cpu().numpy() > 0.5
+            if config.DOMAIN == "global":
+                grid_lat = np.linspace(90.0, -90.0, H)
+                grid_lon = np.linspace(0.0, 360.0, W, endpoint=False)
+                mask_raw = None
+                lat_range = (-90.0, 90.0)
+                lon_range = (0.0, 360.0)
+            else:
+                grid_lat = np.linspace(config.CONUS_LAT_RANGE[0], config.CONUS_LAT_RANGE[1], H)
+                grid_lon = np.linspace(config.CONUS_LON_RANGE[0], config.CONUS_LON_RANGE[1], W)
+                mask_raw = conus_mask.squeeze().cpu().numpy() > 0.5
+                lat_range = config.CONUS_LAT_RANGE
+                lon_range = config.CONUS_LON_RANGE
 
             mesh = IcosahedralMesh(
                 refinement_level=config.MESH_REFINEMENT_LEVEL,
-                lat_range=config.CONUS_LAT_RANGE,
-                lon_range=config.CONUS_LON_RANGE,
+                lat_range=lat_range,
+                lon_range=lon_range,
                 grid_lat=grid_lat,
                 grid_lon=grid_lon,
                 land_mask=mask_raw,
                 buffer_deg=config.MESH_BUFFER_DEG,
                 k_grid2mesh=config.K_GRID2MESH,
                 k_mesh2grid=config.K_MESH2GRID,
+                global_domain=config.DOMAIN == "global",
             )
 
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -4265,8 +4290,14 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                         f"expected {Config.NUM_GLOBAL_CHANNELS}."
                     )
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            accumulation_steps = max(1, int(Config.GRAD_ACCUM))
+            if batch_idx % accumulation_steps == 0:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=Config.PRECISION == "bf16" and device.type == "cuda",
+            ):
                 exceedance_thresholds = (
                     batch_exceedance_thresholds(t_indices, train_dataset, exceedance_q95, device)
                     if Config.ENABLE_EXCEEDANCE_HEAD else None
@@ -4351,7 +4382,14 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            loss.backward()
+            (loss / accumulation_steps).backward()
+
+            should_step = optimizer_step_boundary(
+                batch_idx,
+                len(train_loader),
+                accumulation_steps,
+                Config.MAX_TRAIN_BATCHES,
+            )
 
             # Gradient diagnostic (first batch of first epoch only)
             if epoch == 0 and batch_idx == 0 and is_main_process():
@@ -4373,10 +4411,10 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
                     f.write(f"Total dead layers (grad=0.0): {dead_layers}\n")
                 print(f"  Saved gradient diagnostic to: {diag_path}")
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRAD_CLIP_NORM)
-            optimizer.step()
-
-            ema.update(model.module if ddp else model)
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.GRAD_CLIP_NORM)
+                optimizer.step()
+                ema.update(model.module if ddp else model)
             consecutive_skips = 0
 
             epoch_loss += loss.item()
@@ -4682,6 +4720,12 @@ def main():
                        help='Configured global latitude-longitude resolution.')
     parser.add_argument('--target_mode', choices=Config.TARGET_MODES, default=None,
                        help='Fold-safe target transformation; global default is climatology_anomaly.')
+    parser.add_argument('--precision', choices=Config.VALID_PRECISIONS, default=None,
+                       help='Training autocast precision; Phase A default is fp32.')
+    parser.add_argument('--grad_checkpoint', action='store_true',
+                       help='Checkpoint every mesh processor block to reduce activation memory.')
+    parser.add_argument('--grad_accum', type=int, default=None,
+                       help='Number of micro-batches per optimizer update.')
     parser.add_argument('--mode', type=str, default='train',
                        choices=['train', 'test', 'visualize', 'resume', 'export_hindcast'])
     parser.add_argument('--checkpoint', type=str, default=None)
@@ -4801,6 +4845,16 @@ def main():
     args = parser.parse_args()
 
     configure_domain(args.domain, args.resolution, args.target_mode, Config)
+    if args.precision is not None:
+        Config.PRECISION = args.precision
+    if Config.PRECISION not in Config.VALID_PRECISIONS:
+        raise ValueError(f"PRECISION must be one of {Config.VALID_PRECISIONS}, got {Config.PRECISION!r}.")
+    if args.grad_checkpoint:
+        Config.GRAD_CHECKPOINT = True
+    if args.grad_accum is not None:
+        if args.grad_accum < 1:
+            raise ValueError("--grad_accum must be at least one.")
+        Config.GRAD_ACCUM = int(args.grad_accum)
 
     if args.dry_run:
         Config.MAX_EPOCHS = 1

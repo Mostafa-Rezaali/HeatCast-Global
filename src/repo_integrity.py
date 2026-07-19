@@ -230,6 +230,59 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Global ERA5 download/regrid/cache build is CPU-only",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "global.spherical_mesh_contract",
+        "src/icosahedral_mesh.py",
+        (
+            "global_domain=False",
+            "if self.global_domain:",
+            "self.mesh_vertices = finest_verts",
+            'if edge_feature_mode == "xyz":',
+            "displacement = mesh_xyz[dst] - grid_xyz[src]",
+            '"xyz" if self.global_domain else "latlon"',
+            "edge_attr[:, :-1] *= -1",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.mesh_factory_contract",
+        "src/cfm_mesh_train.py",
+        (
+            'f"mesh_{config.DOMAIN}_{H}x{W}_level{config.MESH_REFINEMENT_LEVEL}"',
+            'if config.DOMAIN == "global":',
+            "grid_lon = np.linspace(0.0, 360.0, W, endpoint=False)",
+            "mask_raw = None",
+            'global_domain=config.DOMAIN == "global"',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.phase_b_memory_flags_contract",
+        "src/mesh_backbone.py",
+        (
+            "gradient_checkpointing=False",
+            "self.gradient_checkpointing = bool(gradient_checkpointing)",
+            "if self.gradient_checkpointing and self.training and torch.is_grad_enabled():",
+            "processor_block, h, e",
+            "PeriodicLonConv2d if bool(getattr(mesh, \"global_domain\", False))",
+        ),
+    ))
+
+    results.append(_result(
+        "global.precision_accumulation_contract",
+        'VALID_PRECISIONS = ("fp32", "bf16")' in cfm
+        and 'GRAD_CHECKPOINT = False' in cfm
+        and 'GRAD_ACCUM = 1' in cfm
+        and "def optimizer_step_boundary(" in cfm
+        and 'enabled=Config.PRECISION == "bf16" and device.type == "cuda"' in cfm
+        and "(loss / accumulation_steps).backward()" in cfm
+        and "if should_step:" in cfm,
+        "Phase A fp32 defaults and config-gated bf16/checkpoint/accumulation paths are explicit",
+    ))
+
     results.append(_result(
         "distributional.grid_refiner_mean_only",
         "mean_raw + self.grid_refiner(mean_raw)" in mesh

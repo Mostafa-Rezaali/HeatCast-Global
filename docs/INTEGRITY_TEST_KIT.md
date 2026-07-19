@@ -27,6 +27,10 @@ not merely that Python files compile.
   when an unspecified CDS dataset identifier would otherwise be guessed.
 - Conservative target and bilinear predictor regridding have a pure-SciPy
   fallback; zarr uses `time=1` chunks and opens only within Dataset workers.
+- Global mesh refinement derives from resolution, keeps the complete sphere,
+  uses XYZ node/edge features, connects every grid cell including poles and
+  the longitude seam, and supports optional processor checkpointing, bf16, and
+  gradient accumulation without changing Phase A defaults.
 
 ## Commands
 

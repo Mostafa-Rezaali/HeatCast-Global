@@ -148,6 +148,7 @@ def test_shared_meshflow_factory_preserves_constructor_and_runtime_config(monkey
         EXCEEDANCE_COUNT_WEIGHT=0.05,
         EXCEEDANCE_POS_WEIGHT=1.0,
         EXCEEDANCE_FOCAL_GAMMA=0.0,
+        GRAD_CHECKPOINT=False,
     )
     mesh = object()
     device = torch.device("cpu")
@@ -180,6 +181,7 @@ def test_shared_meshflow_factory_preserves_constructor_and_runtime_config(monkey
         "exceedance_initial_logit": np.log(0.05 / 0.95),
         "distributional_head": True,
         "sigma_floor": 0.1,
+        "gradient_checkpointing": False,
     }
     assert model.crps_loss is True
     assert model.mse_anchor_weight == 0.0
