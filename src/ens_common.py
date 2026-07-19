@@ -12,10 +12,10 @@ ENS_BENCHMARK_BANNER = """ECMWF ENS benchmark on the HeatCast scoreboard
 ================================================
 Coverage: score only the per-fold intersection of ENS reforecast years and HeatCast test years.
 Initialization: score the downloaded MJJAS S2S hdate initializations common to ENS and HeatCast.
-Variable: ENS daily maximum 2 m temperature versus PRISM T2max.
+Variable: ENS daily maximum 2 m temperature versus the configured HeatCast target.
 Members: ENS probabilities use the 11-member reforecast fraction, calibrated on fold validation years.
 Cycle discipline: bias correction and calibration are fit separately for each model cycle before merging.
-Discipline: identical PRISM events, grid, thresholds, init dates, test years, and fold-safe calibration."""
+Discipline: identical events, grid, thresholds, init dates, test years, and fold-safe calibration."""
 
 
 def fit_quantile_mapping(
@@ -150,14 +150,18 @@ def bilinear_regrid_regular(
         raise ValueError(
             f"Values trailing shape {values.shape[-2:]} does not match lat/lon {(lat.size, lon.size)}."
         )
-    lon = ((lon + 180.0) % 360.0) - 180.0
+    lon = np.mod(lon, 360.0)
     lat_order = np.argsort(lat)
     lon_order = np.argsort(lon)
     lat = lat[lat_order]
     lon = lon[lon_order]
     values = np.take(np.take(values, lat_order, axis=-2), lon_order, axis=-1)
+    # Periodic guard columns make interpolation across 0/360 use the two
+    # adjacent source cells rather than clamping to a continental edge.
+    lon = np.concatenate(([lon[-1] - 360.0], lon, [lon[0] + 360.0]))
+    values = np.concatenate((values[..., -1:], values, values[..., :1]), axis=-1)
     target_lat_flat = np.asarray(target_lat, dtype=np.float64).reshape(-1)
-    target_lon_flat = ((np.asarray(target_lon, dtype=np.float64).reshape(-1) + 180.0) % 360.0) - 180.0
+    target_lon_flat = np.mod(np.asarray(target_lon, dtype=np.float64).reshape(-1), 360.0)
     leading = values.shape[:-2]
     source_flat = values.reshape(-1, lat.size * lon.size)
     result = np.empty((source_flat.shape[0], target_lat_flat.size), dtype=np.float32)

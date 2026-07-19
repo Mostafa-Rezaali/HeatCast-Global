@@ -589,16 +589,17 @@ class ReliabilityStats:
         self.pred_sum = np.zeros(self.bins, dtype=np.float64)
         self.obs_sum = np.zeros(self.bins, dtype=np.float64)
 
-    def update(self, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray) -> None:
+    def update(self, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray, weights: Optional[np.ndarray] = None) -> None:
         valid = mask & np.isfinite(prob) & np.isfinite(truth)
         if not np.any(valid):
             return
         p = np.clip(prob[valid].astype(np.float64), 0.0, 1.0)
         y = truth[valid].astype(np.float64)
+        weight = np.ones_like(p) if weights is None else np.asarray(weights, dtype=np.float64)[valid]
         idx = np.minimum((p * self.bins).astype(np.int64), self.bins - 1)
-        self.count += np.bincount(idx, minlength=self.bins)
-        self.pred_sum += np.bincount(idx, weights=p, minlength=self.bins)
-        self.obs_sum += np.bincount(idx, weights=y, minlength=self.bins)
+        self.count += np.bincount(idx, weights=weight, minlength=self.bins)
+        self.pred_sum += np.bincount(idx, weights=p * weight, minlength=self.bins)
+        self.obs_sum += np.bincount(idx, weights=y * weight, minlength=self.bins)
 
     def table(self) -> List[Dict[str, float]]:
         rows = []
@@ -1027,7 +1028,14 @@ class MetricAccumulator:
         self.auc_hist_pos = np.zeros(self.hist_bins, dtype=np.float64)
         self.auc_hist_neg = np.zeros(self.hist_bins, dtype=np.float64)
 
-    def update(self, prob: np.ndarray, truth: np.ndarray, mask: np.ndarray, auc_score: Optional[np.ndarray] = None) -> None:
+    def update(
+        self,
+        prob: np.ndarray,
+        truth: np.ndarray,
+        mask: np.ndarray,
+        auc_score: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
+    ) -> None:
         valid = mask & np.isfinite(prob) & np.isfinite(truth)
         if auc_score is not None:
             valid = valid & np.isfinite(auc_score)
@@ -1035,17 +1043,18 @@ class MetricAccumulator:
             return
         p = np.clip(prob[valid].astype(np.float64), 0.0, 1.0)
         y = truth[valid].astype(np.float64)
-        self.brier_sum += float(np.sum((p - y) ** 2))
-        self.count += float(p.size)
-        self.truth_pos += float(np.sum(y))
-        self.rel.update(prob, truth, mask)
+        weight = np.ones_like(p) if weights is None else np.asarray(weights, dtype=np.float64)[valid]
+        self.brier_sum += float(np.sum(weight * (p - y) ** 2))
+        self.count += float(np.sum(weight))
+        self.truth_pos += float(np.sum(weight * y))
+        self.rel.update(prob, truth, mask, weights=weights)
         idx = np.minimum((p * (self.hist_bins - 1)).round().astype(np.int64), self.hist_bins - 1)
-        self.hist_pos += np.bincount(idx, weights=y, minlength=self.hist_bins)
-        self.hist_neg += np.bincount(idx, weights=1.0 - y, minlength=self.hist_bins)
+        self.hist_pos += np.bincount(idx, weights=weight * y, minlength=self.hist_bins)
+        self.hist_neg += np.bincount(idx, weights=weight * (1.0 - y), minlength=self.hist_bins)
         auc_values = p if auc_score is None else np.clip(auc_score[valid].astype(np.float64), 0.0, 1.0)
         auc_idx = np.minimum((auc_values * (self.hist_bins - 1)).round().astype(np.int64), self.hist_bins - 1)
-        self.auc_hist_pos += np.bincount(auc_idx, weights=y, minlength=self.hist_bins)
-        self.auc_hist_neg += np.bincount(auc_idx, weights=1.0 - y, minlength=self.hist_bins)
+        self.auc_hist_pos += np.bincount(auc_idx, weights=weight * y, minlength=self.hist_bins)
+        self.auc_hist_neg += np.bincount(auc_idx, weights=weight * (1.0 - y), minlength=self.hist_bins)
 
     def brier(self) -> float:
         return self.brier_sum / self.count if self.count > 0 else float("nan")
@@ -1100,15 +1109,17 @@ class EvaluationAccumulator:
         mask: np.ndarray,
         month: int,
         auc_score: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
     ) -> None:
-        self.metrics[name].update(prob, truth, mask, auc_score=auc_score)
-        self.monthly[int(month)][name].update(prob, truth, mask, auc_score=auc_score)
+        self.metrics[name].update(prob, truth, mask, auc_score=auc_score, weights=weights)
+        self.monthly[int(month)][name].update(prob, truth, mask, auc_score=auc_score, weights=weights)
         for region, rmask in self.region_masks.items():
             valid = mask & rmask & np.isfinite(prob) & np.isfinite(truth)
             if not np.any(valid):
                 continue
-            pred_count = float(np.sum(prob[valid]))
-            obs_count = float(np.sum(truth[valid]))
+            weight = np.ones(int(np.sum(valid)), dtype=np.float64) if weights is None else np.asarray(weights)[valid]
+            pred_count = float(np.sum(prob[valid] * weight))
+            obs_count = float(np.sum(truth[valid] * weight))
             self.region_abs[name][region] += abs(pred_count - obs_count)
             self.region_count[name][region] += 1
 

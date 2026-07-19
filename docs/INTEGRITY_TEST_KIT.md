@@ -43,6 +43,16 @@ not merely that Python files compile.
 - Global NetCDF export derives coordinates from the configured grid and writes
   continuous anomaly means, distributional sigma, truth, and supplied
   exceedance probabilities for all three windows without fixed raster sizes.
+- ECMWF ingest derives its target from config, records domain/resolution in
+  each atomic archive, and preserves cycle-specific quantile mapping while
+  global scoring loads only worker-lazy truth and fold-safe sidecars.
+- Matched ENS comparisons, HeatCast+ENS stacking, and forecasts-of-opportunity
+  use the NH-land selection and cosine-latitude weights in global mode. The
+  soil driver reads the trailing-20-day zarr channel one time slice at a time.
+- Novelty analyses assert fold-role disjointness and include a conditioned ENS
+  Bayesian GEV envelope with explicit Gumbel fallback, Gaussian-vs-CFM tail
+  divergence, coherent regional joint events versus independent marginals,
+  and a 1000+ member storyline product.
 
 ## Commands
 

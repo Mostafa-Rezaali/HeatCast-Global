@@ -18,7 +18,10 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
+import cfm_mesh_train as cfm
 from ens_common import ENS_BENCHMARK_BANNER
+from ens_target_grid import target_grid_for_config
+from global_evaluation import region_masks as global_region_masks
 from ens_compare import (
     add_metric,
     chunk_map,
@@ -413,20 +416,21 @@ def leave_one_out_rows(
 
 
 def load_region_masks_for_land_order(cell_count: int) -> Dict[str, np.ndarray]:
-    import cfm_mesh_train as cfm
-    from publication_analysis_utils import region_masks
-
-    land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+    target_grid = target_grid_for_config(cfm.Config)
+    land_mask = target_grid.headline_mask()
     land_count = int(np.sum(land_mask))
     if land_count != int(cell_count):
         raise RuntimeError(
             f"Region mask land_count={land_count} does not match chunk cell_count={cell_count}; "
             "saved chunks may not be full land-order arrays."
         )
-    return {
-        name: np.asarray(mask, dtype=bool).ravel()[land_mask.ravel()]
-        for name, mask in region_masks(land_mask.shape).items()
-    }
+    if target_grid.domain == "global":
+        masks = global_region_masks(target_grid.lat, target_grid.lon, target_grid.land_mask)
+    else:
+        from publication_analysis_utils import region_masks
+
+        masks = region_masks(land_mask.shape)
+    return {name: np.asarray(mask, dtype=bool)[land_mask] for name, mask in masks.items()}
 
 
 def paired_chunk(
@@ -596,6 +600,7 @@ def score_fold_chunks(
     progress_every: int,
     region_masks: Mapping[str, np.ndarray] | None = None,
     driver_lookup: Optional[object] = None,
+    metric_weights: Optional[np.ndarray] = None,
 ) -> Tuple[
     int,
     ee.EvaluationAccumulator,
@@ -669,10 +674,10 @@ def score_fold_chunks(
         month_acc = by_fold_month.setdefault((fold, month), ee.EvaluationAccumulator(MODEL_NAMES, {}))
         month_year_acc = by_fold_month_year.setdefault((fold, month, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
         for name, probability in forecasts.items():
-            fold_acc.update(name, probability, truth, mask, month)
-            year_acc.update(name, probability, truth, mask, month)
-            month_acc.update(name, probability, truth, mask, month)
-            month_year_acc.update(name, probability, truth, mask, month)
+            fold_acc.update(name, probability, truth, mask, month, weights=metric_weights)
+            year_acc.update(name, probability, truth, mask, month, weights=metric_weights)
+            month_acc.update(name, probability, truth, mask, month, weights=metric_weights)
+            month_year_acc.update(name, probability, truth, mask, month, weights=metric_weights)
 
         confidence = np.abs(heat_prob - base)
         subset_masks = {
@@ -696,6 +701,7 @@ def score_fold_chunks(
                 forecasts,
                 truth,
                 subset_mask,
+                metric_weights,
             )
         for region_name, region_mask in (region_masks or {}).items():
             region_selection = mask & region_mask
@@ -709,6 +715,7 @@ def score_fold_chunks(
                 forecasts,
                 truth,
                 region_selection,
+                metric_weights,
             )
         if driver_lookup is not None:
             driver_selections = driver_lookup.sample_strata(fold, heat_path, data)[1]
@@ -747,6 +754,7 @@ def score_fold_chunks(
                             forecasts,
                             truth,
                             selected_mask,
+                            metric_weights,
                         )
                 if driver_axis == "soil_moisture_tercile":
                     undefined = np.asarray(strata.get("undefined", np.zeros_like(mask)), dtype=bool)
@@ -800,17 +808,21 @@ def update_subset_accumulators(
     forecasts: Mapping[str, np.ndarray],
     truth: np.ndarray,
     mask: np.ndarray,
+    metric_weights: Optional[np.ndarray] = None,
 ) -> None:
     if not np.any(mask):
         return
     year_acc = subset_year_acc[subset_name].setdefault((int(fold), int(year)), ee.EvaluationAccumulator(MODEL_NAMES, {}))
     for name, probability in forecasts.items():
-        subset_acc[subset_name].update(name, probability, truth, mask, month)
-        year_acc.update(name, probability, truth, mask, month)
+        subset_acc[subset_name].update(name, probability, truth, mask, month, weights=metric_weights)
+        year_acc.update(name, probability, truth, mask, month, weights=metric_weights)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--training_data_path", default=None)
     parser.add_argument("--heatcast_runs", required=True, help="Comma-separated five HeatCast run names.")
     parser.add_argument(
         "--ens_runs",
@@ -844,6 +856,9 @@ def main() -> None:
     parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
 
+    cfm.configure_domain(args.domain, args.resolution, None, cfm.Config)
+    if args.training_data_path:
+        cfm.Config.TRAINING_DATA_PATH = str(args.training_data_path)
     print(ENS_BENCHMARK_BANNER)
     heatcast_runs = tuple(value.strip() for value in args.heatcast_runs.split(",") if value.strip())
     ens_runs = tuple(value.strip() for value in args.ens_runs.split(",") if value.strip())
@@ -952,6 +967,13 @@ def main() -> None:
         fold_inputs[first_fold]["heat_c"],
     )
     land_count = len(first_data["truth"])
+    target_grid = target_grid_for_config(cfm.Config)
+    headline_mask = target_grid.headline_mask(leads=window_leads)
+    metric_weights = target_grid.flattened_area_weights(headline_mask) if target_grid.domain == "global" else None
+    if metric_weights is not None and metric_weights.size != land_count:
+        raise RuntimeError(
+            f"Global area-weight vector has {metric_weights.size} cells, paired chunks have {land_count}."
+        )
     driver_lookup = None
     if str(args.driver_table_dir).strip():
         from forecasts_of_opportunity import load_driver_lookup
@@ -987,6 +1009,7 @@ def main() -> None:
                 int(args.progress_every),
                 region_masks,
                 driver_lookup,
+                metric_weights,
             )
             for fold in sorted(fold_inputs)
         ]

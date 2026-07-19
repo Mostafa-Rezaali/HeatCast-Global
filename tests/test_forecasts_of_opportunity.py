@@ -42,6 +42,18 @@ def test_streamed_metrics_and_confidence_assignment():
     assert selections["top_10pct_ge_p90"].tolist() == [False, False, True]
 
 
+def test_opportunity_metrics_honor_latitude_area_weights():
+    probability = np.array([1.0, 0.0])
+    truth = np.array([0.0, 0.0])
+    base = np.array([0.5, 0.5])
+    stats = OpportunityStats()
+    stats.update(probability, truth, base, weights=np.array([0.1, 0.9]))
+    metrics = stats.metrics()
+    assert np.isclose(metrics["n"], 1.0)
+    assert np.isclose(metrics["brier"], 0.1)
+    assert np.isclose(metrics["event_rate"], 0.0)
+
+
 def test_conditional_bss_distinguishes_composition_from_skill():
     truth = np.array([1] * 8 + [0] * 2, dtype=float)
     probability = np.full(10, 0.8)

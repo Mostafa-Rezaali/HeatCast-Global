@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import zipfile
 
 import numpy as np
+import pytest
 
 import ens_ingest as ingest
 import ens_compare
@@ -17,6 +18,8 @@ from ens_common import (
     intersection_years,
     member_fraction_probability,
 )
+from ens_target_grid import ENSTargetGrid
+from exceedance_eval import MetricAccumulator
 from download_ecmwf_s2s import hindcast_dates, mjjas_mon_thu, parse_year_list, retrieve
 from ens_ingest import find_raw_file, load_init_list, load_native_daily_max, normalize_rt_tag, validate_ingested_output
 from stitch_exceedance_folds import load_fold_inputs
@@ -44,6 +47,46 @@ def test_member_fraction_probability_uses_all_valid_members():
     ], dtype=np.float32)
     probability = member_fraction_probability(members, np.array([3.0, 5.5, 4.0], dtype=np.float32))
     assert np.allclose(probability, np.array([0.5, 0.5, 2.0 / 3.0], dtype=np.float32))
+
+
+def test_global_ens_grid_uses_nh_land_order_and_area_weights():
+    grid = ENSTargetGrid(
+        domain="global",
+        resolution="fixture",
+        lat=np.asarray([60.0, 0.0, -60.0]),
+        lon=np.asarray([0.0, 180.0]),
+        land_mask=np.ones((3, 2), dtype=bool),
+    )
+    headline = grid.headline_mask()
+    assert headline.tolist() == [[True, True], [True, True], [False, False]]
+    weights = grid.flattened_area_weights(headline)
+    assert weights.shape == (4,)
+    assert weights[2] > weights[0]
+    assert np.sum(weights) == pytest.approx(1.0)
+
+
+def test_ens_probability_accumulator_accepts_area_weights():
+    accumulator = MetricAccumulator("weighted")
+    probability = np.asarray([0.0, 1.0])
+    truth = np.asarray([1.0, 1.0])
+    weights = np.asarray([0.1, 0.9])
+    accumulator.update(probability, truth, np.ones(2, dtype=bool), weights=weights)
+    assert accumulator.brier() == pytest.approx(0.1)
+    assert accumulator.count == pytest.approx(1.0)
+
+
+def test_ens_bilinear_regrid_is_periodic_at_zero_longitude():
+    from ens_common import bilinear_regrid_regular
+
+    source_lat = np.asarray([-1.0, 1.0])
+    source_lon = np.asarray([0.0, 90.0, 180.0, 270.0])
+    circular = np.cos(np.deg2rad(source_lon))
+    values = np.stack([circular, circular])
+    target_lat = np.asarray([[0.0, 0.0]])
+    target_lon = np.asarray([[359.0, 1.0]])
+    result = bilinear_regrid_regular(values, source_lat, source_lon, target_lat, target_lon)
+    assert result[0, 0] == pytest.approx(result[0, 1], abs=1e-6)
+    assert result[0, 0] > 0.98
 
 
 def test_chunk_schema_round_trip_through_stitch_loader(tmp_path: Path):

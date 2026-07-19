@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -453,7 +453,7 @@ def build_fold_soil_table(
     fold: int,
     manifest: Mapping[str, object],
     chunks: Sequence[Path],
-    shared_data: Mapping[str, np.ndarray],
+    shared_data: Mapping[str, Any],
     land_mask: np.ndarray,
     cache_dir: Path,
     block_pixels: int,
@@ -494,12 +494,13 @@ def build_fold_soil_table(
                 return
         except Exception:
             pass
-    soil = np.asarray(shared_data["soil_moisture"])
+    soil = shared_data["soil_moisture"]
     if soil.ndim != 3 or soil.shape[-1] != len(time_values):
         raise RuntimeError(
             f"Expected soil_moisture=(H,W,T) with T={len(time_values)}, got {soil.shape}."
         )
-    soil_flat = soil.reshape(-1, len(time_values))
+    lazy_reader = getattr(soil, "read_pixels_times", None)
+    soil_flat = None if callable(lazy_reader) else np.asarray(soil).reshape(-1, len(time_values))
     output = np.memmap(
         data_path,
         mode="w+",
@@ -515,8 +516,12 @@ def build_fold_soil_table(
         for start in range(0, len(land_flat), int(block_pixels)):
             stop = min(start + int(block_pixels), len(land_flat))
             pixels = land_flat[start:stop]
-            train_values = soil_flat[pixels][:, train_t]
-            target_values = soil_flat[pixels][:, target_t]
+            if lazy_reader is not None:
+                train_values = lazy_reader(pixels, train_t)
+                target_values = lazy_reader(pixels, target_t)
+            else:
+                train_values = soil_flat[pixels][:, train_t]
+                target_values = soil_flat[pixels][:, target_t]
             output[target_rows, start:stop] = soil_percentile_against_train(
                 train_values,
                 target_values,
@@ -546,6 +551,13 @@ def build_fold_soil_table(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument(
+        "--training_data_path",
+        default=None,
+        help="Optional configured ERA5 zarr (global) or preserved CONUS NetCDF override.",
+    )
     parser.add_argument("--rmm_path", required=True)
     parser.add_argument("--nino34_path", required=True)
     parser.add_argument(
@@ -576,26 +588,43 @@ def main() -> None:
         default=0.5,
         help="Fixed absolute threshold for AllData positive/neutral/negative strata.",
     )
-    parser.add_argument("--input_root", default="exceedance_eval_incremental")
+    parser.add_argument("--input_root", default=None)
     parser.add_argument(
         "--run_names",
         default="cvfold0_dist_v2_normfix,cvfold1_dist_v2_normfix,cvfold2_dist_v2_normfix,cvfold3_dist_v2_normfix,cvfold4_dist_v2_normfix",
     )
-    parser.add_argument("--window_leads", default="12,13,14,15,16,17,18")
-    parser.add_argument("--output_dir", default="data_cache/slow_driver_tables")
+    parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
+    parser.add_argument("--output_dir", default=None)
     parser.add_argument("--block_pixels", type=int, default=2048)
     args = parser.parse_args()
 
     import cfm_mesh_train as cfm
     import exceedance_eval as ee
     import stitch_exceedance_folds as stitch
+    from ens_target_grid import LazyGlobalChannel, global_cache_time_axis, target_grid_for_config
+
+    cfm.configure_domain(args.domain, args.resolution, config=cfm.Config)
+    if args.training_data_path:
+        cfm.Config.TRAINING_DATA_PATH = str(Path(args.training_data_path).expanduser())
 
     run_names = tuple(value.strip() for value in args.run_names.split(",") if value.strip())
     window_leads = ee.parse_int_list(args.window_leads)
-    output_dir = Path(args.output_dir)
+    input_root = Path(args.input_root or cfm.Config.ENS_SCORE_DIR)
+    output_dir = Path(args.output_dir or (Path(cfm.Config.DATA_ROOT) / "drivers"))
     cfm.apply_extended_global_fields()
-    shared_data = cfm.prepare_shared_data(cfm.Config, rank=0, world_size=1, ddp=False)
-    land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+    if cfm.Config.DOMAIN == "global":
+        _, time_values, _ = global_cache_time_axis(Path(cfm.Config.TRAINING_DATA_PATH))
+        shared_data = {
+            "time_values": time_values,
+            "soil_moisture": LazyGlobalChannel(
+                Path(cfm.Config.TRAINING_DATA_PATH),
+                "swvl1_trailing20",
+            ),
+        }
+        land_mask = target_grid_for_config(cfm.Config).headline_mask()
+    else:
+        shared_data = cfm.prepare_shared_data(cfm.Config, rank=0, world_size=1, ddp=False)
+        land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
     alldata_names, alldata_values = build_alldata_drivers(
         shared_data["time_values"],
         Path(args.alldata_path).expanduser() if str(args.alldata_path).strip() else None,
@@ -616,7 +645,7 @@ def main() -> None:
         output_dir / "mjo_enso_by_init.npz",
     )
     for run_name in run_names:
-        manifest, _, chunks = stitch.load_fold_inputs(Path(args.input_root), run_name, window_leads)
+        manifest, _, chunks = stitch.load_fold_inputs(input_root, run_name, window_leads)
         build_fold_soil_table(
             int(manifest["source_fold"]),
             manifest,

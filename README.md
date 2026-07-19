@@ -66,7 +66,7 @@ Phase B is not a separate model implementation.
 | 3 | Global spherical mesh/connectivity and memory flags | Complete |
 | 4 | Fold-safe anomaly target, global inputs, CPU smoke test | Complete |
 | 5 | Weighted week3/week4/W34 evaluation and export | Complete |
-| 6 | Global ENS path and novelty analyses | Planned |
+| 6 | Global ENS path, driver stratification, and novelty analyses | Complete |
 | 7 | Production Slurm workflows, runbook, Phase B checklist | Planned |
 
 Each phase is committed only after the data-free integrity audit and pytest
@@ -106,6 +106,8 @@ Important existing modules are preserved rather than rebuilt:
 | `src/stitch_exceedance_folds.py` | Cross-fitted stitching and year-block bootstrap |
 | `src/ens_ingest.py` | Resume-safe ECMWF S2S ingestion and target-grid regridding |
 | `src/ens_score.py` | Cycle-aware quantile mapping, fold-safe calibration, and scoring |
+| `src/ens_target_grid.py` | Configured global/CONUS ENS grid, masks, weights, and lazy truth access |
+| `src/novelty_analyses.py` | Fold-safe GEV envelope, tail-shape, joint-event, and storyline products |
 | `src/repo_integrity.py` | Fast data-free repository and experiment-contract audit |
 
 The authoritative predictor inventory is

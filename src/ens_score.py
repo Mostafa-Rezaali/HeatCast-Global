@@ -14,6 +14,7 @@ import numpy as np
 
 import cfm_mesh_train as cfm
 import exceedance_eval as ee
+from data_pipeline.build_cache import fold_sidecar_path
 from ens_common import (
     ENS_BENCHMARK_BANNER,
     apply_quantile_mapping,
@@ -21,6 +22,9 @@ from ens_common import (
     member_fraction_probability,
 )
 from ens_ingest import normalize_rt_tag, validate_ingested_output
+from ens_target_grid import LazyGlobalTruth, global_cache_time_axis, target_grid_for_config
+from global_evaluation import GLOBAL_WINDOWS, load_fold_window_statistics
+from global_targets import FoldFieldPreprocessor
 
 
 def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> None:
@@ -36,6 +40,22 @@ def configure_fold(fold: int, window_leads: Sequence[int], cv_stride: int) -> No
 
 def load_ens_scoring_shared_data(config=cfm.Config) -> Dict[str, np.ndarray]:
     """Load only the read-only HeatCast arrays required by ENS scoring."""
+    if getattr(config, "DOMAIN", "conus") == "global":
+        _, time_values, _ = global_cache_time_axis(Path(config.TRAINING_DATA_PATH))
+        from data_pipeline.build_cache import _require_zarr
+
+        root = _require_zarr().open_group(str(config.TRAINING_DATA_PATH), mode="r")
+        time_labels = np.asarray(root["time"][:], dtype=np.int32)
+        shared = {
+            "heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH)),
+            "time_values": time_values,
+            "time_labels": time_labels,
+        }
+        print(
+            "Loaded lazy global ENS truth cache: "
+            f"shape={shared['heat_index'].shape}, time={time_values.size}; one UTC day is read per request."
+        )
+        return shared
     cache_dir = Path(config.OUTPUT_DIR) / "data_cache"
     paths = {
         "heat_index": cache_dir / "heat_index.npy",
@@ -72,13 +92,24 @@ def load_ens_scoring_shared_data(config=cfm.Config) -> Dict[str, np.ndarray]:
     return shared
 
 
-def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Path]:
+def load_ingested_files(
+    root: Path,
+    window_leads: Sequence[int],
+    *,
+    expected_domain: str | None = None,
+    expected_resolution: str | None = None,
+) -> Dict[int, Path]:
     output: Dict[int, Path] = {}
     missing_leads: List[str] = []
     invalid_files: List[str] = []
     required = set(int(value) for value in window_leads)
     for path in sorted(root.glob("init_*.npz")):
-        valid, reason = validate_ingested_output(path, window_leads)
+        valid, reason = validate_ingested_output(
+            path,
+            window_leads,
+            expected_domain=expected_domain,
+            expected_resolution=expected_resolution,
+        )
         if not valid:
             invalid_files.append(f"{path.name}: {reason}")
             continue
@@ -107,6 +138,25 @@ def load_ingested_files(root: Path, window_leads: Sequence[int]) -> Dict[int, Pa
 
 
 def load_window_stats(window_leads: Sequence[int]) -> Tuple[np.ndarray, np.ndarray, Path]:
+    if cfm.Config.DOMAIN == "global":
+        sidecar = fold_sidecar_path(
+            Path(cfm.Config.TRAINING_DATA_PATH),
+            int(cfm.Config.CV_FOLD),
+            "thresholds",
+        )
+        if not sidecar.exists():
+            raise FileNotFoundError(
+                f"Missing fold-safe global window threshold sidecar: {sidecar}. "
+                "Build it from training-year initializations before ENS scoring."
+            )
+        window_name = next(
+            (name for name, leads in GLOBAL_WINDOWS.items() if tuple(leads) == tuple(int(value) for value in window_leads)),
+            None,
+        )
+        if window_name is None:
+            raise ValueError(f"Global ENS scoring supports configured week3/week4/W34 windows, got {tuple(window_leads)}.")
+        thresholds, base_rates, _ = load_fold_window_statistics(sidecar, int(cfm.Config.CV_FOLD))
+        return thresholds[window_name]["q95"], base_rates[window_name]["q95"], sidecar
     path = Path(ee.window_exceedance_cache_path(window_leads))
     if not path.exists():
         raise FileNotFoundError(
@@ -125,6 +175,39 @@ def load_window_stats(window_leads: Sequence[int]) -> Tuple[np.ndarray, np.ndarr
             np.asarray(data["base_rate"], dtype=np.float32),
             path,
         )
+
+
+def load_scoring_normalizer(config=cfm.Config):
+    """Load the fold's target transform without consuming held-out data."""
+    if getattr(config, "DOMAIN", "conus") != "global":
+        return ee.load_norm_stats()
+    path = fold_sidecar_path(Path(config.TRAINING_DATA_PATH), int(config.CV_FOLD), "normalization")
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing fold-safe global normalization sidecar: {path}. "
+            "Fit the four-harmonic training-year preprocessor first."
+        )
+    processor = FoldFieldPreprocessor.load(path)
+    return processor
+
+
+def normalize_truth_field(field, time_index: int, shared_data, normalizer) -> np.ndarray:
+    """Apply the preserved CONUS z-score or global fold-safe anomaly transform."""
+    values = np.asarray(field, dtype=np.float32)
+    if cfm.Config.DOMAIN != "global":
+        return ee._normalize_field(values, normalizer)
+    label = int(np.asarray(shared_data["time_labels"])[int(time_index)])
+    return normalizer.transform("tmax", label, values)
+
+
+def month_slice(cube: np.ndarray, month: int) -> np.ndarray:
+    """Read either legacy 1-based or global month-minus-one threshold cubes."""
+    values = np.asarray(cube)
+    if values.shape[0] == 13:
+        return values[int(month)]
+    if values.shape[0] == 12:
+        return values[int(month) - 1]
+    raise ValueError(f"Threshold cube must have 12 or 13 month slots, got {values.shape}.")
 
 
 def load_ens_members(path: Path, window_leads: Sequence[int]) -> Dict[int, np.ndarray]:
@@ -245,8 +328,11 @@ def build_or_load_quantile_mapping(
             target_rows: List[np.ndarray] = []
             for init_t, init_path in pairs:
                 source = load_ens_members(init_path, (int(lead),))[int(lead)][:, land_mask]
-                target = ee._normalize_field(
-                    np.asarray(heat[:, :, int(init_t) + int(lead)]),
+                target_t = int(init_t) + int(lead)
+                target = normalize_truth_field(
+                    np.asarray(heat[:, :, target_t]),
+                    target_t,
+                    shared_data,
                     norm_stats,
                 )[land_mask]
                 source_rows.append(source.astype(np.float32))
@@ -315,7 +401,7 @@ def score_init(
             apply_quantile_mapping(native[int(lead)][:, land_mask], source_q, target_q)
         )
         truth_fields.append(
-            ee._normalize_field(np.asarray(heat[:, :, target_t]), norm_stats)[land_mask]
+            normalize_truth_field(np.asarray(heat[:, :, target_t]), target_t, shared_data, norm_stats)[land_mask]
         )
     with np.errstate(all="ignore"):
         member_window = np.nanmean(np.stack(mapped_members, axis=1), axis=1).astype(np.float32)
@@ -323,8 +409,8 @@ def score_init(
         spread_land = np.nanstd(member_window, axis=0).astype(np.float32)
     center_t = int(init_t) + ee.window_center_lead(window_leads)
     center_month = int(months[center_t])
-    threshold_land = q95_z[center_month][land_mask]
-    base_land = base_rate[center_month][land_mask]
+    threshold_land = month_slice(q95_z, center_month)[land_mask]
+    base_land = month_slice(base_rate, center_month)[land_mask]
     raw_land = member_fraction_probability(member_window, threshold_land)
     truth_land = (truth_window_land > threshold_land).astype(np.float32)
     return {
@@ -382,12 +468,14 @@ def probability_logit(probability: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
     parser.add_argument("--cv_fold", type=int, required=True)
     parser.add_argument("--run_name", default=None, help="Default: cvfold{fold}_ens_w{window label}.")
     parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
-    parser.add_argument("--input_dir", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded")
-    parser.add_argument("--output_root", default="ens_exceedance_incremental")
-    parser.add_argument("--qmap_cache_root", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/quantile_mapping")
+    parser.add_argument("--input_dir", default=None)
+    parser.add_argument("--output_root", default=None)
+    parser.add_argument("--qmap_cache_root", default=None)
     parser.add_argument("--cv_stride", type=int, default=5)
     parser.add_argument("--quantile_count", type=int, default=51)
     parser.add_argument(
@@ -408,6 +496,7 @@ def main() -> None:
     parser.add_argument("--progress_every", type=int, default=25)
     args = parser.parse_args()
 
+    cfm.configure_domain(args.domain, args.resolution, None, cfm.Config)
     window_leads = ee.parse_int_list(args.window_leads)
     rt_tag = normalize_rt_tag(args.rt_tag)
     configure_fold(args.cv_fold, window_leads, args.cv_stride)
@@ -419,18 +508,24 @@ def main() -> None:
     print(f"Fold={args.cv_fold}; run={run_name}; cycle={rt_tag or 'legacy'}; window={window_leads}")
 
     shared_data = load_ens_scoring_shared_data(cfm.Config)
-    norm_stats = ee.load_norm_stats()
+    norm_stats = load_scoring_normalizer(cfm.Config)
     train_indices, val_indices, test_indices, train_years, val_years, test_years = ee.split_indices_for_config(shared_data)
     if set(train_years) & set(val_years) or set(train_years) & set(test_years) or set(val_years) & set(test_years):
         raise RuntimeError("Fold train/calibration/test years are not disjoint.")
     months, years, _ = ee.month_doy_year_arrays(shared_data["time_values"])
-    land_mask = cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5
+    target_grid = target_grid_for_config(cfm.Config)
+    land_mask = target_grid.headline_mask(leads=window_leads)
     q95_z, base_rate, stats_path = load_window_stats(window_leads)
-    print(f"Using existing PRISM event definition: {stats_path}")
-    input_dir = Path(args.input_dir)
-    if rt_tag and str(input_dir) == "/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded":
+    print(f"Using existing fold-safe {target_grid.domain} event definition: {stats_path}")
+    input_dir = Path(args.input_dir or cfm.Config.ENS_REGRID_DIR)
+    if rt_tag and args.input_dir is None:
         input_dir = input_dir.with_name(f"regridded_{rt_tag}")
-    files_by_init = load_ingested_files(input_dir, window_leads)
+    files_by_init = load_ingested_files(
+        input_dir,
+        window_leads,
+        expected_domain=target_grid.domain,
+        expected_resolution=target_grid.resolution,
+    )
     valid_init_indices = set(int(value) for value in train_indices + val_indices + test_indices)
     files_by_init = {
         init_t: path for init_t, path in files_by_init.items()
@@ -462,7 +557,7 @@ def main() -> None:
         norm_stats,
         land_mask,
         window_leads,
-        Path(args.qmap_cache_root),
+        Path(args.qmap_cache_root or cfm.Config.ENS_QMAP_DIR),
         args.quantile_count,
         rt_tag,
     )
@@ -499,7 +594,7 @@ def main() -> None:
         calibration["sigma"],
     ]).astype(np.float32)
 
-    out_dir = Path(args.output_root) / run_name / "test" / f"window_{ee.lead_list_label(window_leads)}"
+    out_dir = Path(args.output_root or cfm.Config.ENS_SCORE_DIR) / run_name / "test" / f"window_{ee.lead_list_label(window_leads)}"
     out_dir.mkdir(parents=True, exist_ok=True)
     ee.save_incremental_calibration_arrays(
         out_dir,
@@ -573,6 +668,10 @@ def main() -> None:
         "run_name": run_name,
         "rt_tag": rt_tag,
         "fold": int(args.cv_fold),
+        "domain": target_grid.domain,
+        "resolution": target_grid.resolution,
+        "spatial_weighting": "cosine_latitude",
+        "primary_mask": "NH land, full valid window in MJJAS" if target_grid.domain == "global" else "CONUS land",
         "window_leads": list(window_leads),
         "available_years": sorted(available_years),
         "intersection_years": retained,

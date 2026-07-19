@@ -11,7 +11,9 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
+import cfm_mesh_train as cfm
 from ens_common import ENS_BENCHMARK_BANNER, common_init_indices
+from ens_target_grid import target_grid_for_config
 from stitch_exceedance_folds import load_fold_inputs
 
 
@@ -252,6 +254,9 @@ def per_year_comparison_rows(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--training_data_path", default=None)
     parser.add_argument("--heatcast_runs", required=True, help="Comma-separated five HeatCast run names.")
     parser.add_argument(
         "--ens_runs",
@@ -271,6 +276,12 @@ def main() -> None:
     parser.add_argument("--emit_per_year", action="store_true")
     args = parser.parse_args()
 
+    cfm.configure_domain(args.domain, args.resolution, None, cfm.Config)
+    if args.training_data_path:
+        cfm.Config.TRAINING_DATA_PATH = str(args.training_data_path)
+    target_grid = target_grid_for_config(cfm.Config)
+    headline_mask = target_grid.headline_mask(leads=ee.parse_int_list(args.window_leads))
+    metric_weights = target_grid.flattened_area_weights(headline_mask) if target_grid.domain == "global" else None
     print(ENS_BENCHMARK_BANNER)
     heatcast_runs = tuple(value.strip() for value in args.heatcast_runs.split(",") if value.strip())
     ens_runs = tuple(value.strip() for value in args.ens_runs.split(",") if value.strip())
@@ -336,6 +347,10 @@ def main() -> None:
                 np.asarray(heat["forecast_margin"], dtype=np.float32),
             ]).astype(np.float32))
             mask = np.ones(truth.shape, dtype=bool)
+            if metric_weights is not None and metric_weights.size != truth.size:
+                raise RuntimeError(
+                    f"Global area-weight vector has {metric_weights.size} cells, chunk has {truth.size}."
+                )
             forecasts = {
                 REFERENCE: base,
                 "ens_raw_fraction": ens_raw,
@@ -344,9 +359,9 @@ def main() -> None:
             }
             year_acc = by_fold_year.setdefault((fold, year), ee.EvaluationAccumulator(MODEL_NAMES, {}))
             for name, probability in forecasts.items():
-                global_acc.update(name, probability, truth, mask, month)
-                fold_acc[fold].update(name, probability, truth, mask, month)
-                year_acc.update(name, probability, truth, mask, month)
+                global_acc.update(name, probability, truth, mask, month, weights=metric_weights)
+                fold_acc[fold].update(name, probability, truth, mask, month, weights=metric_weights)
+                year_acc.update(name, probability, truth, mask, month, weights=metric_weights)
             fold_years.add(year)
             if (index + 1) % max(1, int(args.progress_every)) == 0:
                 print(f"  fold {fold}: scored {index + 1}/{len(common)} common inits")
@@ -395,6 +410,9 @@ def main() -> None:
         row["intersection_years"] = year_text
         row["intersection_year_count"] = len(all_years)
         row["common_init_count"] = total_inits
+        row["domain"] = target_grid.domain
+        row["resolution"] = target_grid.resolution
+        row["spatial_weighting"] = "cosine_latitude" if metric_weights is not None else "legacy_cell_equal"
     for row in bootstrap_rows:
         row["intersection_years"] = year_text
         row["common_init_count"] = total_inits

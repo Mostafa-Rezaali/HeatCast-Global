@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Dict, Mapping, Sequence, Tuple
+from pathlib import Path
 
 import numpy as np
 from scipy.special import ndtr
@@ -162,6 +163,93 @@ def build_fold_window_thresholds(
             by_quantile[quantile_name] = threshold
         result[window_name] = by_quantile
     return result
+
+
+def build_fold_window_statistics(
+    truth_daily,
+    initialization_dates: Sequence[object],
+    train_years: Sequence[int],
+    *,
+    prediction_leads: Sequence[int] = W34_LEADS,
+) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, np.ndarray]]]:
+    """Return fold thresholds and their realized training-year base rates."""
+    thresholds = build_fold_window_thresholds(
+        truth_daily,
+        initialization_dates,
+        train_years,
+        prediction_leads=prediction_leads,
+    )
+    dates = tuple(_as_date(value) for value in initialization_dates)
+    train = np.asarray([value.year in {int(year) for year in train_years} for value in dates])
+    means = window_means(truth_daily, prediction_leads)
+    base_rates: Dict[str, Dict[str, np.ndarray]] = {}
+    for window_name, leads in GLOBAL_WINDOWS.items():
+        center = int(np.floor(np.median(np.asarray(leads, dtype=np.float64)) + 0.5))
+        months = np.asarray([(value + timedelta(days=center)).month for value in dates])
+        base_rates[window_name] = {}
+        for threshold_name, threshold_cube in thresholds[window_name].items():
+            rates = np.full_like(threshold_cube, np.nan, dtype=np.float32)
+            for month in range(1, 13):
+                selected = train & (months == month)
+                if np.any(selected):
+                    values = means[window_name][selected]
+                    valid = np.isfinite(values) & np.isfinite(threshold_cube[month - 1])[None]
+                    rates[month - 1] = np.divide(
+                        np.sum((values > threshold_cube[month - 1]) & valid, axis=0),
+                        np.sum(valid, axis=0),
+                        out=np.full(values.shape[-2:], np.nan, dtype=np.float64),
+                        where=np.sum(valid, axis=0) > 0,
+                    )
+            base_rates[window_name][threshold_name] = rates
+    return thresholds, base_rates
+
+
+def save_fold_window_statistics(
+    path: Path,
+    thresholds: Mapping[str, Mapping[str, np.ndarray]],
+    base_rates: Mapping[str, Mapping[str, np.ndarray]],
+    *,
+    fold: int,
+    train_years: Sequence[int],
+) -> Path:
+    """Persist pickle-free fold threshold/base-rate sidecars for ENS reuse."""
+    arrays = {
+        "fold": np.asarray(int(fold), dtype=np.int16),
+        "train_years": np.asarray(sorted({int(value) for value in train_years}), dtype=np.int16),
+        "month_indexing": np.asarray("zero_based_month_minus_one"),
+    }
+    for window in GLOBAL_WINDOWS:
+        for threshold in THRESHOLD_QUANTILES:
+            arrays[f"threshold__{window}__{threshold}"] = np.asarray(thresholds[window][threshold], dtype=np.float32)
+            arrays[f"base_rate__{window}__{threshold}"] = np.asarray(base_rates[window][threshold], dtype=np.float32)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(destination, **arrays)
+    return destination
+
+
+def load_fold_window_statistics(path: Path, fold: int):
+    """Load and validate a sidecar written by ``save_fold_window_statistics``."""
+    with np.load(path, allow_pickle=False) as data:
+        saved_fold = int(np.asarray(data["fold"]).item())
+        if saved_fold != int(fold):
+            raise RuntimeError(f"Threshold sidecar fold={saved_fold}, requested fold={fold}.")
+        thresholds = {
+            window: {
+                threshold: np.asarray(data[f"threshold__{window}__{threshold}"], dtype=np.float32)
+                for threshold in THRESHOLD_QUANTILES
+            }
+            for window in GLOBAL_WINDOWS
+        }
+        base_rates = {
+            window: {
+                threshold: np.asarray(data[f"base_rate__{window}__{threshold}"], dtype=np.float32)
+                for threshold in THRESHOLD_QUANTILES
+            }
+            for window in GLOBAL_WINDOWS
+        }
+        train_years = tuple(int(value) for value in np.asarray(data["train_years"]).tolist())
+    return thresholds, base_rates, train_years
 
 
 def _broadcast_weights(lat, shape, mask=None) -> Tuple[np.ndarray, np.ndarray]:

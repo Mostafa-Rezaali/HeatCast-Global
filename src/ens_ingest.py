@@ -15,7 +15,8 @@ import zipfile
 import numpy as np
 
 from ens_common import ENS_BENCHMARK_BANNER, bilinear_regrid_regular
-from publication_analysis_utils import conus_lat_lon
+from ens_target_grid import global_cache_time_axis, target_grid_for_config
+from init_calendar import W34_LEADS, mjjas_mon_thu, window_falls_in_months
 
 
 BASE_DATE = datetime(1981, 5, 1)
@@ -29,6 +30,9 @@ def parse_int_list(text: str) -> Tuple[int, ...]:
 
 
 def load_training_dates(training_path: Path) -> Tuple[np.ndarray, Dict[str, int]]:
+    if Path(training_path).suffix == ".zarr" or Path(training_path).is_dir():
+        dates, _, lookup = global_cache_time_axis(training_path)
+        return dates, lookup
     try:
         from netCDF4 import Dataset, num2date
     except ImportError as exc:
@@ -56,17 +60,17 @@ def requested_init_dates(
     start_year: int | None,
     end_year: int | None,
 ) -> List[str]:
+    available = set(dates.astype("datetime64[D]").astype(str))
+    years = sorted({int(value[:4]) for value in available})
     output = []
-    for value in dates.astype("datetime64[D]").astype(str):
-        dt = datetime.strptime(value, "%Y-%m-%d")
-        if dt.month not in (5, 6, 7, 8, 9):
+    for year in years:
+        if start_year is not None and year < int(start_year):
             continue
-        if start_year is not None and dt.year < int(start_year):
+        if end_year is not None and year > int(end_year):
             continue
-        if end_year is not None and dt.year > int(end_year):
-            continue
-        if dt.weekday() in set(int(day) for day in weekdays):
-            output.append(dt.strftime("%Y%m%d"))
+        for value in mjjas_mon_thu(year):
+            if value.weekday() in set(int(day) for day in weekdays) and value.isoformat() in available:
+                output.append(value.strftime("%Y%m%d"))
     return output
 
 
@@ -85,6 +89,8 @@ def load_init_list(path: Path) -> List[str]:
             raise ValueError(f"{path}:{line_number}: expected YYYYMMDD, got {label!r}.") from exc
         if value.month not in (5, 6, 7, 8, 9):
             raise ValueError(f"{path}:{line_number}: init {label} is outside MJJAS.")
+        if not window_falls_in_months(value.date(), W34_LEADS):
+            raise ValueError(f"{path}:{line_number}: init {label} does not keep leads 15-28 in MJJAS.")
         if label not in seen:
             labels.append(label)
             seen.add(label)
@@ -291,6 +297,8 @@ def _write_ingested_output(
     init_time_index: int,
     variable: str,
     rt_tag: str = "",
+    domain: str = "conus",
+    resolution: str = "prism_4km",
 ) -> None:
     temporary_path = output_path.with_suffix(output_path.suffix + f".tmp.{os.getpid()}")
     try:
@@ -304,6 +312,8 @@ def _write_ingested_output(
                 init_time_index=np.array(init_time_index, dtype=np.int32),
                 variable=np.array(str(variable)),
                 rt_tag=np.array(normalize_rt_tag(rt_tag)),
+                domain=np.array(str(domain)),
+                resolution=np.array(str(resolution)),
             )
         os.replace(temporary_path, output_path)
     finally:
@@ -318,6 +328,8 @@ def validate_ingested_output(
     expected_init_time_index: int | None = None,
     expected_variable: str | None = None,
     expected_rt_tag: str | None = None,
+    expected_domain: str | None = None,
+    expected_resolution: str | None = None,
 ) -> Tuple[bool, str]:
     required_keys = {"t2max", "leads", "members", "init_date", "init_time_index", "variable"}
     if not zipfile.is_zipfile(path):
@@ -333,6 +345,8 @@ def validate_ingested_output(
             init_time_index = int(np.asarray(data["init_time_index"]).item())
             variable = str(np.asarray(data["variable"]).item())
             rt_tag = str(np.asarray(data["rt_tag"]).item()) if "rt_tag" in data.files else ""
+            domain = str(np.asarray(data["domain"]).item()) if "domain" in data.files else "conus"
+            resolution = str(np.asarray(data["resolution"]).item()) if "resolution" in data.files else "prism_4km"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
     missing_leads = sorted(set(int(value) for value in required_leads) - set(leads))
@@ -348,6 +362,10 @@ def validate_ingested_output(
         return False, f"expected variable={expected_variable}, found {variable}"
     if expected_rt_tag is not None and rt_tag != normalize_rt_tag(expected_rt_tag):
         return False, f"expected rt_tag={normalize_rt_tag(expected_rt_tag)}, found {rt_tag}"
+    if expected_domain is not None and domain != str(expected_domain):
+        return False, f"expected domain={expected_domain}, found {domain}"
+    if expected_resolution is not None and resolution != str(expected_resolution):
+        return False, f"expected resolution={expected_resolution}, found {resolution}"
     return True, "valid"
 
 
@@ -360,6 +378,8 @@ def ingest_one_init(
     expected_members: int,
     init_time_index: int,
     rt_tag: str = "",
+    domain: str = "conus",
+    resolution: str = "prism_4km",
 ) -> str:
     if _WORKER_LAND_MASK is None or _WORKER_TARGET_LAT is None or _WORKER_TARGET_LON is None:
         raise RuntimeError("ENS ingest worker was not initialized.")
@@ -386,15 +406,19 @@ def ingest_one_init(
         init_time_index,
         variable,
         rt_tag,
+        domain,
+        resolution,
     )
     return label
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--raw_dir", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/raw")
-    parser.add_argument("--output_dir", default="/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded")
-    parser.add_argument("--training_data_path", default="/blue/nessie/mostafarezaali/Teleconnection/VDM_Training_Data_Extended_v2.nc")
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--raw_dir", default=None)
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--training_data_path", default=None)
     parser.add_argument("--variable", default="mx2t6")
     parser.add_argument("--weekdays", default="0,3", help="Python weekdays; default Monday,Thursday.")
     parser.add_argument("--start_year", type=int, default=None)
@@ -424,16 +448,19 @@ def main() -> None:
 
     print(ENS_BENCHMARK_BANNER)
     rt_tag = normalize_rt_tag(args.rt_tag)
-    raw_dir = Path(args.raw_dir)
-    output_dir = Path(args.output_dir)
-    if rt_tag and str(output_dir) == "/blue/nessie/mostafarezaali/Teleconnection/ens_reforecast/regridded":
-        output_dir = output_dir.with_name(f"regridded_{rt_tag}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    dates, date_lookup = load_training_dates(Path(args.training_data_path))
     import cfm_mesh_train as cfm
 
-    cfm.Config.TRAINING_DATA_PATH = str(args.training_data_path)
-    land_mask = cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5
+    cfm.configure_domain(args.domain, args.resolution, None, cfm.Config)
+    training_path = Path(args.training_data_path or cfm.Config.TRAINING_DATA_PATH)
+    raw_dir = Path(args.raw_dir or cfm.Config.ENS_RAW_DIR)
+    output_dir = Path(args.output_dir or cfm.Config.ENS_REGRID_DIR)
+    if rt_tag and args.output_dir is None:
+        output_dir = output_dir.with_name(f"regridded_{rt_tag}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dates, date_lookup = load_training_dates(training_path)
+    cfm.Config.TRAINING_DATA_PATH = str(training_path)
+    target_grid = target_grid_for_config(cfm.Config)
+    land_mask = target_grid.land_mask
     init_list_path = Path(args.init_list) if args.init_list else (
         raw_dir / f"init_list_{rt_tag}.txt" if rt_tag else None
     )
@@ -462,7 +489,7 @@ def main() -> None:
             f"Missing {len(missing)} requested ENS initialization files. Download them before ingestion:\n{preview}"
         )
 
-    _, _, target_lat, target_lon = conus_lat_lon((621, 1405))
+    target_lat, target_lon = np.meshgrid(target_grid.lat, target_grid.lon, indexing="ij")
     tasks = []
     skipped = 0
     invalid_existing = 0
@@ -481,6 +508,8 @@ def main() -> None:
                 expected_init_time_index=int(init_time_index),
                 expected_variable=str(args.variable),
                 expected_rt_tag=rt_tag,
+                expected_domain=target_grid.domain,
+                expected_resolution=target_grid.resolution,
             )
             if valid:
                 skipped += 1
@@ -497,6 +526,8 @@ def main() -> None:
             int(args.expected_members),
             int(init_time_index),
             rt_tag,
+            target_grid.domain,
+            target_grid.resolution,
         ))
 
     print(

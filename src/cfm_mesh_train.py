@@ -251,12 +251,18 @@ class Config:
     PRIMARY_SEASON_MONTHS = (5, 6, 7, 8, 9)
     ENABLE_GLOBAL_LOCAL_WARM_SEASON_SUPPLEMENT = False
     ENABLE_HEAT_INDEX = False
+    N_MEMBERS = 512
     CV_FOLD_YEARS = None  # TODO(USER): pin exact five-fold years for 1979-2024.
     ENS_COMPARISON_PERIOD = None  # TODO(USER): pin after ECMWF cycle metadata is approved.
 
     # ==================== DATA PATHS ====================
     CONUS_TRAINING_DATA_PATH = os.path.join(CONUS_DATA_ROOT, "VDM_Training_Data_Extended_v2.nc")
     GLOBAL_TRAINING_DATA_PATH = os.path.join(DATA_ROOT, "cache", f"era5_{RESOLUTION}.zarr")
+    ERA5_RAW_DIR = os.path.join(DATA_ROOT, "era5_raw")
+    ENS_RAW_DIR = os.path.join(DATA_ROOT, "ens_reforecast", "raw")
+    ENS_REGRID_DIR = os.path.join(DATA_ROOT, "ens_reforecast", f"regridded_{RESOLUTION}")
+    ENS_QMAP_DIR = os.path.join(DATA_ROOT, "ens_reforecast", "quantile_mapping")
+    ENS_SCORE_DIR = os.path.join(DATA_ROOT, "ens_exceedance_incremental")
     GLOBAL_TELECONNECTION_VECTOR_PATH = os.path.join(DATA_ROOT, "cache", "teleconnection_5.npy")
     GLOBAL_RMM_PATH = os.path.join(DATA_ROOT, "drivers", "rmm.txt")
     TRAINING_DATA_PATH = (
@@ -741,6 +747,10 @@ def _read_extended_global_variable_report(path):
 
 
 def apply_extended_global_fields():
+    if Config.DOMAIN == "global":
+        Config.NUM_GLOBAL_CHANNELS = 0
+        Config.GLOBAL_DATA_PATH = None
+        return
     if not Config.USE_EXTENDED_GLOBAL_FIELDS:
         Config.NUM_GLOBAL_CHANNELS = global_effective_channel_count(Config)
         if Config.REQUIRE_EXTENDED_GLOBAL_FIELDS:

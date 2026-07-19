@@ -84,6 +84,12 @@ def audit_repository(root: Path) -> list[CheckResult]:
     exceed = _text(root, "src/exceedance_eval.py")
     ens_ingest = _text(root, "src/ens_ingest.py")
     ens_score = _text(root, "src/ens_score.py")
+    ens_target_grid = _text(root, "src/ens_target_grid.py")
+    ens_compare = _text(root, "src/ens_compare.py")
+    ens_stack = _text(root, "src/ens_heatcast_stack_opportunity.py")
+    novelty = _text(root, "src/novelty_analyses.py")
+    drivers = _text(root, "src/build_driver_tables.py")
+    opportunity = _text(root, "src/forecasts_of_opportunity.py")
     mode = _text(root, "src/mode_dispatch.py")
     mesh = _text(root, "src/mesh_backbone.py")
     init_calendar = _text(root, "src/init_calendar.py")
@@ -203,6 +209,72 @@ def audit_repository(root: Path) -> list[CheckResult]:
         and "def summarize_global_metric_rows(" in stitch
         and '"global_pooled_year_block_bootstrap.csv"' in stitch,
         "Legacy evaluator exposes the additive global evaluator and stitcher writes all-window year-block summaries",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.ens_target_grid_contract",
+        "src/ens_target_grid.py",
+        (
+            "class ENSTargetGrid:",
+            "def headline_mask(",
+            "self.land_mask & (self.lat[:, None] >= 0.0)",
+            "def flattened_area_weights(",
+            "def target_grid_for_config(",
+            "class LazyGlobalChannel:",
+            "def read_pixels_times(",
+            "class LazyGlobalTruth(LazyGlobalChannel):",
+        ),
+    ))
+
+    results.append(_result(
+        "global.ens_pipeline_contract",
+        all(token in ens_ingest for token in (
+            "target_grid_for_config(cfm.Config)",
+            "expected_domain=target_grid.domain",
+            "expected_resolution=target_grid.resolution",
+            "domain=np.array(str(domain))",
+            "resolution=np.array(str(resolution))",
+        ))
+        and all(token in ens_score for token in (
+            '"heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH))',
+            'fold_sidecar_path(Path(config.TRAINING_DATA_PATH), int(config.CV_FOLD), "normalization")',
+            "load_fold_window_statistics(sidecar, int(cfm.Config.CV_FOLD))",
+            '"primary_mask": "NH land, full valid window in MJJAS"',
+        ))
+        and "weights=metric_weights" in ens_compare
+        and "weights=metric_weights" in ens_stack,
+        "ENS ingest, fold-safe scoring, comparison, and stacking use the configured global grid and area weights",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.novelty_analysis_contract",
+        "src/novelty_analyses.py",
+        (
+            "conditioned-ensemble envelope question",
+            "def fit_bayesian_gev(",
+            "use_gumbel = values.size < int(minimum_shape_samples)",
+            "def gev_envelope_analysis(",
+            "def tail_shape_analysis(",
+            "def joint_event_probabilities(",
+            '"independent_marginals"',
+            "def storyline_product(",
+            "minimum_members: int = 1000",
+            "def assert_fold_safe_exports(",
+        ),
+    ))
+
+    results.append(_result(
+        "global.driver_opportunity_contract",
+        '"swvl1_trailing20"' in drivers
+        and "LazyGlobalChannel(" in drivers
+        and "lazy_reader(pixels, train_t)" in drivers
+        and "lazy_reader(pixels, target_t)" in drivers
+        and "target_grid.flattened_area_weights(land_mask)" in opportunity
+        and "GLOBAL_EXPECTED_YEARS = set(range(1979, 2025))" in opportunity
+        and "weights=weights" in opportunity,
+        "MJO/ENSO/soil opportunity tables use lazy global soil reads and cosine-latitude weighting",
     ))
 
     results.append(_required_tokens_check(
@@ -702,13 +774,17 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "s2s.score_extended_global_contract",
         "def configure_fold(" in ens_score
         and "cfm.apply_extended_global_fields()" in ens_score
-        and ens_score.index("cfm.apply_extended_global_fields()") < ens_score.index("norm_stats = ee.load_norm_stats()"),
-        "ENS scoring applies the extended global-field configuration before loading fold norm stats",
+        and 'if getattr(config, "DOMAIN", "conus") != "global":' in ens_score
+        and "return ee.load_norm_stats()" in ens_score
+        and "norm_stats = load_scoring_normalizer(cfm.Config)" in ens_score,
+        "ENS scoring preserves CONUS fold stats and loads global fold-safe normalization sidecars",
     ))
 
     results.append(_result(
         "s2s.score_rejects_corrupt_ingest_contract",
-        "validate_ingested_output(path, window_leads)" in ens_score
+        "valid, reason = validate_ingested_output(" in ens_score
+        and "expected_domain=expected_domain" in ens_score
+        and "expected_resolution=expected_resolution" in ens_score
         and "Found {len(invalid_files)} invalid ingested ENS outputs" in ens_score
         and "Rerun slurm/submit_ens_widen_cycles.slurm" in ens_score,
         "ENS scoring rejects invalid ingested archives with a repair command",
@@ -742,7 +818,6 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Parallel ENS folds use read-only heat/time disk memmaps and skip shared global predictor caches",
     ))
 
-    ens_compare = _text(root, "src/ens_compare.py")
     results.append(_result(
         "s2s.multicycle_widening_contract",
         all(token in ens_score for token in (

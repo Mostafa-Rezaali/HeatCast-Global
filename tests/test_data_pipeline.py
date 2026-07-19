@@ -15,6 +15,7 @@ from data_pipeline.download_era5 import (
     task_complete,
 )
 from data_pipeline.regrid import GridSpec, regrid_field
+from ens_target_grid import LazyGlobalChannel
 from spatial_weights import weighted_spatial_mean
 
 
@@ -190,3 +191,8 @@ def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path):
     assert root["data"].chunks[0] == 1
     assert root["time"][:].tolist() == [20000101, 20000102, 20000103]
     assert metadata["shape"][0] == 3
+
+    lazy_soil = LazyGlobalChannel(store, "swvl1_trailing20")
+    selected = lazy_soil.read_pixels_times([0, 5], [0, 2])
+    assert selected.shape == (2, 2)
+    assert selected.tolist() == [[0.0, 2.0], [0.0, 2.0]]

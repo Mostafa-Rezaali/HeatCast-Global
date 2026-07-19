@@ -16,6 +16,7 @@ import numpy as np
 
 HIST_BINS = 512
 EXPECTED_YEARS = set(range(1981, 2024))
+GLOBAL_EXPECTED_YEARS = set(range(1979, 2025))
 TOP_CONFIDENCE_PERCENTILE = 90
 BASE_DRIVER_AXES = ("mjo_phase", "enso_state", "soil_moisture_tercile")
 DRIVER_AXES = BASE_DRIVER_AXES
@@ -293,30 +294,43 @@ class OpportunityStats:
         truth: np.ndarray,
         base_rate: np.ndarray,
         selection: Optional[np.ndarray] = None,
+        weights: Optional[np.ndarray] = None,
     ) -> None:
         p = np.asarray(probability).reshape(-1)
         y = np.asarray(truth).reshape(-1)
         base = np.asarray(base_rate).reshape(-1)
+        sample_weights = (
+            np.ones(p.shape, dtype=np.float64)
+            if weights is None
+            else np.asarray(weights, dtype=np.float64).reshape(-1)
+        )
+        if sample_weights.shape != p.shape:
+            raise ValueError("Opportunity weights must match the flattened prediction shape.")
         if selection is not None:
             selected = np.asarray(selection, dtype=bool).reshape(-1)
             p = p[selected]
             y = y[selected]
             base = base[selected]
-        valid = np.isfinite(p) & np.isfinite(y) & np.isfinite(base)
+            sample_weights = sample_weights[selected]
+        valid = (
+            np.isfinite(p) & np.isfinite(y) & np.isfinite(base)
+            & np.isfinite(sample_weights) & (sample_weights > 0.0)
+        )
         if not np.any(valid):
             return
         p = np.clip(p[valid].astype(np.float64), 0.0, 1.0)
         y = y[valid].astype(np.float64)
         base = np.clip(base[valid].astype(np.float64), 0.0, 1.0)
+        sample_weights = sample_weights[valid]
         index = np.minimum((p * HIST_BINS).astype(np.int64), HIST_BINS - 1)
-        self.count += float(p.size)
-        self.event_count += float(np.sum(y))
-        self.pred_sum += float(np.sum(p))
-        self.brier_sum += float(np.sum((p - y) ** 2))
-        self.climo_brier_sum += float(np.sum((base - y) ** 2))
-        self.hist_count += np.bincount(index, minlength=HIST_BINS)
-        self.hist_pred_sum += np.bincount(index, weights=p, minlength=HIST_BINS)
-        self.hist_pos += np.bincount(index, weights=y, minlength=HIST_BINS)
+        self.count += float(np.sum(sample_weights))
+        self.event_count += float(np.sum(sample_weights * y))
+        self.pred_sum += float(np.sum(sample_weights * p))
+        self.brier_sum += float(np.sum(sample_weights * (p - y) ** 2))
+        self.climo_brier_sum += float(np.sum(sample_weights * (base - y) ** 2))
+        self.hist_count += np.bincount(index, weights=sample_weights, minlength=HIST_BINS)
+        self.hist_pred_sum += np.bincount(index, weights=sample_weights * p, minlength=HIST_BINS)
+        self.hist_pos += np.bincount(index, weights=sample_weights * y, minlength=HIST_BINS)
 
     def add(self, other: "OpportunityStats", weight: float = 1.0) -> None:
         self.count += weight * other.count
@@ -670,9 +684,10 @@ def update_stratum(
     truth: np.ndarray,
     base_rate: np.ndarray,
     selection: np.ndarray,
+    weights: Optional[np.ndarray] = None,
 ) -> None:
     delta = OpportunityStats()
-    delta.update(probability, truth, base_rate, selection)
+    delta.update(probability, truth, base_rate, selection, weights=weights)
     global_stats[(axis, stratum)].add(delta)
     by_year[(axis, stratum, int(year))].add(delta)
 
@@ -682,6 +697,7 @@ def stream_chunks(
     land_count: int,
     region_land_masks: Mapping[str, np.ndarray],
     confidence_percentiles: Sequence[int],
+    metric_weights: Optional[np.ndarray] = None,
     driver_lookup: Optional[DriverLookup] = None,
     progress_every: int = 250,
 ) -> Tuple[Dict[Tuple[str, str], OpportunityStats], Dict[Tuple[str, str, int], OpportunityStats], set[int]]:
@@ -691,6 +707,8 @@ def stream_chunks(
     processed = 0
     soil_undefined = 0
     soil_total = 0
+    if metric_weights is not None and np.asarray(metric_weights).reshape(-1).size != int(land_count):
+        raise ValueError("metric_weights must have one value per selected land cell.")
     for manifest, model_c, boundaries, chunks in fold_inputs:
         fold = int(manifest["source_fold"])
         test_years = set(int(year) for year in manifest["test_years"])
@@ -733,14 +751,14 @@ def stream_chunks(
             for stratum, selection in selections:
                 update_stratum(
                     global_stats, by_year, "confidence", stratum, year,
-                    probability, truth, base_rate, selection,
+                    probability, truth, base_rate, selection, metric_weights,
                 )
 
             sigma_deciles = assign_deciles(arrays["model_sigma"], boundaries["sigma_edges"])
             for decile in range(10):
                 update_stratum(
                     global_stats, by_year, "model_sigma_decile", f"decile_{decile + 1}", year,
-                    probability, truth, base_rate, sigma_deciles == decile,
+                    probability, truth, base_rate, sigma_deciles == decile, metric_weights,
                 )
             margin_deciles = assign_deciles(
                 np.abs(arrays["forecast_margin"]), boundaries["forecast_margin_edges"]
@@ -748,11 +766,11 @@ def stream_chunks(
             for decile in range(10):
                 update_stratum(
                     global_stats, by_year, "abs_forecast_margin_decile", f"decile_{decile + 1}", year,
-                    probability, truth, base_rate, margin_deciles == decile,
+                    probability, truth, base_rate, margin_deciles == decile, metric_weights,
                 )
             update_stratum(
                 global_stats, by_year, "month", str(month), year,
-                probability, truth, base_rate, np.ones(land_count, dtype=bool),
+                probability, truth, base_rate, np.ones(land_count, dtype=bool), metric_weights,
             )
             top_decile_name = f"top_10pct_ge_p{TOP_CONFIDENCE_PERCENTILE}"
             top_decile = dict(selections)[top_decile_name]
@@ -763,23 +781,23 @@ def stream_chunks(
                 )
                 update_stratum(
                     global_stats, by_year, "low_sigma", "bottom_sigma_tercile", year,
-                    probability, truth, base_rate, low_sigma,
+                    probability, truth, base_rate, low_sigma, metric_weights,
                 )
                 for driver_axis, strata in driver_selections.items():
                     for stratum, driver_selection in strata.items():
                         update_stratum(
                             global_stats, by_year, driver_axis, stratum, year,
-                            probability, truth, base_rate, driver_selection,
+                            probability, truth, base_rate, driver_selection, metric_weights,
                         )
                         update_stratum(
                             global_stats, by_year, f"{driver_axis}_x_top_confidence",
                             f"{stratum}__{top_decile_name}", year,
-                            probability, truth, base_rate, driver_selection & top_decile,
+                            probability, truth, base_rate, driver_selection & top_decile, metric_weights,
                         )
                         update_stratum(
                             global_stats, by_year, f"{driver_axis}_x_low_sigma",
                             f"{stratum}__bottom_sigma_tercile", year,
-                            probability, truth, base_rate, driver_selection & low_sigma,
+                            probability, truth, base_rate, driver_selection & low_sigma, metric_weights,
                         )
                     if driver_axis == "soil_moisture_tercile":
                         soil_undefined += int(np.sum(strata["undefined"]))
@@ -787,12 +805,12 @@ def stream_chunks(
             for region_name, region_selection in region_land_masks.items():
                 update_stratum(
                     global_stats, by_year, "region", region_name, year,
-                    probability, truth, base_rate, region_selection,
+                    probability, truth, base_rate, region_selection, metric_weights,
                 )
                 update_stratum(
                     global_stats, by_year, "region_x_top_confidence",
                     f"{region_name}__{top_decile_name}", year,
-                    probability, truth, base_rate, region_selection & top_decile,
+                    probability, truth, base_rate, region_selection & top_decile, metric_weights,
                 )
             processed += 1
             if processed % int(progress_every) == 0:
@@ -997,9 +1015,15 @@ def run(args: argparse.Namespace) -> None:
     import cfm_mesh_train as cfm
     import exceedance_eval as ee
     import stitch_exceedance_folds as stitch
-    from publication_analysis_utils import region_masks
+    from ens_target_grid import target_grid_for_config
+    from global_evaluation import region_masks as global_region_masks
+    from publication_analysis_utils import region_masks as conus_region_masks
 
-    input_root = Path(args.input_root)
+    cfm.configure_domain(args.domain, args.resolution, config=cfm.Config)
+    if args.training_data_path:
+        cfm.Config.TRAINING_DATA_PATH = str(Path(args.training_data_path).expanduser())
+
+    input_root = Path(args.input_root or (Path(cfm.Config.DATA_ROOT) / "exceedance_eval_incremental"))
     run_names = parse_str_list(args.run_names)
     window_leads = parse_int_list(args.window_leads)
     confidence_percentiles = parse_int_list(args.confidence_percentiles)
@@ -1034,10 +1058,11 @@ def run(args: argparse.Namespace) -> None:
         chunk_lists.append(chunks)
     audit_rows = stitch.audit_folds(manifests, len(run_names))
     test_union = set().union(*(set(manifest["test_years"]) for manifest in manifests))
-    if test_union != EXPECTED_YEARS:
+    expected_years = GLOBAL_EXPECTED_YEARS if cfm.Config.DOMAIN == "global" else EXPECTED_YEARS
+    if test_union != expected_years:
         raise RuntimeError(
-            f"Expected pooled test years 1981..2023; missing={sorted(EXPECTED_YEARS - test_union)}, "
-            f"extra={sorted(test_union - EXPECTED_YEARS)}."
+            f"Expected pooled {cfm.Config.DOMAIN} test years {min(expected_years)}..{max(expected_years)}; "
+            f"missing={sorted(expected_years - test_union)}, extra={sorted(test_union - expected_years)}."
         )
     for row in audit_rows:
         print(
@@ -1065,11 +1090,19 @@ def run(args: argparse.Namespace) -> None:
         print(f"Fold {fold}: Model C and all stratum boundaries fit on calibration years only.")
     print("Boundary-fit-before-test-streaming assert: PASS")
 
-    land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+    metric_weights = None
+    if cfm.Config.DOMAIN == "global":
+        target_grid = target_grid_for_config(cfm.Config)
+        land_mask = target_grid.headline_mask()
+        raw_regions = global_region_masks(target_grid.lat, target_grid.lon, land_mask)
+        metric_weights = target_grid.flattened_area_weights(land_mask)
+    else:
+        land_mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
+        raw_regions = conus_region_masks(land_mask.shape)
     land_count = int(np.sum(land_mask))
     region_land_masks = {
         name: np.asarray(mask, dtype=bool).ravel()[land_mask.ravel()]
-        for name, mask in region_masks(land_mask.shape).items()
+        for name, mask in raw_regions.items()
     }
     fold_inputs = list(zip(manifests, models, boundaries, chunk_lists))
     driver_lookup = (
@@ -1084,11 +1117,15 @@ def run(args: argparse.Namespace) -> None:
         land_count,
         region_land_masks,
         confidence_percentiles,
+        metric_weights=metric_weights,
         driver_lookup=driver_lookup,
         progress_every=250,
     )
-    if observed_years != EXPECTED_YEARS:
-        raise RuntimeError(f"Streamed year set is not exactly 1981..2023: {sorted(observed_years)}")
+    if observed_years != expected_years:
+        raise RuntimeError(
+            f"Streamed year set is not exactly {min(expected_years)}..{max(expected_years)}: "
+            f"{sorted(observed_years)}"
+        )
     print(f"Chunk length and pooled-year asserts: PASS ({land_count} land cells, {len(observed_years)} years)")
 
     confidence_strata = [name for name, _ in confidence_selections(
@@ -1220,15 +1257,18 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--training_data_path", default=None)
     parser.add_argument(
         "--input_root",
-        default="/blue/nessie/mostafarezaali/Teleconnection/exceedance_eval_incremental",
+        default=None,
     )
     parser.add_argument(
         "--run_names",
         default="cvfold0_dist_v2_normfix,cvfold1_dist_v2_normfix,cvfold2_dist_v2_normfix,cvfold3_dist_v2_normfix,cvfold4_dist_v2_normfix",
     )
-    parser.add_argument("--window_leads", default="12,13,14,15,16,17,18")
+    parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
     parser.add_argument("--out_dir", default=None)
     parser.add_argument("--n_bootstrap", type=int, default=2000)
     parser.add_argument("--confidence_percentiles", default="50,80,90,95,99")
