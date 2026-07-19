@@ -21,6 +21,10 @@ pnpm-lock.yaml
 *.npz
 *.nc
 *.pkl
+*.zarr/
+*.grib
+*.grib2
+cds_cache/
 data_cache/
 checkpoints/
 test_prediction_plots/
