@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -11,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
+from global_evaluation import GLOBAL_WINDOWS, year_block_bootstrap
 
 
 REFERENCE_NAME = "pooled_climatology"
@@ -29,6 +31,94 @@ REQUIRED_MODEL_NAMES = (
     ee.CLIMATOLOGY_ANCHORED_MODEL_NAME,
     ee.NESTED_SHRINKAGE_MODEL_NAME,
 )
+
+
+def summarize_global_metric_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    repetitions: int = 1000,
+    seed: int = 0,
+) -> List[Dict[str, object]]:
+    """Pool fold-held-out global metrics and attach year-block bootstrap CIs.
+
+    Each input row represents one held-out year and must contain ``window``,
+    ``fold``, ``year``, and one or more numeric metrics.  The year ownership
+    guard prevents a year from leaking into more than one test fold.
+    """
+    if not rows:
+        raise ValueError("At least one global metric row is required.")
+    required_windows = set(GLOBAL_WINDOWS)
+    seen_windows = {str(row["window"]) for row in rows}
+    unknown = seen_windows - required_windows
+    if unknown:
+        raise ValueError(f"Unknown global windows: {sorted(unknown)}.")
+    year_owner: Dict[int, int] = {}
+    for row in rows:
+        year, fold = int(row["year"]), int(row["fold"])
+        if year in year_owner and year_owner[year] != fold:
+            raise RuntimeError(f"Held-out year {year} is owned by folds {year_owner[year]} and {fold}.")
+        year_owner[year] = fold
+
+    reserved = {"window", "fold", "year", "month", "region"}
+    output: List[Dict[str, object]] = []
+    for window in GLOBAL_WINDOWS:
+        selected = [row for row in rows if str(row["window"]) == window]
+        if not selected:
+            continue
+        metric_names = sorted(
+            key for key, value in selected[0].items()
+            if key not in reserved and isinstance(value, (int, float, np.integer, np.floating))
+        )
+        years = np.asarray([int(row["year"]) for row in selected], dtype=np.int16)
+        for metric_index, metric in enumerate(metric_names):
+            values = np.asarray([float(row[metric]) for row in selected], dtype=np.float64)
+            bootstrap = year_block_bootstrap(
+                values,
+                years,
+                repetitions=int(repetitions),
+                seed=int(seed) + metric_index,
+            )
+            output.append({
+                "window": window,
+                "metric": metric,
+                "value": float(np.nanmean(values)),
+                "ci_low": float(np.nanquantile(bootstrap, 0.025)),
+                "ci_high": float(np.nanquantile(bootstrap, 0.975)),
+                "n_years": int(np.unique(years).size),
+                "n_folds": int(len({int(row["fold"]) for row in selected})),
+            })
+    return output
+
+
+def write_global_metric_tables(
+    rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    *,
+    repetitions: int = 1000,
+    seed: int = 0,
+) -> Tuple[Path, ...]:
+    """Write fold/year rows plus pooled week3/week4/W34 bootstrap tables."""
+    destination = Path(output_dir)
+    destination.mkdir(parents=True, exist_ok=True)
+    paths: List[Path] = []
+    for window in GLOBAL_WINDOWS:
+        selected = [dict(row) for row in rows if str(row["window"]) == window]
+        if not selected:
+            continue
+        path = destination / f"global_{window}_fold_year_metrics.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(selected[0]))
+            writer.writeheader()
+            writer.writerows(selected)
+        paths.append(path)
+    pooled = summarize_global_metric_rows(rows, repetitions=repetitions, seed=seed)
+    pooled_path = destination / "global_pooled_year_block_bootstrap.csv"
+    with pooled_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=("window", "metric", "value", "ci_low", "ci_high", "n_years", "n_folds"))
+        writer.writeheader()
+        writer.writerows(pooled)
+    paths.append(pooled_path)
+    return tuple(paths)
 
 
 def _scalar(data: Mapping[str, np.ndarray], key: str) -> Any:

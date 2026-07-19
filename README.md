@@ -65,7 +65,7 @@ Phase B is not a separate model implementation.
 | 2 | ERA5 download/regrid/zarr cache and data-build Slurm | Complete |
 | 3 | Global spherical mesh/connectivity and memory flags | Complete |
 | 4 | Fold-safe anomaly target, global inputs, CPU smoke test | Complete |
-| 5 | Weighted week3/week4/W34 evaluation and export | Planned |
+| 5 | Weighted week3/week4/W34 evaluation and export | Complete |
 | 6 | Global ENS path and novelty analyses | Planned |
 | 7 | Production Slurm workflows, runbook, Phase B checklist | Planned |
 
@@ -129,8 +129,8 @@ python src/repo_integrity.py
 python -m pytest -q
 ```
 
-CI stays data-free and never downloads ERA5 or ECMWF data. A single-process
-CPU synthetic smoke test is added as part of the global training path.
+CI stays data-free and never downloads ERA5 or ECMWF data. It runs the
+single-process CPU synthetic smoke test at the true Phase A `121 x 240` shape.
 
 ## License
 

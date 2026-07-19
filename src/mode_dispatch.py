@@ -105,23 +105,41 @@ def _exceedance_loss_weights(model):
     )
 
 
-def spatial_gradient_loss(pred, target, mask):
+def _area_weighted_mask(model, mask, reference):
+    """Expand a mask and add cosine-latitude weights for global meshes."""
+    expanded = mask.to(device=reference.device, dtype=reference.dtype).expand_as(reference)
+    mesh = getattr(_raw_model(model), "_mesh", None) if model is not None else None
+    if not bool(getattr(mesh, "global_domain", False)):
+        return expanded
+    grid_lat = getattr(mesh, "grid_lat", None)
+    if grid_lat is None:
+        raise RuntimeError("Global loss requires mesh.grid_lat for area weighting.")
+    latitude = torch.as_tensor(grid_lat, device=reference.device, dtype=reference.dtype)
+    if latitude.ndim != 1 or latitude.numel() != reference.shape[-2]:
+        raise RuntimeError(
+            f"Global latitude shape {tuple(latitude.shape)} does not match field shape {tuple(reference.shape)}."
+        )
+    weights = torch.cos(torch.deg2rad(latitude)).clamp_min(0.0)
+    weights = weights.reshape((1,) * (reference.ndim - 2) + (reference.shape[-2], 1))
+    return expanded * weights
+
+
+def spatial_gradient_loss(pred, target, mask, model=None):
     """Match masked spatial finite-difference gradients."""
     if pred.shape != target.shape:
         raise RuntimeError(
             f"Gradient loss shape mismatch: pred={tuple(pred.shape)}, target={tuple(target.shape)}"
         )
 
-    mask = mask.to(device=pred.device, dtype=pred.dtype)
-    mask_expanded = mask.expand_as(pred)
+    mask_expanded = _area_weighted_mask(model, mask, pred)
 
     dy_pred = pred[..., 1:, :] - pred[..., :-1, :]
     dy_true = target[..., 1:, :] - target[..., :-1, :]
     dx_pred = pred[..., :, 1:] - pred[..., :, :-1]
     dx_true = target[..., :, 1:] - target[..., :, :-1]
 
-    mask_y = mask_expanded[..., 1:, :] * mask_expanded[..., :-1, :]
-    mask_x = mask_expanded[..., :, 1:] * mask_expanded[..., :, :-1]
+    mask_y = torch.sqrt(mask_expanded[..., 1:, :] * mask_expanded[..., :-1, :])
+    mask_x = mask_expanded[..., :, 1:] * (mask_expanded[..., :, :-1] > 0).to(pred.dtype)
 
     loss_y = ((dy_pred - dy_true).square() * mask_y).sum() / mask_y.sum().clamp_min(1.0)
     loss_x = ((dx_pred - dx_true).square() * mask_x).sum() / mask_x.sum().clamp_min(1.0)
@@ -153,11 +171,11 @@ def split_distributional_prediction(model, raw_pred, x_t):
     return mean, sigma
 
 
-def gaussian_crps(mean, sigma, target, mask):
+def gaussian_crps(mean, sigma, target, mask, model=None):
     """Closed-form Gaussian CRPS, masked to land pixels."""
     sigma = sigma.clamp_min(1e-6)
     target = target.to(device=mean.device, dtype=mean.dtype)
-    mask_expanded = mask.to(device=mean.device, dtype=mean.dtype).expand_as(mean)
+    mask_expanded = _area_weighted_mask(model, mask, mean)
     valid = mask_expanded > 0.5
     if not valid.any():
         return mean.sum() * 0.0
@@ -226,18 +244,20 @@ def exceedance_losses(model, y, mask, exceedance_thresholds):
         probs = torch.sigmoid(logits[valid])
         p_t = torch.where(labels[valid] > 0.5, probs, 1.0 - probs)
         bce = ((1.0 - p_t).clamp_min(1e-6) ** float(focal_gamma)) * bce
-    bce_loss = bce.mean()
+    point_weights = _area_weighted_mask(model, mask, y)[valid]
+    bce_loss = (bce * point_weights).sum() / point_weights.sum().clamp_min(1e-8)
 
-    probs = torch.sigmoid(logits) * mask_expanded
-    labels_masked = labels * mask_expanded
+    weighted_mask = _area_weighted_mask(model, mask, y)
+    probs = torch.sigmoid(logits) * weighted_mask
+    labels_masked = labels * weighted_mask
     region_masks = getattr(raw, "exceedance_region_masks", None)
     if region_masks is not None:
         region_masks = region_masks.to(device=y.device, dtype=y.dtype)
         if y.ndim == 4:
             # y: (B,L,H,W), region_masks: (R,H,W)
-            denom = (region_masks.unsqueeze(0).unsqueeze(0) * mask_expanded.unsqueeze(2)).sum(
+            denom = (region_masks.unsqueeze(0).unsqueeze(0) * weighted_mask.unsqueeze(2)).sum(
                 dim=(-2, -1)
-            ).clamp_min(1.0)
+            ).clamp_min(1e-8)
             pred_frac = (probs.unsqueeze(2) * region_masks.unsqueeze(0).unsqueeze(0)).sum(
                 dim=(-2, -1)
             ) / denom
@@ -246,12 +266,12 @@ def exceedance_losses(model, y, mask, exceedance_thresholds):
             ) / denom
         else:
             # y: (B,1,H,W), region_masks: (R,H,W)
-            denom = (region_masks.unsqueeze(0) * mask_expanded).sum(dim=(-2, -1)).clamp_min(1.0)
+            denom = (region_masks.unsqueeze(0) * weighted_mask).sum(dim=(-2, -1)).clamp_min(1e-8)
             pred_frac = (probs * region_masks.unsqueeze(0)).sum(dim=(-2, -1)) / denom
             obs_frac = (labels_masked * region_masks.unsqueeze(0)).sum(dim=(-2, -1)) / denom
         count_loss = (pred_frac - obs_frac).square().mean()
     else:
-        denom = mask_expanded.sum(dim=tuple(range(2, mask_expanded.ndim))).clamp_min(1.0)
+        denom = weighted_mask.sum(dim=tuple(range(2, weighted_mask.ndim))).clamp_min(1e-8)
         pred_frac = probs.sum(dim=tuple(range(2, probs.ndim))) / denom
         obs_frac = labels_masked.sum(dim=tuple(range(2, labels_masked.ndim))) / denom
         count_loss = (pred_frac - obs_frac).square().mean()
@@ -368,25 +388,26 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
         mask_expanded = mask.expand_as(pred)
         valid = mask_expanded > 0.5
         if valid.any():
-            daily_mse = ((pred - y).square() * mask_expanded).sum() / mask_expanded.sum().clamp_min(1.0)
-            daily_crps = gaussian_crps(pred, sigma, y, mask) if use_crps else daily_mse
+            weighted_mask = _area_weighted_mask(model, mask, pred)
+            daily_mse = ((pred - y).square() * weighted_mask).sum() / weighted_mask.sum().clamp_min(1e-8)
+            daily_crps = gaussian_crps(pred, sigma, y, mask, model=model) if use_crps else daily_mse
             center_idx = _tube_center_index(model)
             center_pred = pred[:, center_idx:center_idx + 1]
             center_truth = y[:, center_idx:center_idx + 1]
-            center_mask = mask.expand_as(center_pred)
-            center_mse = ((center_pred - center_truth).square() * center_mask).sum() / center_mask.sum().clamp_min(1.0)
+            center_mask = _area_weighted_mask(model, mask, center_pred)
+            center_mse = ((center_pred - center_truth).square() * center_mask).sum() / center_mask.sum().clamp_min(1e-8)
             center_crps = (
-                gaussian_crps(center_pred, sigma[:, center_idx:center_idx + 1], center_truth, mask)
+                gaussian_crps(center_pred, sigma[:, center_idx:center_idx + 1], center_truth, mask, model=model)
                 if use_crps else center_mse
             )
             weekly_pred = pred.mean(dim=1, keepdim=True)
             weekly_truth = y.mean(dim=1, keepdim=True)
-            weekly_mask = mask.expand_as(weekly_pred)
-            weekly_mse = ((weekly_pred - weekly_truth).square() * weekly_mask).sum() / weekly_mask.sum().clamp_min(1.0)
+            weekly_mask = _area_weighted_mask(model, mask, weekly_pred)
+            weekly_mse = ((weekly_pred - weekly_truth).square() * weekly_mask).sum() / weekly_mask.sum().clamp_min(1e-8)
             if use_crps:
                 n_leads = max(int(sigma.shape[1]), 1)
                 weekly_sigma = torch.sqrt((sigma.square().mean(dim=1, keepdim=True) / n_leads).clamp_min(1e-8))
-                weekly_crps = gaussian_crps(weekly_pred, weekly_sigma, weekly_truth, mask)
+                weekly_crps = gaussian_crps(weekly_pred, weekly_sigma, weekly_truth, mask, model=model)
             else:
                 weekly_crps = weekly_mse
         else:
@@ -403,7 +424,7 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
                 base_loss = base_loss + mse_anchor_weight * daily_mse
         else:
             base_loss = w_daily * daily_mse + w_center * center_mse + w_weekly * weekly_mse
-        grad_loss = spatial_gradient_loss(pred, y, mask) if gradient_weight > 0.0 else zero
+        grad_loss = spatial_gradient_loss(pred, y, mask, model=model) if gradient_weight > 0.0 else zero
         total_loss = (1.0 - gradient_weight) * base_loss + gradient_weight * grad_loss
         exceedance_bce = zero
         exceedance_count = zero
@@ -438,15 +459,20 @@ def deterministic_loss(model, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
     mask_expanded = mask.expand_as(pred)
     valid = mask_expanded > 0.5
     if valid.any():
-        total_loss = gaussian_crps(pred, sigma, y, mask) if use_crps else F.huber_loss(pred[valid], y[valid], delta=2.0)
-        recon_mse = F.mse_loss(pred[valid], y[valid])
+        weighted_mask = _area_weighted_mask(model, mask, pred)
+        if use_crps:
+            total_loss = gaussian_crps(pred, sigma, y, mask, model=model)
+        else:
+            huber = F.huber_loss(pred, y, delta=2.0, reduction="none")
+            total_loss = (huber * weighted_mask).sum() / weighted_mask.sum().clamp_min(1e-8)
+        recon_mse = ((pred - y).square() * weighted_mask).sum() / weighted_mask.sum().clamp_min(1e-8)
         if use_crps and mse_anchor_weight > 0.0:
             total_loss = total_loss + mse_anchor_weight * recon_mse
     else:
         total_loss = pred.sum() * 0.0
         recon_mse = total_loss.detach()
 
-    grad_loss = spatial_gradient_loss(pred, y, mask) if gradient_weight > 0.0 else zero
+    grad_loss = spatial_gradient_loss(pred, y, mask, model=model) if gradient_weight > 0.0 else zero
     total_loss = (1.0 - gradient_weight) * total_loss + gradient_weight * grad_loss
     exceedance_bce = zero
     exceedance_count = zero
@@ -524,8 +550,9 @@ def cfm_loss(model, fm, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
     x_input = _cfm_input(model, x_t_flow, x_t, x_tm1, x_tm2, spatial_c)
     v_pred = model(x_input, times, vec_c, global_fields=global_fields)
 
-    loss_per_pixel = (v_pred - v_target) ** 2 * mask
-    loss_per_sample = loss_per_pixel.sum(dim=(1, 2, 3)) / (mask.sum(dim=(1, 2, 3)) + 1e-8)
+    weighted_mask = _area_weighted_mask(model, mask, v_pred)
+    loss_per_pixel = (v_pred - v_target) ** 2 * weighted_mask
+    loss_per_sample = loss_per_pixel.sum(dim=(1, 2, 3)) / weighted_mask.sum(dim=(1, 2, 3)).clamp_min(1e-8)
     total_loss = loss_per_sample.mean()
 
     with torch.no_grad():
@@ -538,8 +565,8 @@ def cfm_loss(model, fm, y, x_t, x_tm1, x_tm2, spatial_c, vec_c,
 
     t_view = times.view(-1, 1, 1, 1)
     y_recon = x_t_flow + (1 - t_view) * v_pred
-    recon_mse = ((y_recon - y) ** 2 * mask).sum(dim=(1, 2, 3))
-    recon_mse = (recon_mse / (mask.sum(dim=(1, 2, 3)) + 1e-8)).mean()
+    recon_mse = ((y_recon - y) ** 2 * weighted_mask).sum(dim=(1, 2, 3))
+    recon_mse = (recon_mse / weighted_mask.sum(dim=(1, 2, 3)).clamp_min(1e-8)).mean()
 
     return total_loss, {
         "cfm_loss": total_loss.detach(),

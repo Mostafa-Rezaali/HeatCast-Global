@@ -36,6 +36,13 @@ not merely that Python files compile.
 - The 26 fine-grid and 8 vector channels are assembled from worker-local cache
   slices, and CI runs a two-step `121 x 240` distributional CPU smoke test with
   sampling and NetCDF export verification.
+- Global training losses and validation summaries use cosine-latitude weights;
+  global evaluation applies NH-land/full-window-MJJAS masks and reports week3,
+  week4, and W34 TAC, MSE skill, CRPS/CRPSS, q95 and upper-tercile probability
+  diagnostics, tail containment, monthly/region breakdowns, and year-block CIs.
+- Global NetCDF export derives coordinates from the configured grid and writes
+  continuous anomaly means, distributional sigma, truth, and supplied
+  exceedance probabilities for all three windows without fixed raster sizes.
 
 ## Commands
 

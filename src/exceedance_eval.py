@@ -32,6 +32,13 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 import cfm_mesh_train as cfm
+from global_evaluation import (
+    GLOBAL_WINDOWS,
+    build_fold_window_thresholds,
+    evaluate_global_windows,
+    nh_land_mjjas_mask,
+    region_masks as global_region_masks,
+)
 from init_calendar import MJJAS_MONTHS, mjjas_mon_thu
 from publication_analysis_utils import NOAA_REGION_BOXES, conus_lat_lon, ensure_dir, region_masks
 

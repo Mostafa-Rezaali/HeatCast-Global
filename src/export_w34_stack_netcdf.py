@@ -28,6 +28,7 @@ from typing import Dict, List, Mapping, Sequence, Tuple
 import numpy as np
 
 import exceedance_eval as ee
+from data_pipeline.regrid import grid_for_resolution
 from ens_compare import chunk_map, resolve_ens_run_groups
 from ens_heatcast_stack_opportunity import (
     STACK_FEATURE_NAMES,
@@ -38,6 +39,7 @@ from ens_heatcast_stack_opportunity import (
     paired_chunk,
 )
 from stitch_exceedance_folds import load_fold_inputs
+from global_evaluation import GLOBAL_WINDOWS, window_means
 
 
 BASE_DATE = datetime(1981, 5, 1)
@@ -125,6 +127,20 @@ def _coord_from_source(path: Path, shape: Tuple[int, int]) -> Tuple[np.ndarray, 
 
 
 def target_lat_lon(config, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]:
+    if str(getattr(config, "DOMAIN", "conus")) == "global":
+        grid = grid_for_resolution(str(config.RESOLUTION))
+        if tuple(shape) != tuple(grid.shape):
+            raise RuntimeError(
+                f"Configured global grid {config.RESOLUTION} has shape {grid.shape}, got {tuple(shape)}."
+            )
+        lon2d, lat2d = np.meshgrid(grid.lon.astype(np.float32), grid.lat.astype(np.float32))
+        return (
+            grid.lat.astype(np.float32),
+            grid.lon.astype(np.float32),
+            lat2d,
+            lon2d,
+            f"configured_global_grid:{config.RESOLUTION}",
+        )
     coords = _coord_from_source(Path(config.TRAINING_DATA_PATH), shape)
     if coords is not None:
         return (*coords, f"source:{config.TRAINING_DATA_PATH}")
@@ -132,11 +148,25 @@ def target_lat_lon(config, shape: Tuple[int, int]) -> Tuple[np.ndarray, np.ndarr
     return lat_1d, lon_1d, lat2d, lon2d, "prism_4km_pixel_center_fallback"
 
 
-def load_land_metadata() -> Dict[str, np.ndarray]:
+def load_land_metadata(config=None) -> Dict[str, np.ndarray]:
     import cfm_mesh_train as cfm
 
-    mask = np.asarray(cfm.load_conus_mask(cfm.Config).cpu().numpy() > 0.5, dtype=bool)
-    lat_1d, lon_1d, lat2d, lon2d, coord_source = target_lat_lon(cfm.Config, mask.shape)
+    selected = cfm.Config if config is None else config
+    if str(getattr(selected, "DOMAIN", "conus")) == "global":
+        from data_pipeline.build_cache import CACHE_CHANNELS, _require_zarr
+
+        zarr = _require_zarr()
+        root = zarr.open_group(str(selected.TRAINING_DATA_PATH), mode="r")
+        lat_1d = np.asarray(root["lat"][:], dtype=np.float32)
+        lon_1d = np.asarray(root["lon"][:], dtype=np.float32)
+        mask = np.asarray(root["data"][0, :, :, CACHE_CHANNELS.index("land_mask")] >= 0.5, dtype=bool)
+        if mask.shape != (lat_1d.size, lon_1d.size):
+            raise RuntimeError("Global cache land mask and coordinate shapes disagree.")
+        lon2d, lat2d = np.meshgrid(lon_1d, lat_1d)
+        coord_source = f"global_zarr:{selected.TRAINING_DATA_PATH}"
+    else:
+        mask = np.asarray(cfm.load_conus_mask(selected).cpu().numpy() > 0.5, dtype=bool)
+        lat_1d, lon_1d, lat2d, lon2d, coord_source = target_lat_lon(selected, mask.shape)
     row2d, col2d = np.indices(mask.shape)
     return {
         "mask": mask,
@@ -148,6 +178,104 @@ def load_land_metadata() -> Dict[str, np.ndarray]:
         "row_land": np.asarray(row2d[mask], dtype=np.int32),
         "col_land": np.asarray(col2d[mask], dtype=np.int32),
     }
+
+
+def write_global_hindcast_netcdf(
+    path: Path,
+    initialization_dates: Sequence[int],
+    lat,
+    lon,
+    forecast_daily_mean,
+    forecast_daily_sigma,
+    truth_daily,
+    *,
+    exceedance_probabilities: Mapping[str, np.ndarray] | None = None,
+    prediction_leads: Sequence[int] = tuple(range(15, 29)),
+    dry_run: bool = False,
+) -> Path:
+    """Write grid-parameterized global week3/week4/W34 hindcast fields.
+
+    Daily inputs use shape ``(time, lead, lat, lon)``.  Window sigma follows
+    the unchanged independent-lead Gaussian tube-loss aggregation used by
+    :mod:`mode_dispatch`.  Exceedance mappings may provide ``q95`` and
+    ``upper_tercile`` arrays for each window using keys such as ``w34_q95``.
+    """
+    latitude = np.asarray(lat, dtype=np.float32)
+    longitude = np.asarray(lon, dtype=np.float32)
+    mean_daily = np.asarray(forecast_daily_mean, dtype=np.float32)
+    sigma_daily = np.asarray(forecast_daily_sigma, dtype=np.float32)
+    observed_daily = np.asarray(truth_daily, dtype=np.float32)
+    expected = (len(initialization_dates), len(tuple(prediction_leads)), latitude.size, longitude.size)
+    if mean_daily.shape != expected or sigma_daily.shape != expected or observed_daily.shape != expected:
+        raise ValueError(
+            f"Global export arrays must all have shape {expected}; got "
+            f"{mean_daily.shape}, {sigma_daily.shape}, and {observed_daily.shape}."
+        )
+    if np.any(sigma_daily <= 0.0):
+        raise ValueError("Distributional sigma must be positive for global export.")
+    means = window_means(mean_daily, prediction_leads)
+    truths = window_means(observed_daily, prediction_leads)
+    lead_tuple = tuple(int(value) for value in prediction_leads)
+    sigmas = {}
+    for name, leads in GLOBAL_WINDOWS.items():
+        indices = [lead_tuple.index(int(value)) for value in leads]
+        sigmas[name] = np.sqrt(np.sum(sigma_daily[:, indices] ** 2, axis=1)) / len(indices)
+    probabilities = {} if exceedance_probabilities is None else {
+        str(key): np.asarray(value, dtype=np.float32) for key, value in exceedance_probabilities.items()
+    }
+    for key, values in probabilities.items():
+        if values.shape != (len(initialization_dates), latitude.size, longitude.size):
+            raise ValueError(f"Exceedance probability {key!r} has invalid shape {values.shape}.")
+        if np.any((values < 0.0) | (values > 1.0)):
+            raise ValueError(f"Exceedance probability {key!r} leaves [0, 1].")
+    destination = Path(path)
+    if dry_run:
+        return destination
+    try:
+        from netCDF4 import Dataset
+    except Exception as exc:
+        raise RuntimeError("netCDF4 is required for global hindcast export.") from exc
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with Dataset(destination, "w", format="NETCDF4") as ds:
+        ds.createDimension("y", latitude.size)
+        ds.createDimension("x", longitude.size)
+        ds.createDimension("time", len(initialization_dates))
+        ds.title = "HeatCast-Global week3, week4, and W34 hindcasts"
+        ds.domain = "global"
+        ds.primary_evaluation = "NH land with full valid window in MJJAS"
+        ds.prediction_leads = ",".join(str(value) for value in prediction_leads)
+        create_var(ds, "lat_1d", "f4", ("y",), units="degrees_north")[:] = latitude
+        create_var(ds, "lon_1d", "f4", ("x",), units="degrees_east")[:] = longitude
+        create_var(ds, "init_date_yyyymmdd", "i4", ("time",), zlib=False)[:] = np.asarray(initialization_dates, dtype=np.int32)
+        chunks = (latitude.size, min(256, longitude.size), 1)
+        for name in GLOBAL_WINDOWS:
+            for suffix, values, long_name in (
+                ("anomaly_mean", means[name], "forecast climatology anomaly mean"),
+                ("anomaly_sigma", sigmas[name], "forecast Gaussian standard deviation"),
+                ("observed_anomaly", truths[name], "observed climatology anomaly"),
+            ):
+                variable = create_var(
+                    ds,
+                    f"{name}_{suffix}",
+                    "f4",
+                    ("y", "x", "time"),
+                    chunksizes=chunks,
+                    units="K",
+                    long_name=f"{name} {long_name}",
+                )
+                variable[:] = np.moveaxis(values, 0, -1)
+        for key, values in probabilities.items():
+            variable = create_var(
+                ds,
+                f"prob_{key}",
+                "f4",
+                ("y", "x", "time"),
+                chunksizes=chunks,
+                units="1",
+                long_name=f"forecast probability for {key} exceedance",
+            )
+            variable[:] = np.moveaxis(values, 0, -1)
+    return destination
 
 
 def load_fold_norm_scales(
@@ -365,6 +493,8 @@ def write_netcdf(
     land_meta: Mapping[str, np.ndarray],
     args: argparse.Namespace,
 ) -> None:
+    import cfm_mesh_train as cfm
+
     try:
         from netCDF4 import Dataset
     except Exception as exc:
@@ -391,7 +521,9 @@ def write_netcdf(
         ds.createDimension("x", int(np.asarray(land_meta["mask"]).shape[1]))
         ds.createDimension("window_lead", len(ee.parse_int_list(args.window_leads)))
 
-        ds.title = "HeatCast W34 HeatCast+ENS stack export"
+        domain = str(getattr(cfm.Config, "DOMAIN", "conus"))
+        ds.title = f"HeatCast {domain} W34 HeatCast+ENS stack export"
+        ds.domain = domain
         ds.product = "cross_fitted_heatcast_ens_stack_probabilities"
         ds.scope = "paired_heatcast_ens_heldout_test_intersection"
         ds.note = (
@@ -425,11 +557,11 @@ def write_netcdf(
         create_var(ds, "lon", "f4", ("y", "x"), units="degrees_east")[:] = lon2d
         create_var(ds, "lat_land", "f4", ("land_cell",), units="degrees_north")[:] = land_meta["lat_land"]
         create_var(ds, "lon_land", "f4", ("land_cell",), units="degrees_east")[:] = land_meta["lon_land"]
-        create_var(ds, "row_land", "i4", ("land_cell",), long_name="row index in full CONUS grid")[:] = land_meta["row_land"]
-        create_var(ds, "col_land", "i4", ("land_cell",), long_name="column index in full CONUS grid")[:] = land_meta["col_land"]
+        create_var(ds, "row_land", "i4", ("land_cell",), long_name="row index in full configured grid")[:] = land_meta["row_land"]
+        create_var(ds, "col_land", "i4", ("land_cell",), long_name="column index in full configured grid")[:] = land_meta["col_land"]
         create_var(ds, "lat_1d", "f4", ("y",), units="degrees_north")[:] = land_meta["lat_1d"]
         create_var(ds, "lon_1d", "f4", ("x",), units="degrees_east")[:] = land_meta["lon_1d"]
-        create_var(ds, "land_mask", "i1", ("y", "x"), zlib=True, long_name="CONUS land mask")[:] = np.asarray(land_meta["mask"], dtype=np.int8)
+        create_var(ds, "land_mask", "i1", ("y", "x"), zlib=True, long_name=f"{domain} land mask")[:] = np.asarray(land_meta["mask"], dtype=np.int8)
 
         time_var = create_var(
             ds,

@@ -50,6 +50,7 @@ from datetime import datetime, timedelta
 from icosahedral_mesh import IcosahedralMesh
 from mesh_backbone import MeshFlowNet, count_parameters
 from mode_dispatch import compute_loss, generate_sample
+from spatial_weights import area_weights
 import pickle
 try:
     from publication_analysis_utils import region_masks as publication_region_masks
@@ -1092,6 +1093,21 @@ def build_mesh_once(config, conus_mask, device, ddp=False):
 # ======================================================================================
 # EXPONENTIAL EXTREME LOSS (Lopez-Gomez et al., 2023)
 # ======================================================================================
+def _training_weighted_mask(mask, reference):
+    """Return the training mask with global cosine-latitude area weights."""
+    weights = mask.to(device=reference.device, dtype=reference.dtype)
+    if weights.ndim == 3:
+        weights = weights.unsqueeze(1)
+    if weights.shape != reference.shape:
+        weights = weights.expand_as(reference)
+    if getattr(Config, "DOMAIN", "conus") == "global":
+        latitude = torch.linspace(90.0, -90.0, reference.shape[-2], device=reference.device, dtype=reference.dtype)
+        latitude_weight = torch.cos(torch.deg2rad(latitude)).clamp_min(0.0)
+        latitude_weight = latitude_weight.reshape((1,) * (reference.ndim - 2) + (reference.shape[-2], 1))
+        weights = weights * latitude_weight
+    return weights
+
+
 def exponential_extreme_loss(pred, target, mask, a=1.0, b=0.0):
     """
     Loss that upweights prediction errors for extreme values.
@@ -1105,22 +1121,15 @@ def exponential_extreme_loss(pred, target, mask, a=1.0, b=0.0):
     diff_sq = (target - pred) ** 2
     weight = a * torch.exp(target.clamp(-5, 5)) + b * torch.exp(-target.clamp(-5, 5))
     loss = weight * diff_sq
-    mask = mask.to(device=pred.device, dtype=pred.dtype)
-    if mask.shape != pred.shape:
-        mask = mask.expand_as(pred)
-    return (loss * mask).sum() / (mask.sum() + 1e-8)
+    weighted_mask = _training_weighted_mask(mask, pred)
+    return (loss * weighted_mask).sum() / (weighted_mask.sum() + 1e-8)
 
 
 def masked_mse_loss(pred, target, mask):
     """Land-only MSE in normalized z-score units."""
-    mask = mask.to(device=pred.device, dtype=pred.dtype)
-    if mask.ndim == 3:
-        mask = mask.unsqueeze(1)
-    if mask.shape != pred.shape:
-        mask = mask.expand_as(pred)
-
-    denom = mask.sum().clamp_min(1.0)
-    return (((pred - target) ** 2) * mask).sum() / denom
+    weighted_mask = _training_weighted_mask(mask, pred)
+    denom = weighted_mask.sum().clamp_min(1e-8)
+    return (((pred - target) ** 2) * weighted_mask).sum() / denom
 
 
 def finite_nonzero_mean_std_time_chunks(data_hw_time, indices, chunk_size=16):
@@ -1182,7 +1191,7 @@ def anomaly_corr_loss(pred, target, climo, mask, eps=1e-8):
     pred = pred.float()
     target = target.float()
     climo = climo.to(device=pred.device, dtype=pred.dtype)
-    mask = mask.to(device=pred.device, dtype=pred.dtype)
+    mask = _training_weighted_mask(mask, pred)
 
     if climo.ndim == 3:
         climo = climo.unsqueeze(1)
@@ -1193,18 +1202,15 @@ def anomaly_corr_loss(pred, target, climo, mask, eps=1e-8):
     if mask.shape != pred.shape:
         mask = mask.expand_as(pred)
 
-    pred_anom = (pred - climo) * mask
-    truth_anom = (target - climo) * mask
+    pred_anom = pred - climo
+    truth_anom = target - climo
 
-    land_count = mask.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
-    pred_anom = pred_anom - pred_anom.sum(dim=(-2, -1), keepdim=True) / land_count
-    truth_anom = truth_anom - truth_anom.sum(dim=(-2, -1), keepdim=True) / land_count
-    pred_anom = pred_anom * mask
-    truth_anom = truth_anom * mask
-
-    cov = (pred_anom * truth_anom).sum(dim=(-2, -1))
-    pred_std = (pred_anom.square().sum(dim=(-2, -1)).clamp_min(eps)).sqrt()
-    truth_std = (truth_anom.square().sum(dim=(-2, -1)).clamp_min(eps)).sqrt()
+    land_count = mask.sum(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    pred_anom = pred_anom - (pred_anom * mask).sum(dim=(-2, -1), keepdim=True) / land_count
+    truth_anom = truth_anom - (truth_anom * mask).sum(dim=(-2, -1), keepdim=True) / land_count
+    cov = (pred_anom * truth_anom * mask).sum(dim=(-2, -1))
+    pred_std = ((pred_anom.square() * mask).sum(dim=(-2, -1)).clamp_min(eps)).sqrt()
+    truth_std = ((truth_anom.square() * mask).sum(dim=(-2, -1)).clamp_min(eps)).sqrt()
     corr = cov / (pred_std * truth_std + eps)
     corr = torch.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
     return (1.0 - corr).mean()
@@ -2955,6 +2961,19 @@ def _accumulate_tac_stats(stats, pred, truth, persist, target_doy, climo_by_doy,
     _accumulate_tac_stats_with_climo(stats, pred, truth, persist, climo, mask_np)
 
 
+def _metric_spatial_mean(values, valid):
+    """Use cosine-latitude aggregation for global validation metrics."""
+    values = np.asarray(values, dtype=np.float64)
+    valid = np.asarray(valid, dtype=bool) & np.isfinite(values)
+    if not np.any(valid):
+        return float("nan")
+    if getattr(Config, "DOMAIN", "conus") != "global":
+        return float(np.nanmean(values[valid]))
+    latitude = np.linspace(90.0, -90.0, values.shape[0], dtype=np.float64)
+    weights = np.broadcast_to(area_weights(latitude)[:, None], values.shape)
+    return float(np.sum(values[valid] * weights[valid]) / np.sum(weights[valid]))
+
+
 def _corr_from_tac_sums(x_sum, y_sum, x_sq_sum, y_sq_sum, xy_sum, count, mask_np):
     valid = (mask_np > 0.5) & (count >= 2)
     cov = xy_sum - (x_sum * y_sum) / np.maximum(count, 1.0)
@@ -2964,7 +2983,7 @@ def _corr_from_tac_sums(x_sum, y_sum, x_sq_sum, y_sq_sum, xy_sum, count, mask_np
     valid &= denom > 1e-12
     corr = np.full(count.shape, np.nan, dtype=np.float32)
     corr[valid] = (cov[valid] / denom[valid]).astype(np.float32)
-    return corr, float(np.nanmean(corr[valid])) if np.any(valid) else float("nan")
+    return corr, _metric_spatial_mean(corr, valid)
 
 
 def summarize_tac_stats(stats, mask_np):
@@ -2989,7 +3008,7 @@ def mse_from_tac_stats(stats, mask_np, persistence=False):
     sqerr_sum = stats[prefix_sq] + stats["truth_sq_sum"] - 2.0 * stats[prefix_xy]
     per_pixel = np.full(count.shape, np.nan, dtype=np.float64)
     per_pixel[valid] = sqerr_sum[valid] / np.maximum(count[valid], 1.0)
-    return float(np.nanmean(per_pixel[valid])) if np.any(valid) else float("nan")
+    return _metric_spatial_mean(per_pixel, valid)
 
 
 def _target_doy_from_time_value(time_value):

@@ -88,6 +88,9 @@ def audit_repository(root: Path) -> list[CheckResult]:
     mesh = _text(root, "src/mesh_backbone.py")
     init_calendar = _text(root, "src/init_calendar.py")
     spatial_weights = _text(root, "src/spatial_weights.py")
+    global_evaluation = _text(root, "src/global_evaluation.py")
+    stitch = _text(root, "src/stitch_exceedance_folds.py")
+    export = _text(root, "src/export_w34_stack_netcdf.py")
     ens_download = _text(root, "src/download_ecmwf_s2s.py")
     w34_train = _text(root, "slurm/submit_w34_tube_all.slurm")
     w34_eval = _text(root, "slurm/submit_w34_eval_stitch.slurm")
@@ -160,6 +163,61 @@ def audit_repository(root: Path) -> list[CheckResult]:
         and "np.cos(np.deg2rad(values))" in spatial_weights
         and "def weighted_spatial_mean(" in spatial_weights,
         "Shared NumPy/PyTorch cosine-latitude weighting helpers are present",
+    ))
+
+    results.append(_result(
+        "global.area_weighted_training_contract",
+        "def _area_weighted_mask(model, mask, reference):" in mode
+        and "torch.cos(torch.deg2rad(latitude)).clamp_min(0.0)" in mode
+        and "gaussian_crps(pred, sigma, y, mask, model=model)" in mode
+        and "weighted_mask = _area_weighted_mask(model, mask, v_pred)" in mode
+        and "point_weights = _area_weighted_mask(model, mask, y)[valid]" in mode
+        and "def _training_weighted_mask(mask, reference):" in cfm
+        and "def _metric_spatial_mean(values, valid):" in cfm,
+        "Global CRPS, deterministic, CFM, exceedance, auxiliary, and validation reductions are area weighted",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.evaluation_windows_contract",
+        "src/global_evaluation.py",
+        (
+            '"week3": WEEK3_LEADS',
+            '"week4": WEEK4_LEADS',
+            '"w34": W34_LEADS',
+            'THRESHOLD_QUANTILES: Mapping[str, float] = {"upper_tercile": 2.0 / 3.0, "q95": 0.95}',
+            "def nh_land_mjjas_mask(",
+            "def build_fold_window_thresholds(",
+            "def evaluate_global_windows(",
+            'row[f"q95_tail_containment_{label}"]',
+            'row["monthly_region_breakdowns"]',
+            "def year_block_bootstrap(",
+        ),
+    ))
+
+    results.append(_result(
+        "global.evaluation_integration_contract",
+        "from global_evaluation import (" in exceed
+        and "build_fold_window_thresholds" in exceed
+        and "evaluate_global_windows" in exceed
+        and "def summarize_global_metric_rows(" in stitch
+        and '"global_pooled_year_block_bootstrap.csv"' in stitch,
+        "Legacy evaluator exposes the additive global evaluator and stitcher writes all-window year-block summaries",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.export_contract",
+        "src/export_w34_stack_netcdf.py",
+        (
+            'if str(getattr(config, "DOMAIN", "conus")) == "global":',
+            "grid_for_resolution(str(config.RESOLUTION))",
+            "def write_global_hindcast_netcdf(",
+            '("anomaly_mean", means[name]',
+            '("anomaly_sigma", sigmas[name]',
+            'f"prob_{key}"',
+            'ds.primary_evaluation = "NH land with full valid window in MJJAS"',
+        ),
     ))
 
     results.append(_required_tokens_check(

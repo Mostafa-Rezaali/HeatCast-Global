@@ -444,6 +444,8 @@ class IcosahedralMesh:
         self.lat_range = lat_range
         self.lon_range = lon_range
         self.global_domain = bool(global_domain)
+        self.grid_lat = None if grid_lat is None else np.asarray(grid_lat, dtype=np.float64)
+        self.grid_lon = None if grid_lon is None else np.asarray(grid_lon, dtype=np.float64)
 
         print(f"\n{'='*70}")
         print(f"Building Icosahedral Mesh (refinement level {refinement_level})")
