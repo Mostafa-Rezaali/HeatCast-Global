@@ -1,4 +1,4 @@
-# HeatCast Repository Integrity Test Kit
+# HeatCast-Global Repository Integrity Test Kit
 
 This kit checks that the code still implements the intended HeatCast experiment,
 not merely that Python files compile.
@@ -16,6 +16,13 @@ not merely that Python files compile.
 - W34 evaluation saves fold arrays and uses leakage-clean cross-fitted stitching.
 - Critical Slurm jobs retain the established memory, GPU, Git-pull, and email settings.
 - Runtime model/data artifacts are not accidentally committed.
+- Global mode defaults to ERA5 `1.5deg`, climatology anomalies, no separate
+  coarse-global stack, and the unchanged 15--28 distributional tube.
+- CONUS mode retains the original z-score/persistence-residual and 59-field
+  coarse-global path.
+- The ECMWF downloader and evaluation import one full-W34-valid MJJAS
+  Monday/Thursday initialization calendar.
+- Global spatial reductions use the shared normalized cosine-latitude helper.
 
 ## Commands
 

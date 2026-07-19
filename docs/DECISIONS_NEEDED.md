@@ -16,9 +16,9 @@ initialization calendar, comparison-period config, and paper tables.
 ## Cross-validation fold years
 
 `TODO(USER)`: Approve the exact five year-disjoint train/calibration/test fold
-table for 1979--2024. Until approved, the global config exposes an explicit
-provisional table for data-free tests and refuses production scoring when the
-decision flag is unset.
+table for 1979--2024. Until approved, `Config.CV_FOLD_YEARS` remains `None`;
+data-free tests use synthetic fixture years and production scoring must refuse
+to infer a table.
 
 Affected interfaces: fold-specific climatology, normalization, percentile
 thresholds, hindcast export, and all pooled comparisons.

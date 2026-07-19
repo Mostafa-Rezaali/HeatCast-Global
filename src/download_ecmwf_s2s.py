@@ -24,16 +24,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Iterable, Sequence, Tuple
+from typing import Sequence, Tuple
 
-
-def mjjas_mon_thu(year: int) -> Iterable[date]:
-    day = date(int(year), 5, 1)
-    end = date(int(year), 9, 30)
-    while day <= end:
-        if day.weekday() in (0, 3):
-            yield day
-        day += timedelta(days=1)
+from init_calendar import mjjas_mon_thu
 
 
 def retrieve(

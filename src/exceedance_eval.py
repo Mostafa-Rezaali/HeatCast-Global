@@ -32,11 +32,16 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 import cfm_mesh_train as cfm
+from init_calendar import MJJAS_MONTHS, mjjas_mon_thu
 from publication_analysis_utils import NOAA_REGION_BOXES, conus_lat_lon, ensure_dir, region_masks
 
 
-MJJAS_MONTHS = (5, 6, 7, 8, 9)
 BASE_DATE = datetime(1981, 5, 1)
+
+
+def matched_mjjas_initializations(year: int):
+    """Return the shared, full-W34-valid ECMWF Monday/Thursday calendar."""
+    return tuple(mjjas_mon_thu(int(year)))
 
 
 def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:

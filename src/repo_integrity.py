@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast, data-free repository contract audit for HeatCast.
+"""Fast, data-free repository contract audit for HeatCast-Global.
 
 This audit protects experiment intent and submission-script consistency. It is
 deliberately independent of the external NetCDF datasets and GPU runtime.
@@ -85,17 +85,22 @@ def audit_repository(root: Path) -> list[CheckResult]:
     ens_score = _text(root, "src/ens_score.py")
     mode = _text(root, "src/mode_dispatch.py")
     mesh = _text(root, "src/mesh_backbone.py")
+    init_calendar = _text(root, "src/init_calendar.py")
+    spatial_weights = _text(root, "src/spatial_weights.py")
+    ens_download = _text(root, "src/download_ecmwf_s2s.py")
     w34_train = _text(root, "slurm/submit_w34_tube_all.slurm")
     w34_eval = _text(root, "slurm/submit_w34_eval_stitch.slurm")
 
     month_literal = "MJJAS_MONTHS = (5, 6, 7, 8, 9)"
     results.append(_result(
         "target.month_specific_daily_exceedance",
-        month_literal in cfm and month_literal in exceed
+        month_literal in cfm
+        and "MJJAS_MONTHS: Tuple[int, ...] = (5, 6, 7, 8, 9)" in init_calendar
+        and "from init_calendar import MJJAS_MONTHS, mjjas_mon_thu" in exceed
         and "def build_month_q95" in exceed
         and "truth_z > q95_z" not in exceed
         and "(field_z[valid] > threshold[valid])" in exceed,
-        "MJJAS month-specific q95 builders and strict daily exceedance labels are present",
+        "Shared MJJAS calendar, month-specific q95 builders, and strict daily labels are present",
     ))
 
     results.append(_result(
@@ -116,7 +121,44 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "sigma = F.softplus(sigma_raw) + float(floor)",
             "def gaussian_crps(",
         )),
-        "Distributional mean uses persistence residual and sigma uses positive softplus floor",
+        "CONUS persistence-residual mean and positive softplus sigma semantics remain available",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.config_contract",
+        "src/cfm_mesh_train.py",
+        (
+            'DOMAIN = os.environ.get("HEATCAST_DOMAIN", "global")',
+            'DATA_ROOT = "/blue/nessie/mostafarezaali/HeatCastGlobal/"',
+            '"1.5deg": {"shape": (121, 240), "mesh_level": 5}',
+            '"0.25deg": {"shape": (721, 1440), "mesh_level": 6}',
+            'TARGET_MODES = ("zscore_persistence", "climatology_anomaly")',
+            'PREDICT_PERSISTENCE_RESIDUAL = TARGET_MODE == "zscore_persistence"',
+            'USE_EXTENDED_GLOBAL_FIELDS = DOMAIN == "conus"',
+            'CV_FOLD_YEARS = None  # TODO(USER)',
+            'ENS_COMPARISON_PERIOD = None  # TODO(USER)',
+            'def configure_domain(',
+        ),
+    ))
+
+    results.append(_result(
+        "global.shared_init_calendar_contract",
+        "def mjjas_mon_thu(" in init_calendar
+        and "W34_LEADS: Tuple[int, ...] = tuple(range(15, 29))" in init_calendar
+        and "require_full_w34: bool = True" in init_calendar
+        and "from init_calendar import mjjas_mon_thu" in ens_download
+        and "from init_calendar import MJJAS_MONTHS, mjjas_mon_thu" in exceed,
+        "Downloader and evaluation import one full-W34-valid MJJAS initialization calendar",
+    ))
+
+    results.append(_result(
+        "global.area_weight_helper_contract",
+        "def area_weights(lat):" in spatial_weights
+        and "torch.cos(torch.deg2rad(values))" in spatial_weights
+        and "np.cos(np.deg2rad(values))" in spatial_weights
+        and "def weighted_spatial_mean(" in spatial_weights,
+        "Shared NumPy/PyTorch cosine-latitude weighting helpers are present",
     ))
 
     results.append(_result(

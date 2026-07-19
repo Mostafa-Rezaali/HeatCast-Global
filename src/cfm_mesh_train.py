@@ -224,13 +224,45 @@ class FlowMatching(nn.Module):
 # CONFIGURATION
 # ======================================================================================
 class Config:
-    # ==================== DATA PATHS ====================
-    TRAINING_DATA_PATH = '/blue/nessie/mostafarezaali/Teleconnection/VDM_Training_Data_Extended_v2.nc'
-    TARGET_VARIABLE_CANDIDATES = ("t2m_prism", "HeatIndex")
-    OUTPUT_DIR = os.environ.get(
-        "HEATCAST_OUTPUT_DIR",
-        "/blue/nessie/mostafarezaali/Teleconnection/",
+    # ==================== DOMAIN AND SCIENTIFIC MODE ====================
+    VALID_DOMAINS = ("conus", "global")
+    DOMAIN = os.environ.get("HEATCAST_DOMAIN", "global").strip().lower()
+    DATA_ROOT = "/blue/nessie/mostafarezaali/HeatCastGlobal/"
+    CONUS_DATA_ROOT = "/blue/nessie/mostafarezaali/Teleconnection/"
+    RESOLUTION_SPECS = {
+        "1.5deg": {"shape": (121, 240), "mesh_level": 5},
+        "0.25deg": {"shape": (721, 1440), "mesh_level": 6},
+    }
+    RESOLUTION = os.environ.get("HEATCAST_RESOLUTION", "1.5deg")
+    MESH_LEVEL = RESOLUTION_SPECS[RESOLUTION]["mesh_level"]
+    TARGET_MODES = ("zscore_persistence", "climatology_anomaly")
+    TARGET_MODE = os.environ.get(
+        "HEATCAST_TARGET_MODE",
+        "climatology_anomaly" if DOMAIN == "global" else "zscore_persistence",
     )
+    PRECISION = os.environ.get("HEATCAST_PRECISION", "fp32")
+    GRAD_CHECKPOINT = False
+    GRAD_ACCUM = 1
+    SMOKE_TEST = False
+    PRIMARY_HEMISPHERE = "north"
+    PRIMARY_LAND_ONLY = True
+    PRIMARY_SEASON_MONTHS = (5, 6, 7, 8, 9)
+    ENABLE_GLOBAL_LOCAL_WARM_SEASON_SUPPLEMENT = False
+    ENABLE_HEAT_INDEX = False
+    CV_FOLD_YEARS = None  # TODO(USER): pin exact five-fold years for 1979-2024.
+    ENS_COMPARISON_PERIOD = None  # TODO(USER): pin after ECMWF cycle metadata is approved.
+
+    # ==================== DATA PATHS ====================
+    CONUS_TRAINING_DATA_PATH = os.path.join(CONUS_DATA_ROOT, "VDM_Training_Data_Extended_v2.nc")
+    GLOBAL_TRAINING_DATA_PATH = os.path.join(DATA_ROOT, "cache", f"era5_{RESOLUTION}.zarr")
+    TRAINING_DATA_PATH = (
+        GLOBAL_TRAINING_DATA_PATH if DOMAIN == "global" else CONUS_TRAINING_DATA_PATH
+    )
+    TARGET_VARIABLE_CANDIDATES = (
+        ("t2m_daily_max", "tmax") if DOMAIN == "global" else ("t2m_prism", "HeatIndex")
+    )
+    OUTPUT_DIR_OVERRIDE = os.environ.get("HEATCAST_OUTPUT_DIR")
+    OUTPUT_DIR = OUTPUT_DIR_OVERRIDE or (DATA_ROOT if DOMAIN == "global" else CONUS_DATA_ROOT)
     CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")
     PLOTS_DIR = os.path.join(OUTPUT_DIR, "test_prediction_plots")
 
@@ -240,12 +272,13 @@ class Config:
     MONITOR_MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, "trained_cfm_direct15_best_monitor.pth")
 
     # ==================== GLOBAL DATA PATHS ====================
-    GLOBAL_DATA_PATH = '/blue/nessie/mostafarezaali/Teleconnection/Global_Coarse_Conditions_Extended.nc'
+    CONUS_GLOBAL_DATA_PATH = os.path.join(CONUS_DATA_ROOT, "Global_Coarse_Conditions_Extended.nc")
+    GLOBAL_DATA_PATH = None if DOMAIN == "global" else CONUS_GLOBAL_DATA_PATH
     EXTENDED_GLOBAL_VARIABLES_PATH = os.path.join(
         OUTPUT_DIR, "data_cache", "extended_global_variables.txt"
     )
-    USE_EXTENDED_GLOBAL_FIELDS = True
-    REQUIRE_EXTENDED_GLOBAL_FIELDS = True
+    USE_EXTENDED_GLOBAL_FIELDS = DOMAIN == "conus"
+    REQUIRE_EXTENDED_GLOBAL_FIELDS = DOMAIN == "conus"
     EXPECTED_NUM_GLOBAL_CHANNELS = 59
     GLOBAL_VARIABLES = [
         'sst',
@@ -263,21 +296,21 @@ class Config:
     GLOBAL_DECOMPOSE_LOW_RESIDUAL = True
     GLOBAL_LOWPASS_WINDOW_DAYS = 20
     GLOBAL_COMPONENT_NAMES = ("low20", "residual")
-    NUM_GLOBAL_CHANNELS = (
-        EXPECTED_NUM_GLOBAL_CHANNELS
-        * len(GLOBAL_LAG_DAYS)
+    NUM_GLOBAL_CHANNELS = 0 if DOMAIN == "global" else (
+        EXPECTED_NUM_GLOBAL_CHANNELS * len(GLOBAL_LAG_DAYS)
         * (len(GLOBAL_COMPONENT_NAMES) if GLOBAL_DECOMPOSE_LOW_RESIDUAL else 1)
     )
 
     # Train on the daily day-15 z-score field. Train-year-only local daily
     # climatology is still built for TAC verification, not used as the target.
-    TRAIN_ON_CLIMATOLOGY_ANOMALIES = False
+    TRAIN_ON_CLIMATOLOGY_ANOMALIES = TARGET_MODE == "climatology_anomaly"
     CLIMATOLOGY_WINDOW_DAYS = 30
-    PREDICT_PERSISTENCE_RESIDUAL = True
+    CLIMATOLOGY_HARMONICS = 4
+    PREDICT_PERSISTENCE_RESIDUAL = TARGET_MODE == "zscore_persistence"
 
     # ==================== MODEL ARCHITECTURE ====================
-    IMAGE_SIZE = (621, 1405)
-    IMAGE_CHANNELS = 1
+    IMAGE_SIZE = RESOLUTION_SPECS[RESOLUTION]["shape"] if DOMAIN == "global" else (621, 1405)
+    IMAGE_CHANNELS = 2 if DOMAIN == "global" else 1
     # Additional slow-state local memory channels. These are normalized exactly
     # like their current-day counterparts and appended to spatial_c.
     LOCAL_LAG_DAYS = (7, 14)
@@ -285,18 +318,18 @@ class Config:
     NUM_LOCAL_LAG_CHANNELS = len(LOCAL_LAG_DAYS) * len(LOCAL_LAG_VARIABLES)
     # spatial_c = physics(9) + local_lags(6) + topo/lat/lon/doy/toa/mask(7) = 22
     # model input = [x_t(1), x_tm1(1), x_tm2(1), spatial_c(22)] = 25 (deterministic)
-    NUM_SPATIAL_CONDITIONS = 3 + 9 + NUM_LOCAL_LAG_CHANNELS + 7
+    NUM_SPATIAL_CONDITIONS = 26 if DOMAIN == "global" else 3 + 9 + NUM_LOCAL_LAG_CHANNELS + 7
     LEAD_TIME = 15             # Direct 15-day prediction (no rollout)
-    MULTI_LEAD_TUBE = False
-    PREDICTION_LEADS = (12, 13, 14, 15, 16, 17, 18)
+    MULTI_LEAD_TUBE = DOMAIN == "global"
+    PREDICTION_LEADS = tuple(range(15, 29)) if DOMAIN == "global" else (12, 13, 14, 15, 16, 17, 18)
     TUBE_LOSS_DAILY_WEIGHT = 0.80
-    TUBE_LOSS_CENTER_WEIGHT = 0.10
-    TUBE_LOSS_WEEKLY_WEIGHT = 0.10
+    TUBE_LOSS_CENTER_WEIGHT = 0.0 if DOMAIN == "global" else 0.10
+    TUBE_LOSS_WEEKLY_WEIGHT = 0.20 if DOMAIN == "global" else 0.10
     TUBE_TEMPORAL_HEADS = 4
     TUBE_DECODE_CHUNK_SIZE = 0
     GRADIENT_LOSS_WEIGHT = 0.0
-    DISTRIBUTIONAL_HEAD = False
-    CRPS_LOSS = False
+    DISTRIBUTIONAL_HEAD = DOMAIN == "global"
+    CRPS_LOSS = DOMAIN == "global"
     SIGMA_FLOOR = 0.1
     MSE_ANCHOR_WEIGHT = 0.0
     ENABLE_EXCEEDANCE_HEAD = False
@@ -306,7 +339,7 @@ class Config:
     EXCEEDANCE_FOCAL_GAMMA = 0.0
     EXCEEDANCE_INITIAL_PROB = 0.05
     ROLLOUT_STEPS = 1          # Single forward pass at inference
-    CONDITION_DIM = 5
+    CONDITION_DIM = 8 if DOMAIN == "global" else 5
 
     BASE_DIM = 64
     DIM_MULTS = (1, 2, 4, 8)
@@ -342,7 +375,7 @@ class Config:
     WARMUP_EPOCHS = 10
     MAX_TRAIN_BATCHES = None
     USE_VALIDATION_PATIENCE = True
-    EARLY_STOP_METRIC = "weekly7_tac"
+    EARLY_STOP_METRIC = "w34_tac" if DOMAIN == "global" else "weekly7_tac"
     EARLY_STOP_PATIENCE = 5
     EARLY_STOP_MIN_EPOCH = 12
     EARLY_STOP_MIN_DELTA = 1e-4
@@ -360,7 +393,7 @@ class Config:
     PAPER_HEAT_MAPS_PER_FOLD = 12
 
     # ==================== MESH CONFIG ====================
-    MESH_REFINEMENT_LEVEL = 7
+    MESH_REFINEMENT_LEVEL = MESH_LEVEL if DOMAIN == "global" else 7
     MESH_PROCESSOR_ROUNDS = 8
     MESH_LATENT_DIM = 128
     MESH_BUFFER_DEG = 5.0
@@ -381,6 +414,92 @@ class Config:
     # ==================== ANOMALY-CORRELATION LOSS ====================
     USE_ANOMALY_CORR_LOSS = False
     ANOMALY_CORR_LOSS_WEIGHT = 0.0
+
+
+def configure_domain(domain=None, resolution=None, target_mode=None, config=Config):
+    """Apply the global/CONUS switch and refresh every dependent config field."""
+    selected_domain = str(domain or config.DOMAIN).strip().lower()
+    if selected_domain not in config.VALID_DOMAINS:
+        raise ValueError(f"DOMAIN must be one of {config.VALID_DOMAINS}, got {selected_domain!r}.")
+    selected_resolution = str(resolution or config.RESOLUTION)
+    if selected_resolution not in config.RESOLUTION_SPECS:
+        raise ValueError(
+            f"RESOLUTION must be one of {tuple(config.RESOLUTION_SPECS)}, got {selected_resolution!r}."
+        )
+    selected_target = target_mode
+    if selected_target is None and selected_domain != config.DOMAIN:
+        selected_target = "climatology_anomaly" if selected_domain == "global" else "zscore_persistence"
+    selected_target = str(selected_target or config.TARGET_MODE)
+    if selected_target not in config.TARGET_MODES:
+        raise ValueError(f"TARGET_MODE must be one of {config.TARGET_MODES}, got {selected_target!r}.")
+    if selected_domain == "global" and selected_target == "zscore_persistence":
+        # Supported for controlled comparisons; persistence residual semantics remain intact.
+        pass
+
+    config.DOMAIN = selected_domain
+    config.RESOLUTION = selected_resolution
+    config.TARGET_MODE = selected_target
+    config.MESH_LEVEL = int(config.RESOLUTION_SPECS[selected_resolution]["mesh_level"])
+    config.MESH_REFINEMENT_LEVEL = config.MESH_LEVEL if selected_domain == "global" else 7
+    config.IMAGE_SIZE = (
+        tuple(config.RESOLUTION_SPECS[selected_resolution]["shape"])
+        if selected_domain == "global" else (621, 1405)
+    )
+    config.TRAINING_DATA_PATH = (
+        os.path.join(config.DATA_ROOT, "cache", f"era5_{selected_resolution}.zarr")
+        if selected_domain == "global" else config.CONUS_TRAINING_DATA_PATH
+    )
+    config.TARGET_VARIABLE_CANDIDATES = (
+        ("t2m_daily_max", "tmax") if selected_domain == "global" else ("t2m_prism", "HeatIndex")
+    )
+    config.OUTPUT_DIR = config.OUTPUT_DIR_OVERRIDE or (
+        config.DATA_ROOT if selected_domain == "global" else config.CONUS_DATA_ROOT
+    )
+    config.EXTENDED_GLOBAL_VARIABLES_PATH = os.path.join(
+        config.OUTPUT_DIR, "data_cache", "extended_global_variables.txt"
+    )
+    config.GLOBAL_DATA_PATH = None if selected_domain == "global" else config.CONUS_GLOBAL_DATA_PATH
+    config.USE_EXTENDED_GLOBAL_FIELDS = selected_domain == "conus"
+    config.REQUIRE_EXTENDED_GLOBAL_FIELDS = selected_domain == "conus"
+    config.NUM_GLOBAL_CHANNELS = 0 if selected_domain == "global" else (
+        config.EXPECTED_NUM_GLOBAL_CHANNELS * len(config.GLOBAL_LAG_DAYS)
+        * (len(config.GLOBAL_COMPONENT_NAMES) if config.GLOBAL_DECOMPOSE_LOW_RESIDUAL else 1)
+    )
+    config.TRAIN_ON_CLIMATOLOGY_ANOMALIES = selected_target == "climatology_anomaly"
+    config.PREDICT_PERSISTENCE_RESIDUAL = selected_target == "zscore_persistence"
+    config.NUM_SPATIAL_CONDITIONS = (
+        26 if selected_domain == "global"
+        else 3 + 9 + config.NUM_LOCAL_LAG_CHANNELS + 7
+    )
+    config.CONDITION_DIM = 8 if selected_domain == "global" else 5
+    if selected_domain == "global":
+        config.MULTI_LEAD_TUBE = True
+        config.PREDICTION_LEADS = tuple(range(15, 29))
+        config.TUBE_LOSS_DAILY_WEIGHT = 0.80
+        config.TUBE_LOSS_CENTER_WEIGHT = 0.0
+        config.TUBE_LOSS_WEEKLY_WEIGHT = 0.20
+        config.DISTRIBUTIONAL_HEAD = True
+        config.CRPS_LOSS = True
+        config.IMAGE_CHANNELS = 2
+        config.EARLY_STOP_METRIC = "w34_tac"
+    else:
+        config.MULTI_LEAD_TUBE = False
+        config.PREDICTION_LEADS = (12, 13, 14, 15, 16, 17, 18)
+        config.TUBE_LOSS_DAILY_WEIGHT = 0.80
+        config.TUBE_LOSS_CENTER_WEIGHT = 0.10
+        config.TUBE_LOSS_WEEKLY_WEIGHT = 0.10
+        config.DISTRIBUTIONAL_HEAD = False
+        config.CRPS_LOSS = False
+        config.IMAGE_CHANNELS = 1
+        config.EARLY_STOP_METRIC = "weekly7_tac"
+
+    config.CHECKPOINT_DIR = os.path.join(config.OUTPUT_DIR, "checkpoints")
+    config.PLOTS_DIR = os.path.join(config.OUTPUT_DIR, "test_prediction_plots")
+    config.OUTPUT_NC_FILE = os.path.join(config.OUTPUT_DIR, "CFM_Forecasts_Improved.nc")
+    config.HINDCAST_STATS_DIR = os.path.join(config.OUTPUT_DIR, "hindcast_stats")
+    config.HINDCAST_PAPER_DIR = os.path.join(config.OUTPUT_DIR, "hindcast_paper_data")
+    config.TRAINING_METRICS_DIR = os.path.join(config.OUTPUT_DIR, "training_metrics")
+    return config
 
 
 def global_base_channel_count(config=Config):
@@ -513,6 +632,8 @@ def parse_int_tuple(text):
 
 def early_stop_score(metric_name, improved_metrics, val_mse, val_ssim):
     metric_name = str(metric_name).lower()
+    if metric_name == "w34_tac":
+        return float(improved_metrics.get("w34_tac", improved_metrics.get("tube_weekly7_tac", float("nan"))))
     if metric_name == "tac":
         return float(improved_metrics.get("tac", float("nan")))
     if metric_name == "weekly7_tac":
@@ -4555,6 +4676,12 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
 # ======================================================================================
 def main():
     parser = argparse.ArgumentParser(description='MeshFlowNet Direct 15-Day Prediction')
+    parser.add_argument('--domain', choices=Config.VALID_DOMAINS, default=None,
+                       help='Select the preserved CONUS path or the global ERA5 path.')
+    parser.add_argument('--resolution', choices=tuple(Config.RESOLUTION_SPECS), default=None,
+                       help='Configured global latitude-longitude resolution.')
+    parser.add_argument('--target_mode', choices=Config.TARGET_MODES, default=None,
+                       help='Fold-safe target transformation; global default is climatology_anomaly.')
     parser.add_argument('--mode', type=str, default='train',
                        choices=['train', 'test', 'visualize', 'resume', 'export_hindcast'])
     parser.add_argument('--checkpoint', type=str, default=None)
@@ -4634,7 +4761,7 @@ def main():
     parser.add_argument('--early_stop_patience', type=int, default=None,
                        help='Stop after this many validation checks without monitor improvement.')
     parser.add_argument('--early_stop_metric', type=str, default=None,
-                       choices=['tube_weekly7_tac', 'weekly7_tac', 'tac', 'r2', 'mse_skill', 'spatial_anom_r2', 'exceedance_bss', 'ssim', 'val_mse'],
+                       choices=['w34_tac', 'tube_weekly7_tac', 'weekly7_tac', 'tac', 'r2', 'mse_skill', 'spatial_anom_r2', 'exceedance_bss', 'ssim', 'val_mse'],
                        help='Validation metric used for patience; larger is better except val_mse is internally negated.')
     parser.add_argument('--early_stop_min_epoch', type=int, default=None,
                        help='Do not count patience failures before this epoch.')
@@ -4672,6 +4799,8 @@ def main():
                        help='Number of largest heat-anomaly-area maps to save per fold.')
 
     args = parser.parse_args()
+
+    configure_domain(args.domain, args.resolution, args.target_mode, Config)
 
     if args.dry_run:
         Config.MAX_EPOCHS = 1

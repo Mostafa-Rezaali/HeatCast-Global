@@ -61,7 +61,7 @@ Phase B is not a separate model implementation.
 | Phase | Deliverable | State |
 |---:|---|---|
 | 0 | Duplicate/rebrand, artifact policy, baseline CI | Complete |
-| 1 | Domain config, calendar, area weighting, window math | Planned |
+| 1 | Domain config, calendar, area weighting, window math | Complete |
 | 2 | ERA5 download/regrid/zarr cache and data-build Slurm | Planned |
 | 3 | Global spherical mesh/connectivity and memory flags | Planned |
 | 4 | Fold-safe anomaly target, global inputs, CPU smoke test | Planned |
