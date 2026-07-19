@@ -138,6 +138,7 @@ def test_lazy_dataset_opens_only_on_getitem_and_reads_bounded_times():
     metadata = {
         "shape": list(logical.shape),
         "channels": list(CACHE_CHANNELS),
+        "time_values": [20000101] * logical.shape[0],
     }
     dataset = LazyGlobalZarrDataset(
         "logical.zarr", (100,), opener=opener, metadata=metadata

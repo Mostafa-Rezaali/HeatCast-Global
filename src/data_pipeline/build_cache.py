@@ -373,6 +373,7 @@ def write_zarr_cache(
         "target_source": str(target_source),
         "target_statistic": "daily maximum 2m_temperature",
         "utc_days": True,
+        "time_values": [int(value) for value in np.asarray(time[:], dtype=np.int32).tolist()],
     }
     root.attrs.update(metadata)
     metadata_path(path).write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
@@ -403,6 +404,7 @@ class LazyGlobalZarrDataset(Dataset):
             metadata_path(Path(store_path)).read_text(encoding="utf-8")
         )
         self.channels = tuple(self.metadata["channels"])
+        self.time_values = tuple(int(value) for value in self.metadata.get("time_values", ()))
         self.tmax_channel = self.channels.index("tmax")
         n_times = int(self.metadata["shape"][0])
         for index in self.init_indices:
@@ -439,10 +441,19 @@ class LazyGlobalZarrDataset(Dataset):
         target_indices = [init_index + lead for lead in self.prediction_leads]
         context = np.asarray(data.oindex[history_indices, :, :, :], dtype=np.float32)
         target = np.asarray(data.oindex[target_indices, :, :, self.tmax_channel], dtype=np.float32)
+        if len(self.time_values) == int(self.metadata["shape"][0]):
+            history_dates = tuple(self.time_values[index] for index in history_indices)
+            target_dates = tuple(self.time_values[index] for index in target_indices)
+        else:
+            time = root["time"]
+            history_dates = tuple(int(value) for value in np.asarray(time.oindex[history_indices]).tolist())
+            target_dates = tuple(int(value) for value in np.asarray(time.oindex[target_indices]).tolist())
         return {
             "context": torch.from_numpy(context),
             "target": torch.from_numpy(target),
             "init_index": init_index,
+            "history_dates": history_dates,
+            "target_dates": target_dates,
         }
 
 

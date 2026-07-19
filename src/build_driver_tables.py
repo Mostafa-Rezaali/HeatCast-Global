@@ -25,10 +25,10 @@ def sanitize_index_name(name: str) -> str:
     return clean
 
 
-def parse_rmm_file(path: Path) -> Dict[int, Tuple[int, float]]:
+def _parse_rmm_rows(path: Path) -> Dict[int, Tuple[float, float, int, float]]:
     if not path.exists():
         raise FileNotFoundError(f"Missing BOM RMM file: {path}")
-    output: Dict[int, Tuple[int, float]] = {}
+    output: Dict[int, Tuple[float, float, int, float]] = {}
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         parts = line.split()
         if len(parts) < 7:
@@ -39,15 +39,27 @@ def parse_rmm_file(path: Path) -> Dict[int, Tuple[int, float]]:
             # year month day RMM1 RMM2 phase amplitude [optional source/method].
             # Recent files append a method label after amplitude, so phase and
             # amplitude must be read by position rather than from the line end.
+            rmm1 = float(parts[3])
+            rmm2 = float(parts[4])
             phase = int(float(parts[5]))
             amplitude = float(parts[6])
             key = int(f"{year:04d}{month:02d}{day:02d}")
         except ValueError:
             continue
-        output[key] = (phase, amplitude)
+        output[key] = (rmm1, rmm2, phase, amplitude)
     if not output:
         raise RuntimeError(f"No RMM observations parsed from {path}")
     return output
+
+
+def parse_rmm_file(path: Path) -> Dict[int, Tuple[int, float]]:
+    """Return the existing driver-table phase/amplitude representation."""
+    return {key: (values[2], values[3]) for key, values in _parse_rmm_rows(path).items()}
+
+
+def parse_rmm_components_file(path: Path) -> Dict[int, Tuple[float, float, float]]:
+    """Return RMM1, RMM2, and amplitude for model vector conditioning."""
+    return {key: (values[0], values[1], values[3]) for key, values in _parse_rmm_rows(path).items()}
 
 
 def parse_nino34_file(path: Path) -> Dict[Tuple[int, int], float]:

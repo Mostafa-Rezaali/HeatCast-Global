@@ -51,3 +51,6 @@ jobs:
         else
           echo "No pytest tests found; skipping pytest."
         fi
+    - name: Run global CPU smoke test
+      run: |
+        python src/cfm_mesh_train.py --smoke_test

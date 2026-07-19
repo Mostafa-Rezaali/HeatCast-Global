@@ -1,113 +1,115 @@
-# HeatCast Model Inputs
+# HeatCast-Global Model Inputs
 
-The model call is:
+This file is the authoritative channel contract for both `Config.DOMAIN`
+modes. Global mode is the repository default. All time-varying normalization
+and climatology statistics are fitted from the active fold's training years
+only.
+
+## Global ERA5 mode (default)
+
+The model call remains:
 
 ```python
-model(x_input, dummy_t, vec_c, global_fields=global_fields)
+model(x_input, dummy_t, vec_c, global_fields=None)
 ```
 
-where `dummy_t = 0.5` is just a constant model-time embedding in deterministic mode.
+`dummy_t = 0.5` is the fixed direct-inference time embedding. The separate
+59-field coarse-global encoder is disabled (`NUM_GLOBAL_CHANNELS = 0`) because
+the fine grid is itself global.
 
-**Local CONUS grid input: 19 channels**
+### Fine-grid input: 26 channels
 
-`x_input = [x_t, x_t-1, x_t-2, spatial_c]`
+`x_input = [x_t, x_t-1, x_t-2, spatial_c]` on the configured `lat x lon` grid.
+`A` denotes subtraction of a four-harmonic day-of-year climatology fitted per
+grid cell from training years only, followed by fold-safe normalization.
 
-1. `t2m_prism[t]`
-2. `t2m_prism[t-1]`
-3. `t2m_prism[t-2]`
-4. `geopotential[t]`
-5. `soil_moisture[t]`
-6. `sea_level_pressure[t]`
-7. `temperature_2m[t]`
-8. `specific_humidity_850[t]`
-9. `temperature_850[t]`
-10. `u_wind_850[t]`
-11. `v_wind_850[t]`
-12. `geopotential_300[t]`
+1. ERA5 daily Tmax at `t` (`A`)
+2. ERA5 daily Tmax at `t-1` (`A`)
+3. ERA5 daily Tmax at `t-2` (`A`)
+4. daily-mean `t2m` at `t` (`A`)
+5. `swvl1` at `t` (`A`)
+6. `swvl1` trailing 20-day mean (`A`)
+7. `swvl2` trailing 20-day mean (`A`)
+8. SST at `t`, zero-filled where invalid (`A`)
+9. SST validity mask
+10. z500 at `t` (`A`)
+11. z500 trailing low20 component (`A`)
+12. MSLP at `t` (`A`)
+13. t850 at `t` (`A`)
+14. q850 at `t`
+15. u850 at `t`
+16. v850 at `t`
+17. z300 at `t`
+18. orography (ERA5 surface geopotential divided by `g`)
+19. land-sea mask
+20. sine latitude
+21. cosine latitude
+22. sine longitude
+23. cosine longitude
+24. day-of-year sine
+25. day-of-year cosine
+26. daily-mean TOA insolation at `t`, scaled by the solar constant
+
+The external zarr cache stores 17 physical fields. Lagged Tmax and the nine
+positional/calendar/insolation channels are assembled lazily per sample. The
+store is opened inside each Dataset worker, never in the parent process, and
+has `time=1` chunks.
+
+### Vector input: 8 channels
+
+1--5. the existing five configured teleconnection indices
+6. MJO RMM1
+7. MJO RMM2
+8. MJO amplitude
+
+RMM values use the parser shared with `build_driver_tables.py`; the model path
+does not implement a second parser. Vector normalization uses only the active
+fold's training indices.
+
+### Global target and outputs
+
+- Target: ERA5 daily maximum 2 m temperature for UTC days.
+- Default target mode: `climatology_anomaly`.
+- Climatology: intercept plus the first four annual sine/cosine harmonics per
+  grid cell, fitted from training years only.
+- Persistence residual: disabled in the default anomaly mode.
+- Leads: exactly `15...28`, emitted as a 14-lead mean/sigma tube.
+- Continuous aggregates: week 3 (`15...21`), week 4 (`22...28`), and W34
+  (`15...28`).
+
+## CONUS compatibility mode
+
+`DOMAIN=conus` retains the original PRISM target, z-score plus persistence
+residual semantics, regional mesh, five vector indices, and separate coarse
+global conditioning.
+
+The base CONUS local stack remains the original 19 channels:
+
+1. PRISM T2max at `t`
+2. PRISM T2max at `t-1`
+3. PRISM T2max at `t-2`
+4. geopotential
+5. soil moisture
+6. sea-level pressure
+7. 2 m temperature
+8. q850
+9. t850
+10. u850
+11. v850
+12. z300
 13. topography
 14. latitude
 15. longitude
-16. day-of-year sine at `t`
-17. day-of-year cosine at `t`
-18. TOA insolation at `t`
+16. day-of-year sine
+17. day-of-year cosine
+18. TOA insolation
 19. land mask
 
-**Vector input: 5 channels**
+The current compatibility implementation can additionally enable six existing
+slow local-lag channels (`t2max`, soil moisture, and 2 m temperature at lags 7
+and 14), producing 25 deterministic input channels. This is preserved behavior,
+not part of the global redesign.
 
-- `CondTrain[:, t]`: your 5 teleconnection indices at time `t`
-
-**Global ERA5/coarse input: 59 channels**
-
-Original 9:
-
-1. `sst`
-2. `olr`
-3. `geopotential_200`
-4. `u_wind_200`
-5. `total_column_water_vapour`
-6. `v_wind_200`
-7. `geopotential_500`
-8. `temperature_850`
-9. `temperature_2m_global`
-
-Extended 50:
-
-10. `era5_z_1000`
-11. `era5_z_925`
-12. `era5_z_850`
-13. `era5_z_700`
-14. `era5_z_500`
-15. `era5_z_300`
-16. `era5_z_250`
-17. `era5_z_200`
-18. `era5_z_100`
-19. `era5_z_10`
-20. `era5_u_1000`
-21. `era5_u_925`
-22. `era5_u_850`
-23. `era5_u_700`
-24. `era5_u_500`
-25. `era5_u_300`
-26. `era5_u_250`
-27. `era5_u_200`
-28. `era5_u_100`
-29. `era5_u_10`
-30. `era5_v_1000`
-31. `era5_v_925`
-32. `era5_v_850`
-33. `era5_v_700`
-34. `era5_v_500`
-35. `era5_v_300`
-36. `era5_v_250`
-37. `era5_v_200`
-38. `era5_v_100`
-39. `era5_v_10`
-40. `era5_t_1000`
-41. `era5_t_925`
-42. `era5_t_850`
-43. `era5_t_700`
-44. `era5_t_500`
-45. `era5_t_300`
-46. `era5_t_250`
-47. `era5_t_200`
-48. `era5_t_100`
-49. `era5_t_10`
-50. `era5_q_1000`
-51. `era5_q_925`
-52. `era5_q_850`
-53. `era5_q_700`
-54. `era5_q_500`
-55. `era5_msl`
-56. `era5_sp`
-57. `era5_sst`
-58. `era5_tcwv`
-59. `era5_t2m`
-
-**Targets and outputs, not inputs**
-
-- Daily PRISM T2max z-score fields at leads `t+15` through `t+28`.
-- The distributional head emits a mean and positive sigma for every lead and
-  land pixel.
-- W34 continuous verification averages the 14 daily target and mean fields.
-- W34 exceedance truth compares that 14-day observed mean with a
-  train-year-only, center-month, per-pixel q95 threshold.
+The CONUS coarse-global stack remains 59 ERA5 variables decomposed into
+`low20` and `residual` components (118 channels). Its variable inventory and
+decomposition code are unchanged and are disabled only when `DOMAIN=global`.

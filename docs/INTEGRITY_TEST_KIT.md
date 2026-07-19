@@ -31,6 +31,11 @@ not merely that Python files compile.
   uses XYZ node/edge features, connects every grid cell including poles and
   the longitude seam, and supports optional processor checkpointing, bf16, and
   gradient accumulation without changing Phase A defaults.
+- Global climatology uses exactly four annual harmonics and training years
+  only; the poisoning test protects both coefficients and normalization.
+- The 26 fine-grid and 8 vector channels are assembled from worker-local cache
+  slices, and CI runs a two-step `121 x 240` distributional CPU smoke test with
+  sampling and NetCDF export verification.
 
 ## Commands
 

@@ -283,6 +283,50 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "Phase A fp32 defaults and config-gated bf16/checkpoint/accumulation paths are explicit",
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "global.fold_safe_climatology_contract",
+        "src/global_targets.py",
+        (
+            "DEFAULT_HARMONICS = 4",
+            "if parsed.year not in train_year_set:",
+            "gram += np.outer(feature, feature)",
+            "np.linalg.solve(regularized",
+            "def fit_fold_preprocessor_from_zarr(",
+            "daily = np.asarray(data[index, :, :, :]",
+            '"fold_safe": True',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.input_stack_contract",
+        "src/global_dataset.py",
+        (
+            "GLOBAL_INPUT_CHANNELS: Tuple[str, ...]",
+            "VECTOR_INPUT_CHANNELS: Tuple[str, ...]",
+            "if len(spatial) != 23:",
+            '"global_fields": torch.empty((0,)',
+            "class GlobalHeatCastDataset(LazyGlobalZarrDataset):",
+            "parse_rmm_components_file",
+            "normalize_condition_vectors(",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.cpu_smoke_contract",
+        "src/global_smoke_test.py",
+        (
+            'grid = grid_for_resolution("1.5deg")',
+            "for _ in range(2):",
+            "sampled_member = mean + sigma * torch.randn_like(mean)",
+            "_export_dry_run(",
+            '"grid_shape": list(grid.shape)',
+            '"train_steps": 2',
+        ),
+    ))
+
     results.append(_result(
         "distributional.grid_refiner_mean_only",
         "mean_raw + self.grid_refiner(mean_raw)" in mesh
@@ -728,6 +772,11 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "ci.runs_integrity_and_pytest",
         "python src/repo_integrity.py" in workflow and "pytest" in workflow,
         "GitHub Actions runs the contract audit and pytest",
+    ))
+    results.append(_result(
+        "ci.runs_global_cpu_smoke",
+        "python src/cfm_mesh_train.py --smoke_test" in workflow,
+        "GitHub Actions runs the true-shape global CPU smoke test",
     ))
     return results
 

@@ -256,6 +256,8 @@ class Config:
     # ==================== DATA PATHS ====================
     CONUS_TRAINING_DATA_PATH = os.path.join(CONUS_DATA_ROOT, "VDM_Training_Data_Extended_v2.nc")
     GLOBAL_TRAINING_DATA_PATH = os.path.join(DATA_ROOT, "cache", f"era5_{RESOLUTION}.zarr")
+    GLOBAL_TELECONNECTION_VECTOR_PATH = os.path.join(DATA_ROOT, "cache", "teleconnection_5.npy")
+    GLOBAL_RMM_PATH = os.path.join(DATA_ROOT, "drivers", "rmm.txt")
     TRAINING_DATA_PATH = (
         GLOBAL_TRAINING_DATA_PATH if DOMAIN == "global" else CONUS_TRAINING_DATA_PATH
     )
@@ -4784,6 +4786,8 @@ def main():
                        help='Initial exceedance-head probability bias.')
     parser.add_argument('--dry_run', action='store_true',
                        help='Run a tiny one-GPU smoke/proxy pass: 1 epoch, 2 train batches, 4 validation samples.')
+    parser.add_argument('--smoke_test', action='store_true',
+                       help='Run the data-free 121x240 global CPU integration smoke test and exit.')
     parser.add_argument('--epochs', type=int, default=None,
                        help='Override max epochs.')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -4855,6 +4859,13 @@ def main():
         if args.grad_accum < 1:
             raise ValueError("--grad_accum must be at least one.")
         Config.GRAD_ACCUM = int(args.grad_accum)
+    if args.smoke_test:
+        Config.SMOKE_TEST = True
+        if Config.DOMAIN != "global" or Config.RESOLUTION != "1.5deg":
+            raise ValueError("--smoke_test requires --domain global --resolution 1.5deg.")
+        from global_smoke_test import run_global_smoke_test
+        run_global_smoke_test(seed=Config.SEED)
+        return
 
     if args.dry_run:
         Config.MAX_EPOCHS = 1
