@@ -24,6 +24,9 @@ CURRENT_SUBMISSIONS = (
     "slurm/submit_ens_widen_cycles.slurm",
     "slurm/submit_export_w34_stack_netcdf.slurm",
     "slurm/submit_global_data_build.slurm",
+    "slurm/submit_global_ens_cycles.slurm",
+    "slurm/submit_global_w34_eval_stitch.slurm",
+    "slurm/submit_global_w34_tube_all.slurm",
     "slurm/submit_paper_evidence_blocks.slurm",
     "slurm/submit_paper_figures_journal.slurm",
     "slurm/submit_teleconnection_stack_analysis.slurm",
@@ -445,6 +448,46 @@ def audit_repository(root: Path) -> list[CheckResult]:
 
     results.append(_required_tokens_check(
         root,
+        "global.fold_decision_contract",
+        "src/fold_config.py",
+        (
+            "GLOBAL_YEARS: Tuple[int, ...] = tuple(range(1979, 2025))",
+            "Global fold JSON must contain exactly five records",
+            "train/calibration/test years overlap",
+            "Five global test folds must partition 1979-2024 exactly once",
+            "def comparison_period(",
+            "ens_comparison_period",
+        ),
+    ))
+
+    results.append(_result(
+        "global.production_training_data_contract",
+        "def prepare_global_training_datasets(" in cfm
+        and "fit_fold_preprocessor_from_zarr(" in cfm
+        and 'GlobalHeatCastDataset(store_path, train_indices' in cfm
+        and '"valid_indices_override"' in cfm
+        and "Global production requires --fold_years_json" in cfm
+        and 'if config.DOMAIN == "global":' in cfm
+        and "return self._global_delegate[idx]" in cfm,
+        "Production training uses approved folds, worker-lazy zarr datasets, and fold-safe preprocessing",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.streaming_sidecar_contract",
+        "src/build_global_fold_sidecars.py",
+        (
+            "Build fold-safe global normalization and window-threshold sidecars lazily",
+            "np.memmap(",
+            "block_pixels",
+            "np.nanquantile(block",
+            "save_fold_window_statistics(",
+            "require_conditions=False",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
         "global.cpu_smoke_contract",
         "src/global_smoke_test.py",
         (
@@ -454,6 +497,82 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "_export_dry_run(",
             '"grid_shape": list(grid.shape)',
             '"train_steps": 2',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.training_submission_contract",
+        "slurm/submit_global_w34_tube_all.slurm",
+        (
+            "--gres=gpu:8",
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/",
+            "module load cuda/12.9.1",
+            "FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER)",
+            "--domain global",
+            "--target_mode climatology_anomaly",
+            "--prediction_leads \"$LEADS\"",
+            "--tube_loss_daily_weight 0.80",
+            "--tube_loss_weekly_weight 0.20",
+            "--early_stop_metric w34_tac",
+            "submit_global_w34_eval_stitch.slurm",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.evaluation_submission_contract",
+        "slurm/submit_global_w34_eval_stitch.slurm",
+        (
+            "--gres=gpu:1",
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/",
+            "15,16,17,18,19,20,21",
+            "22,23,24,25,26,27,28",
+            "src/stitch_exceedance_folds.py",
+            "src/build_driver_tables.py",
+            "src/forecasts_of_opportunity.py",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.ens_submission_contract",
+        "slurm/submit_global_ens_cycles.slurm",
+        (
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/",
+            "ECMWF_CYCLE_SPECS=${ECMWF_CYCLE_SPECS:?TODO(USER)",
+            "comparison_period",
+            "--expected_members \"$MEMBERS\"",
+            "--comparison_years \"$COMPARISON_YEARS\"",
+            "src/ens_heatcast_stack_opportunity.py",
+            "src/export_w34_stack_netcdf.py",
+        ),
+    ))
+    global_ens_submission = _text(root, "slurm/submit_global_ens_cycles.slurm")
+    results.append(_result(
+        "global.ens_submission_cpu_only",
+        "--gres=" not in global_ens_submission,
+        "Global ENS ingest/scoring/comparison is CPU-only and requests no GPU",
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.runbook_contract",
+        "docs/RUNBOOK.md",
+        (
+            "Resolve the scientific gates",
+            "submit_global_data_build.slurm",
+            "submit_global_w34_tube_all.slurm",
+            "submit_global_w34_eval_stitch.slurm",
+            "submit_global_ens_cycles.slurm",
+            "conditioned-ensemble envelope diagnostic",
+            "Phase B (`0.25deg`) checklist",
         ),
     ))
 

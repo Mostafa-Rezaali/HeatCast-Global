@@ -65,6 +65,11 @@ def yyyymmdd_from_time_value(value: float) -> int:
 
 
 def load_time_values(path: Path) -> np.ndarray:
+    if path.is_dir() and path.name.endswith(".zarr"):
+        from ens_target_grid import global_cache_time_axis
+
+        _, offsets, _ = global_cache_time_axis(path)
+        return offsets
     if not path.exists():
         raise FileNotFoundError(
             f"Missing time axis file: {path}. Expected data_cache/time_values.npy "
@@ -160,6 +165,7 @@ def load_land_metadata(config=None) -> Dict[str, np.ndarray]:
         lat_1d = np.asarray(root["lat"][:], dtype=np.float32)
         lon_1d = np.asarray(root["lon"][:], dtype=np.float32)
         mask = np.asarray(root["data"][0, :, :, CACHE_CHANNELS.index("land_mask")] >= 0.5, dtype=bool)
+        mask &= lat_1d[:, None] >= 0.0
         if mask.shape != (lat_1d.size, lon_1d.size):
             raise RuntimeError("Global cache land mask and coordinate shapes disagree.")
         lon2d, lat2d = np.meshgrid(lon_1d, lat_1d)
@@ -701,6 +707,9 @@ def write_netcdf(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", choices=("conus", "global"), default="global")
+    parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--training_data_path", default=None)
     parser.add_argument("--output", default="matlab_exports/w34_heatcast_ens_stack.nc")
     parser.add_argument("--heatcast_root", default="exceedance_eval_incremental")
     parser.add_argument("--ens_root", default="ens_exceedance_incremental")
@@ -734,8 +743,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    import cfm_mesh_train as cfm
+
+    cfm.configure_domain(args.domain, args.resolution, config=cfm.Config)
+    if args.training_data_path:
+        cfm.Config.TRAINING_DATA_PATH = str(Path(args.training_data_path))
     window_leads = ee.parse_int_list(args.window_leads)
-    time_values = load_time_values(Path(args.time_values_path))
+    time_path = Path(args.time_values_path)
+    if args.domain == "global" and args.time_values_path == "data_cache/time_values.npy":
+        time_path = Path(cfm.Config.TRAINING_DATA_PATH)
+    time_values = load_time_values(time_path)
     land_meta = load_land_metadata()
     fold_inputs = build_fold_inputs(args, window_leads)
     stackers = fit_crossfit_stackers(args, fold_inputs)

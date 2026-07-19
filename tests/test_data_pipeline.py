@@ -16,6 +16,7 @@ from data_pipeline.download_era5 import (
 )
 from data_pipeline.regrid import GridSpec, regrid_field
 from ens_target_grid import LazyGlobalChannel
+from global_dataset import GlobalHeatCastDataset, identity_preprocessor
 from spatial_weights import weighted_spatial_mean
 
 
@@ -196,3 +197,32 @@ def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path):
     selected = lazy_soil.read_pixels_times([0, 5], [0, 2])
     assert selected.shape == (2, 2)
     assert selected.tolist() == [[0.0, 2.0], [0.0, 2.0]]
+
+
+def test_global_training_dataset_preserves_date_labels_while_exposing_legacy_offsets(tmp_path: Path):
+    pytest.importorskip("zarr")
+    grid = GridSpec(np.array([45.0, -45.0]), np.array([0.0, 120.0, 240.0]), "fixture")
+
+    def daily(day):
+        fields = {name: np.full(grid.shape, float(day), dtype=np.float32) for name in CACHE_CHANNELS}
+        fields["land_mask"][:] = 1.0
+        fields["sst_valid"][:] = 1.0
+        return DailySlice(date(2000, 1, 1) + timedelta(days=day), fields)
+
+    store = tmp_path / "training.zarr"
+    write_zarr_cache(tuple(daily(day) for day in range(31)), store, grid, target_source="fixture")
+    dataset = GlobalHeatCastDataset(
+        store,
+        (2,),
+        condition_vectors=np.zeros((31, 8), dtype=np.float32),
+        preprocessor=identity_preprocessor(grid.shape),
+    )
+    assert dataset._store is None
+    sample = dataset[0]
+    assert sample[0].shape == (14, 2, 3)
+    assert sample[1].shape == (1, 2, 3)
+    assert sample[4].shape == (23, 2, 3)
+    assert sample[5].shape == (8,)
+    assert dataset.date_labels[2] == 20000103
+    assert dataset.time_values[2] == (date(2000, 1, 3) - date(1981, 5, 1)).days
+    assert np.allclose(sample[0][0].numpy(), 17.0)

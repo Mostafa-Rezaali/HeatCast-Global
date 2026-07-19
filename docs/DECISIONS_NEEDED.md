@@ -23,6 +23,11 @@ to infer a table.
 Affected interfaces: fold-specific climatology, normalization, percentile
 thresholds, hindcast export, and all pooled comparisons.
 
+Production jobs require the approved table through `FOLD_YEARS_JSON` (or
+`HEATCAST_FOLD_YEARS_JSON`). `src/fold_config.py` rejects missing roles,
+within-fold overlap, incomplete 1979--2024 coverage, or pooled test folds that
+do not partition all years exactly once.
+
 ## CDS credentials
 
 `TODO(USER)`: Install and validate the CDS API key in `~/.cdsapirc` on

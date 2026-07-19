@@ -22,8 +22,10 @@ pnpm-lock.yaml
 *.nc
 *.pkl
 *.zarr/
+*.zarr.sidecars/
 *.grib
 *.grib2
+*.dat
 cds_cache/
 data_cache/
 checkpoints/
@@ -31,6 +33,12 @@ test_prediction_plots/
 hindcast_stats/
 hindcast_paper_data/
 paper_figures/
+exports/
+drivers/fold_safe_tables/
+exceedance_eval*/
+ens_exceedance_incremental/
+ens_head_to_head*/
+ens_heatcast_stack_opportunity*/
 
 # Old model launch configurations; keep current W34/ENS/paper scripts tracked.
 submit_tube7_*.slurm

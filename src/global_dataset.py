@@ -8,7 +8,8 @@ fold-specific preprocessors fit from training years.
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Mapping, Sequence, Tuple
 
 import numpy as np
@@ -18,6 +19,7 @@ from build_driver_tables import parse_rmm_components_file
 from cfm_mesh_train import compute_toa_insolation
 from data_pipeline.build_cache import CACHE_CHANNELS, LazyGlobalZarrDataset
 from global_targets import FoldFieldPreprocessor, label_to_date
+from init_calendar import W34_LEADS, window_falls_in_months
 
 
 ANOMALY_CHANNELS: Tuple[str, ...] = (
@@ -49,6 +51,63 @@ VECTOR_INPUT_CHANNELS: Tuple[str, ...] = (
     "teleconnection_1", "teleconnection_2", "teleconnection_3",
     "teleconnection_4", "teleconnection_5", "rmm1", "rmm2", "mjo_amplitude",
 )
+BASE_DATE = datetime(1981, 5, 1)
+
+
+class ZeroClimatology:
+    """Lazy zero field used when targets already are climatology anomalies."""
+
+    def __init__(self, shape: Sequence[int]):
+        self.shape = tuple(int(value) for value in shape)
+
+    def __getitem__(self, day_of_year):
+        del day_of_year
+        return np.zeros(self.shape, dtype=np.float32)
+
+
+def load_global_cache_axis(store_path: Path):
+    """Read only cache coordinates/date labels and derive legacy day offsets."""
+    from data_pipeline.build_cache import _require_zarr
+
+    root = _require_zarr().open_group(str(store_path), mode="r")
+    labels = np.asarray(root["time"][:], dtype=np.int32)
+    lat = np.asarray(root["lat"][:], dtype=np.float32)
+    lon = np.asarray(root["lon"][:], dtype=np.float32)
+    offsets = np.asarray([
+        (datetime.combine(label_to_date(value), datetime.min.time()) - BASE_DATE).days
+        for value in labels
+    ], dtype=np.float64)
+    return labels, offsets, lat, lon
+
+
+def valid_global_initializations(date_labels, prediction_leads=W34_LEADS) -> Tuple[int, ...]:
+    """Return indices with required history and a full MJJAS-valid W34 tube."""
+    labels = np.asarray(date_labels, dtype=np.int32)
+    leads = tuple(int(value) for value in prediction_leads)
+    if leads != W34_LEADS:
+        raise ValueError(f"Global production tube must remain {W34_LEADS}, got {leads}.")
+    output = []
+    for index in range(2, len(labels) - max(leads)):
+        initialization = label_to_date(labels[index])
+        continuous = (
+            label_to_date(labels[index - 2]) == initialization - timedelta(days=2)
+            and all(
+                label_to_date(labels[index + lead]) == initialization + timedelta(days=lead)
+                for lead in leads
+            )
+        )
+        if continuous and window_falls_in_months(initialization, leads):
+            output.append(index)
+    return tuple(output)
+
+
+def load_global_condition_vectors(config, date_labels, train_indices):
+    """Load five indices plus RMM and normalize only with the fold's train dates."""
+    base = np.load(config.GLOBAL_TELECONNECTION_VECTOR_PATH, mmap_mode="r")
+    if base.shape == (5, len(date_labels)):
+        base = np.asarray(base.T)
+    vectors = build_model_condition_vectors(date_labels, base, config.GLOBAL_RMM_PATH)
+    return normalize_condition_vectors(vectors, train_indices)
 
 
 def build_model_condition_vectors(
@@ -188,6 +247,18 @@ class GlobalHeatCastDataset(LazyGlobalZarrDataset):
             raise ValueError("condition_vectors must have shape (cache_time, 8).")
         self.preprocessor = preprocessor
         self.indices = self.init_indices
+        labels = np.asarray(self.time_values, dtype=np.int32)
+        self.cache_date_labels = labels
+        self.date_labels = labels
+        self.time_values = np.asarray([
+            (datetime.combine(label_to_date(value), datetime.min.time()) - BASE_DATE).days
+            for value in labels
+        ], dtype=np.float64)
+        self.doy_values = np.asarray([
+            label_to_date(value).timetuple().tm_yday for value in labels
+        ], dtype=np.int16)
+        self.n_timesteps = int(labels.size)
+        self.target_climatology = ZeroClimatology(tuple(self.metadata["shape"][1:3]))
         self._coordinate_cache = None
         self._coordinate_pid = None
 

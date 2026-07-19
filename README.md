@@ -67,7 +67,7 @@ Phase B is not a separate model implementation.
 | 4 | Fold-safe anomaly target, global inputs, CPU smoke test | Complete |
 | 5 | Weighted week3/week4/W34 evaluation and export | Complete |
 | 6 | Global ENS path, driver stratification, and novelty analyses | Complete |
-| 7 | Production Slurm workflows, runbook, Phase B checklist | Planned |
+| 7 | Production Slurm workflows, runbook, Phase B checklist | Complete |
 
 Each phase is committed only after the data-free integrity audit and pytest
 suite pass. Scientific choices that cannot be inferred are marked
@@ -111,8 +111,8 @@ Important existing modules are preserved rather than rebuilt:
 | `src/repo_integrity.py` | Fast data-free repository and experiment-contract audit |
 
 The authoritative predictor inventory is
-[docs/MODEL_INPUTS.md](docs/MODEL_INPUTS.md). Operational instructions will be
-maintained in `docs/RUNBOOK.md` after the production workflows are complete.
+[docs/MODEL_INPUTS.md](docs/MODEL_INPUTS.md). The full Phase A production order
+and Phase B checklist are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Target environment
 

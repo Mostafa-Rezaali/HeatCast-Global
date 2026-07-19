@@ -19,6 +19,7 @@ TARGET_SOURCE=${TARGET_SOURCE:-daily_statistics}
 RESOLUTION=${RESOLUTION:-1.5deg}
 YEARS=${YEARS:-1979-2024}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-4}
+BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 : "${ERA5_PRESSURE_DATASET:?TODO(USER): pin and export the pressure-level CDS dataset identifier}"
 
 cd "$WORK_DIR"
@@ -60,4 +61,14 @@ git pull --ff-only origin main
 )
 
 test -s "$WORK_DIR/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
+if [ "$BUILD_FOLD_SIDECARS" = "1" ]; then
+    FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}
+    test -s "$FOLD_YEARS_JSON"
+    for FOLD in 0 1 2 3 4; do
+        "$PY" -u src/build_global_fold_sidecars.py \
+          --fold "$FOLD" \
+          --fold_years_json "$FOLD_YEARS_JSON" \
+          --resolution "$RESOLUTION"
+    done
+fi
 echo "GLOBAL ERA5 CACHE BUILD COMPLETE: $WORK_DIR/cache/era5_${RESOLUTION}.zarr"

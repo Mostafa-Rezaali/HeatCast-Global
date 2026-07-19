@@ -257,6 +257,7 @@ def main() -> None:
     parser.add_argument("--domain", choices=("conus", "global"), default="global")
     parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
     parser.add_argument("--training_data_path", default=None)
+    parser.add_argument("--comparison_years", default=None, help="Approved comma-separated ECMWF matched years.")
     parser.add_argument("--heatcast_runs", required=True, help="Comma-separated five HeatCast run names.")
     parser.add_argument(
         "--ens_runs",
@@ -286,6 +287,10 @@ def main() -> None:
     heatcast_runs = tuple(value.strip() for value in args.heatcast_runs.split(",") if value.strip())
     ens_runs = tuple(value.strip() for value in args.ens_runs.split(",") if value.strip())
     window_leads = ee.parse_int_list(args.window_leads)
+    comparison_years = (
+        {int(value) for value in args.comparison_years.split(",") if value.strip()}
+        if args.comparison_years else None
+    )
     ens_groups = resolve_ens_run_groups(ens_runs, heatcast_runs, Path(args.ens_root), window_leads)
 
     global_acc = ee.EvaluationAccumulator(MODEL_NAMES, {})
@@ -319,6 +324,8 @@ def main() -> None:
         cycle_init_counts = defaultdict(int)
         for index, init_t in enumerate(common):
             heat = load_chunk(heat_map[init_t])
+            if comparison_years is not None and int(heat["year"]) not in comparison_years:
+                continue
             matching_sources = [source for source in ens_sources if init_t in source[2]]
             if len(matching_sources) > 1:
                 duplicate_cycle_inits += 1

@@ -441,9 +441,10 @@ class LazyGlobalZarrDataset(Dataset):
         target_indices = [init_index + lead for lead in self.prediction_leads]
         context = np.asarray(data.oindex[history_indices, :, :, :], dtype=np.float32)
         target = np.asarray(data.oindex[target_indices, :, :, self.tmax_channel], dtype=np.float32)
-        if len(self.time_values) == int(self.metadata["shape"][0]):
-            history_dates = tuple(self.time_values[index] for index in history_indices)
-            target_dates = tuple(self.time_values[index] for index in target_indices)
+        date_axis = getattr(self, "cache_date_labels", self.time_values)
+        if len(date_axis) == int(self.metadata["shape"][0]):
+            history_dates = tuple(date_axis[index] for index in history_indices)
+            target_dates = tuple(date_axis[index] for index in target_indices)
         else:
             time = root["time"]
             history_dates = tuple(int(value) for value in np.asarray(time.oindex[history_indices]).tolist())

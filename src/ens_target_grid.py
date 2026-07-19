@@ -149,7 +149,12 @@ class LazyGlobalChannel:
             raise IndexError("LazyGlobalChannel expects (lat, lon, time) indexing.")
         lat_index, lon_index, time_index = index
         if not isinstance(time_index, (int, np.integer)):
-            raise IndexError("LazyGlobalChannel reads one time slice at a time.")
+            if isinstance(time_index, slice):
+                times = range(*time_index.indices(self.shape[2]))
+            else:
+                times = tuple(int(value) for value in np.asarray(time_index).reshape(-1))
+            slices = [self[lat_index, lon_index, int(value)] for value in times]
+            return np.stack(slices, axis=-1) if slices else np.empty((0,), dtype=np.float32)
         root = self._open()
         field = np.asarray(
             root["data"][int(time_index), :, :, self.channel_index],
@@ -177,3 +182,31 @@ class LazyGlobalTruth(LazyGlobalChannel):
 
     def __init__(self, store_path: Path):
         super().__init__(store_path, "tmax")
+
+
+class LazyNormalizedGlobalTruth(LazyGlobalTruth):
+    """Apply a fold preprocessor to each lazily read Tmax day."""
+
+    def __init__(self, store_path: Path, preprocessor, date_labels):
+        super().__init__(store_path)
+        self.preprocessor = preprocessor
+        self.date_labels = np.asarray(date_labels, dtype=np.int32)
+        if self.date_labels.size != self.shape[2]:
+            raise ValueError("Global normalized truth date axis does not match the zarr cache.")
+
+    def __getitem__(self, index):
+        if not isinstance(index, tuple) or len(index) != 3:
+            raise IndexError("LazyNormalizedGlobalTruth expects (lat, lon, time) indexing.")
+        lat_index, lon_index, time_index = index
+        if not isinstance(time_index, (int, np.integer)):
+            return super().__getitem__(index)
+        full_field = LazyGlobalChannel.__getitem__(
+            self,
+            (slice(None), slice(None), int(time_index)),
+        )
+        normalized = self.preprocessor.transform(
+            "tmax",
+            int(self.date_labels[int(time_index)]),
+            full_field,
+        )
+        return normalized[lat_index, lon_index]

@@ -436,6 +436,63 @@ def load_or_build_window_exceedance_stats(
     evaluated. The spread is built from train-year forecast errors
     truth_week - mu_week, so it is checkpoint-dependent.
     """
+    if cfm.Config.DOMAIN == "global":
+        from data_pipeline.build_cache import fold_sidecar_path
+        from global_evaluation import load_fold_window_statistics
+
+        fold = int(getattr(cfm.Config, "CV_FOLD", cfm.Config.CV_TEST_OFFSETS[0]))
+        sidecar = fold_sidecar_path(Path(cfm.Config.TRAINING_DATA_PATH), fold, "thresholds")
+        thresholds, base_rates, saved_train_years = load_fold_window_statistics(sidecar, fold)
+        window_name = next(
+            name for name, leads in GLOBAL_WINDOWS.items()
+            if tuple(int(value) for value in leads) == tuple(int(value) for value in window_leads)
+        )
+        if set(saved_train_years) != set(int(value) for value in train_years):
+            raise RuntimeError("Global threshold sidecar train years do not match the active fold.")
+        h, w = cfm.Config.IMAGE_SIZE
+        q95_z = np.full((13, h, w), np.nan, dtype=np.float32)
+        base_rate = np.full((13, h, w), np.nan, dtype=np.float32)
+        q95_z[1:] = thresholds[window_name]["q95"]
+        base_rate[1:] = base_rates[window_name]["q95"]
+        count = np.zeros((13, h, w), dtype=np.float64)
+        error_mean = np.zeros((13, h, w), dtype=np.float64)
+        error_m2 = np.zeros((13, h, w), dtype=np.float64)
+        loader = DataLoader(train_dataset, batch_size=1, shuffle=False, num_workers=0)
+        model.eval()
+        center_lead = window_center_lead(window_leads)
+        with torch.inference_mode():
+            for batch_index, batch in enumerate(loader):
+                mu_week, truth_week, init_index = predict_target_field(
+                    model,
+                    batch,
+                    device,
+                    target_mode="window",
+                    lead_indices=tuple(lead_indices),
+                    center_idx=cfm.center_lead_index(cfm.Config),
+                    image_size=cfm.Config.IMAGE_SIZE,
+                )
+                center_time = int(init_index) + int(center_lead)
+                month = int(months[center_time])
+                if int(years[center_time]) not in set(int(value) for value in train_years):
+                    raise RuntimeError("Global error-spread builder leaked outside training years.")
+                error = np.asarray(truth_week - mu_week, dtype=np.float64)
+                valid = mask_np & np.isfinite(error)
+                old_count = count[month][valid]
+                new_count = old_count + 1.0
+                delta = error[valid] - error_mean[month][valid]
+                error_mean[month][valid] += delta / new_count
+                error_m2[month][valid] += delta * (error[valid] - error_mean[month][valid])
+                count[month][valid] = new_count
+                if (batch_index + 1) % max(1, int(progress_every)) == 0:
+                    print(f"  global error-spread stream {batch_index + 1}/{len(train_dataset)}")
+        sigma_error = np.full((13, h, w), np.nan, dtype=np.float32)
+        valid_count = count > 1.0
+        sigma_error[valid_count] = np.sqrt(
+            error_m2[valid_count] / np.maximum(count[valid_count] - 1.0, 1.0)
+        ).astype(np.float32)
+        sigma_error[(count > 0.0) & ~valid_count] = float(cfm.Config.SIGMA_FLOOR)
+        return q95_z, sigma_error, base_rate
+
     path = window_exceedance_cache_path(window_leads)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     norm_path = cfm.get_norm_stats_path(cfm.Config)
@@ -2768,14 +2825,21 @@ def evaluate(args: argparse.Namespace) -> None:
 
     norm_stats = load_norm_stats()
     climo = cfm.load_or_build_train_climatology(shared_data, train_indices, norm_stats, cfm.Config, ddp=False)
-    daily_q95_z, daily_sigma_clim, daily_base_rate = load_or_build_exceedance_stats(
-        shared_data, train_years, norm_stats, climo
-    )
-    for month in MJJAS_MONTHS:
-        rate = float(np.nanmean(daily_base_rate[month]))
-        print(f"Daily build check month={month}: train-year mean exceedance rate={rate:.4f}")
-        if np.isfinite(rate) and not (0.025 <= rate <= 0.075):
-            raise RuntimeError(f"Train exceedance rate for month {month} is not near 5%: {rate:.4f}")
+    if cfm.Config.DOMAIN == "global":
+        daily_q95_z = daily_sigma_clim = daily_base_rate = np.full(
+            (13,) + tuple(cfm.Config.IMAGE_SIZE),
+            np.nan,
+            dtype=np.float32,
+        )
+    else:
+        daily_q95_z, daily_sigma_clim, daily_base_rate = load_or_build_exceedance_stats(
+            shared_data, train_years, norm_stats, climo
+        )
+        for month in MJJAS_MONTHS:
+            rate = float(np.nanmean(daily_base_rate[month]))
+            print(f"Daily build check month={month}: train-year mean exceedance rate={rate:.4f}")
+            if np.isfinite(rate) and not (0.025 <= rate <= 0.075):
+                raise RuntimeError(f"Train exceedance rate for month {month} is not near 5%: {rate:.4f}")
 
     dataset = select_dataset(
         eval_split, cfm.Config, shared_data, norm_stats, climo,
@@ -2822,10 +2886,29 @@ def evaluate(args: argparse.Namespace) -> None:
     else:
         q95_z, sigma_clim, base_rate = daily_q95_z, daily_sigma_clim, daily_base_rate
 
-    regions = {
-        name: (rmask & mask_np)
-        for name, rmask in region_masks(cfm.Config.IMAGE_SIZE).items()
-    }
+    if cfm.Config.DOMAIN == "global":
+        from ens_target_grid import target_grid_for_config
+        from spatial_weights import area_weights
+
+        target_grid = target_grid_for_config(cfm.Config)
+        metric_weights = np.broadcast_to(
+            np.asarray(area_weights(target_grid.lat), dtype=np.float64)[:, None],
+            mask_np.shape,
+        )
+        regions = {
+            name: (rmask & mask_np)
+            for name, rmask in global_region_masks(
+                target_grid.lat,
+                target_grid.lon,
+                mask_np,
+            ).items()
+        }
+    else:
+        metric_weights = None
+        regions = {
+            name: (rmask & mask_np)
+            for name, rmask in region_masks(cfm.Config.IMAGE_SIZE).items()
+        }
     center_idx = cfm.center_lead_index(cfm.Config) if cfm.Config.MULTI_LEAD_TUBE else 0
 
     split_year_map = {"train": train_years, "val": val_years, "test": test_years}
@@ -3063,11 +3146,20 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     daily_compare_acc = (
         EvaluationAccumulator(["monthly_climatology", "stage1_mu_sigma_clim"], {})
-        if target_mode == "window" else None
+        if target_mode == "window" and cfm.Config.DOMAIN != "global" else None
     )
 
     h, w = cfm.Config.IMAGE_SIZE
     heat = shared_data["heat_index"]
+    if cfm.Config.DOMAIN == "global":
+        from ens_target_grid import LazyNormalizedGlobalTruth
+
+        bundle = shared_data["global_bundle"]
+        heat = LazyNormalizedGlobalTruth(
+            Path(cfm.Config.TRAINING_DATA_PATH),
+            bundle["preprocessor"],
+            bundle["date_labels"],
+        )
     print(f"Evaluating split={eval_split}, samples={len(dataset)}")
     leakage_ok = True
     causal_ok = True
@@ -3273,7 +3365,15 @@ def evaluate(args: argparse.Namespace) -> None:
                     )
 
             for name, prob in forecasts.items():
-                acc.update(name, prob, truth, mask_np, target_month, auc_score=auc_scores.get(name))
+                acc.update(
+                    name,
+                    prob,
+                    truth,
+                    mask_np,
+                    target_month,
+                    auc_score=auc_scores.get(name),
+                    weights=metric_weights,
+                )
             if year_incremental_acc is not None:
                 target_year = int(years[target_t])
                 for name in (reference_name, "incremental_A_init_margin", NESTED_SHRINKAGE_MODEL_NAME):
@@ -3283,6 +3383,7 @@ def evaluate(args: argparse.Namespace) -> None:
                         truth,
                         mask_np,
                         target_month,
+                        weights=metric_weights,
                     )
 
             if daily_compare_acc is not None:
@@ -3296,10 +3397,12 @@ def evaluate(args: argparse.Namespace) -> None:
                     daily_stage1 = normal_cdf((center_mu_z - qd) / np.maximum(sigd, 0.1))
                     daily_stage1[~mask_np] = np.nan
                     daily_compare_acc.update(
-                        "monthly_climatology", daily_base_rate[daily_month], daily_truth, mask_np, daily_month
+                        "monthly_climatology", daily_base_rate[daily_month], daily_truth, mask_np, daily_month,
+                        weights=metric_weights,
                     )
                     daily_compare_acc.update(
-                        "stage1_mu_sigma_clim", daily_stage1, daily_truth, mask_np, daily_month
+                        "stage1_mu_sigma_clim", daily_stage1, daily_truth, mask_np, daily_month,
+                        weights=metric_weights,
                     )
 
             if (batch_idx + 1) % max(1, int(args.progress_every)) == 0:

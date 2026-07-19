@@ -470,6 +470,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--domain", choices=("conus", "global"), default="global")
     parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
+    parser.add_argument("--fold_years_json", default=None)
+    parser.add_argument("--comparison_years", default=None, help="Approved comma-separated ECMWF matched years.")
     parser.add_argument("--cv_fold", type=int, required=True)
     parser.add_argument("--run_name", default=None, help="Default: cvfold{fold}_ens_w{window label}.")
     parser.add_argument("--window_leads", default="15,16,17,18,19,20,21,22,23,24,25,26,27,28")
@@ -496,7 +498,11 @@ def main() -> None:
     parser.add_argument("--progress_every", type=int, default=25)
     args = parser.parse_args()
 
+    if args.fold_years_json:
+        cfm.Config.CV_FOLD_YEARS_PATH = args.fold_years_json
     cfm.configure_domain(args.domain, args.resolution, None, cfm.Config)
+    if cfm.Config.DOMAIN == "global" and cfm.Config.CV_FOLD_YEARS is None:
+        raise RuntimeError("Global ENS scoring requires the approved --fold_years_json.")
     window_leads = ee.parse_int_list(args.window_leads)
     rt_tag = normalize_rt_tag(args.rt_tag)
     configure_fold(args.cv_fold, window_leads, args.cv_stride)
@@ -531,6 +537,15 @@ def main() -> None:
         init_t: path for init_t, path in files_by_init.items()
         if int(init_t) in valid_init_indices
     }
+    comparison_years = (
+        {int(value) for value in args.comparison_years.split(",") if value.strip()}
+        if args.comparison_years else None
+    )
+    if comparison_years is not None:
+        files_by_init = {
+            init_t: path for init_t, path in files_by_init.items()
+            if int(years[int(init_t)]) in comparison_years
+        }
     if not files_by_init:
         raise RuntimeError(
             "No ENS inits remain after applying HeatCast continuous-season and lead-window guards."
@@ -675,6 +690,7 @@ def main() -> None:
         "window_leads": list(window_leads),
         "available_years": sorted(available_years),
         "intersection_years": retained,
+        "approved_comparison_years": sorted(comparison_years) if comparison_years is not None else None,
         "calibrator": {
             "feature_names": list(calibrator.feature_names),
             "mean": calibrator.mean.tolist(),

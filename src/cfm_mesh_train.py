@@ -42,6 +42,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 import shutil
+from pathlib import Path
 mp.set_start_method("spawn", force=True)
 mp.set_sharing_strategy("file_system")
 
@@ -252,13 +253,18 @@ class Config:
     ENABLE_GLOBAL_LOCAL_WARM_SEASON_SUPPLEMENT = False
     ENABLE_HEAT_INDEX = False
     N_MEMBERS = 512
-    CV_FOLD_YEARS = None  # TODO(USER): pin exact five-fold years for 1979-2024.
+    CV_FOLD_YEARS_PATH = os.environ.get("HEATCAST_FOLD_YEARS_JSON")
+    CV_FOLD_YEARS = None  # TODO(USER): loaded only from the approved JSON for 1979-2024.
     ENS_COMPARISON_PERIOD = None  # TODO(USER): pin after ECMWF cycle metadata is approved.
 
     # ==================== DATA PATHS ====================
     CONUS_TRAINING_DATA_PATH = os.path.join(CONUS_DATA_ROOT, "VDM_Training_Data_Extended_v2.nc")
+    CONUS_TOPOGRAPHY_PATH = os.path.join(
+        CONUS_DATA_ROOT,
+        "CONUS_topography_ETOPO2022_60s_on_model_grid.nc",
+    )
     GLOBAL_TRAINING_DATA_PATH = os.path.join(DATA_ROOT, "cache", f"era5_{RESOLUTION}.zarr")
-    ERA5_RAW_DIR = os.path.join(DATA_ROOT, "era5_raw")
+    ERA5_RAW_DIR = os.path.join(DATA_ROOT, "raw", "era5")
     ENS_RAW_DIR = os.path.join(DATA_ROOT, "ens_reforecast", "raw")
     ENS_REGRID_DIR = os.path.join(DATA_ROOT, "ens_reforecast", f"regridded_{RESOLUTION}")
     ENS_QMAP_DIR = os.path.join(DATA_ROOT, "ens_reforecast", "quantile_mapping")
@@ -268,6 +274,7 @@ class Config:
     TRAINING_DATA_PATH = (
         GLOBAL_TRAINING_DATA_PATH if DOMAIN == "global" else CONUS_TRAINING_DATA_PATH
     )
+    TOPOGRAPHY_PATH = None if DOMAIN == "global" else CONUS_TOPOGRAPHY_PATH
     TARGET_VARIABLE_CANDIDATES = (
         ("t2m_daily_max", "tmax") if DOMAIN == "global" else ("t2m_prism", "HeatIndex")
     )
@@ -459,6 +466,7 @@ def configure_domain(domain=None, resolution=None, target_mode=None, config=Conf
         os.path.join(config.DATA_ROOT, "cache", f"era5_{selected_resolution}.zarr")
         if selected_domain == "global" else config.CONUS_TRAINING_DATA_PATH
     )
+    config.TOPOGRAPHY_PATH = None if selected_domain == "global" else config.CONUS_TOPOGRAPHY_PATH
     config.TARGET_VARIABLE_CANDIDATES = (
         ("t2m_daily_max", "tmax") if selected_domain == "global" else ("t2m_prism", "HeatIndex")
     )
@@ -481,6 +489,10 @@ def configure_domain(domain=None, resolution=None, target_mode=None, config=Conf
         26 if selected_domain == "global"
         else 3 + 9 + config.NUM_LOCAL_LAG_CHANNELS + 7
     )
+    if selected_domain == "global" and config.CV_FOLD_YEARS_PATH:
+        from fold_config import load_fold_table
+
+        config.CV_FOLD_YEARS = load_fold_table(config.CV_FOLD_YEARS_PATH)
     config.CONDITION_DIM = 8 if selected_domain == "global" else 5
     if selected_domain == "global":
         config.MULTI_LEAD_TUBE = True
@@ -994,6 +1006,31 @@ def build_crossval_split(valid_indices, time_values, val_stride=None, test_strid
              pass fold-specific offset tuples so every year can be predicted
              by a model that never trained on that offset group.
     """
+    base_date = datetime(1981, 5, 1)
+    idx_years = np.array([
+        (base_date + timedelta(days=float(time_values[i]))).year
+        for i in valid_indices
+    ])
+    if Config.DOMAIN == "global" and Config.CV_FOLD_YEARS is not None:
+        fold = int(getattr(Config, "CV_FOLD", Config.CV_TEST_OFFSETS[0]))
+        if fold not in Config.CV_FOLD_YEARS:
+            raise ValueError(f"Approved fold table does not contain fold {fold}.")
+        roles = Config.CV_FOLD_YEARS[fold]
+        train_years = set(int(value) for value in roles["train_years"])
+        val_years = set(int(value) for value in roles["calibration_years"])
+        test_years = set(int(value) for value in roles["test_years"])
+        available = set(int(value) for value in idx_years)
+        if not available.issubset(train_years | val_years | test_years):
+            raise ValueError(f"Approved fold {fold} does not assign available years {sorted(available)}.")
+        return (
+            [i for i, year in zip(valid_indices, idx_years) if int(year) in train_years],
+            [i for i, year in zip(valid_indices, idx_years) if int(year) in val_years],
+            [i for i, year in zip(valid_indices, idx_years) if int(year) in test_years],
+            train_years,
+            val_years,
+            test_years,
+        )
+
     val_stride = Config.CV_STRIDE if val_stride is None else val_stride
     test_stride = Config.CV_STRIDE if test_stride is None else test_stride
     if val_offsets is None:
@@ -1012,11 +1049,6 @@ def build_crossval_split(valid_indices, time_values, val_stride=None, test_strid
     if overlap:
         raise ValueError(f"Validation and test CV offsets overlap: {sorted(overlap)}")
 
-    base_date = datetime(1981, 5, 1)
-    idx_years = np.array([
-        (base_date + timedelta(days=float(time_values[i]))).year
-        for i in valid_indices
-    ])
     unique_years = sorted(set(idx_years))
 
     val_years = set()
@@ -1576,6 +1608,8 @@ def get_climatology_cache_path(config=None):
 
 
 def load_or_build_train_climatology(shared_data, train_indices, norm_stats, config, ddp=False):
+    if config.DOMAIN == "global":
+        return shared_data["target_climatology"]
     path = get_climatology_cache_path(config)
     if is_main_process():
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1883,6 +1917,20 @@ class ClimateDataset(Dataset):
         self.mode = mode
         self.target_climatology = target_climatology
 
+        if config.DOMAIN == "global":
+            if shared_data is None or "global_bundle" not in shared_data:
+                raise RuntimeError("Global ClimateDataset requires the worker-lazy global training bundle.")
+            bundle = shared_data["global_bundle"]
+            self._global_delegate = bundle["datasets"][mode]
+            self.indices = self._global_delegate.indices
+            self.time_values = self._global_delegate.time_values
+            self.doy_values = self._global_delegate.doy_values
+            self.n_timesteps = self._global_delegate.n_timesteps
+            self.target_climatology = self._global_delegate.target_climatology
+            self.condition_mean = bundle["condition_mean"]
+            self.condition_std = bundle["condition_std"]
+            return
+
         if shared_data is None:
             print(f"  Loading data to RAM...")
             with NetCDFDataset(config.TRAINING_DATA_PATH, 'r') as nc:
@@ -2059,6 +2107,8 @@ class ClimateDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
+        if hasattr(self, "_global_delegate"):
+            return self._global_delegate[idx]
         t = self.indices[idx]
         h, w = self.config.IMAGE_SIZE
         target_leads = prediction_leads(self.config)
@@ -2245,6 +2295,22 @@ class ClimateDataset(Dataset):
 
 
 def get_normalization_stats(dataset):
+    if hasattr(dataset, "_global_delegate"):
+        return {
+            'hi_mean': torch.tensor(0.0),
+            'hi_std': torch.tensor(1.0),
+            'stats_mean': torch.zeros(23, 1, 1),
+            'stats_std': torch.ones(23, 1, 1),
+            'cond_mean': torch.from_numpy(np.asarray(dataset.condition_mean, dtype=np.float32)),
+            'cond_std': torch.from_numpy(np.asarray(dataset.condition_std, dtype=np.float32)),
+            'topo_mean': torch.tensor(0.0),
+            'topo_std': torch.tensor(1.0),
+            'toa_mean': torch.tensor(0.0),
+            'toa_std': torch.tensor(1.0),
+            'global_mean': torch.empty(0, 1, 1),
+            'global_std': torch.empty(0, 1, 1),
+            'shared_data': None,
+        }
     stats = {
         'hi_mean':    dataset.hi_mean,
         'hi_std':     dataset.hi_std,
@@ -2317,6 +2383,13 @@ def masked_ssim_01_chunked_cpu(pred, target, mask, fill=0.5, chunk_size=8):
 # OCEAN MASKING UTILITIES
 # ======================================================================================
 def load_conus_mask(config):
+    if config.DOMAIN == "global":
+        from ens_target_grid import target_grid_for_config
+
+        grid = target_grid_for_config(config)
+        mask = grid.headline_mask().astype(np.float32)
+        print(f"  Global validation mask: NH land ({float(mask.mean()) * 100:.1f}% of grid cells)")
+        return torch.from_numpy(mask)
     with NetCDFDataset(config.TRAINING_DATA_PATH, 'r') as nc:
         target_name, hi = get_target_variable(nc, config)
         if hi.ndim == 4:
@@ -3809,11 +3882,31 @@ def save_mask_plot(mask, out_dir, fname="conus_mask.png"):
 # DATA CACHE
 # ======================================================================================
 def prepare_shared_data(config, rank, world_size, ddp):
+    if config.DOMAIN == "global":
+        os.makedirs(os.path.join(config.OUTPUT_DIR, "data_cache"), exist_ok=True)
+        if config.CV_FOLD_YEARS is None and config.CV_FOLD_YEARS_PATH:
+            from fold_config import load_fold_table
+
+            config.CV_FOLD_YEARS = load_fold_table(config.CV_FOLD_YEARS_PATH)
+        bundle = prepare_global_training_datasets(rank=rank, ddp=ddp)
+        from ens_target_grid import LazyGlobalTruth
+
+        return {
+            "heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH)),
+            "time_values": bundle["time_values"],
+            "valid_indices_override": sorted(
+                bundle["train_indices"] + bundle["val_indices"] + bundle["test_indices"]
+            ),
+            "global_bundle": bundle,
+            "target_climatology": bundle["datasets"]["train"].target_climatology,
+        }
     cache_dir = os.path.join(config.OUTPUT_DIR, "data_cache")
     os.makedirs(cache_dir, exist_ok=True)
     target_meta_path = os.path.join(cache_dir, "_target_cache_meta.npz")
 
-    TOPO_PATH = "/blue/nessie/mostafarezaali/Teleconnection/CONUS_topography_ETOPO2022_60s_on_model_grid.nc"
+    TOPO_PATH = config.TOPOGRAPHY_PATH
+    if not TOPO_PATH:
+        raise RuntimeError("CONUS shared-data setup requires Config.TOPOGRAPHY_PATH.")
 
     paths = {
         "heat_index":   os.path.join(cache_dir, "heat_index.npy"),
@@ -3989,6 +4082,105 @@ torch.backends.cudnn.benchmark = True
 # ======================================================================================
 # TRAINING LOOP
 # ======================================================================================
+def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True):
+    """Build fold-safe worker-lazy global datasets and the NH validation mask."""
+    from data_pipeline.build_cache import fold_sidecar_path
+    from ens_target_grid import target_grid_for_config
+    from global_dataset import (
+        ANOMALY_CHANNELS,
+        GlobalHeatCastDataset,
+        load_global_cache_axis,
+        load_global_condition_vectors,
+        valid_global_initializations,
+    )
+    from global_targets import FoldFieldPreprocessor, fit_fold_preprocessor_from_zarr
+
+    if Config.CV_FOLD_YEARS is None:
+        raise RuntimeError("Global training refuses to infer fold years; supply the approved fold JSON.")
+    store_path = Path(Config.TRAINING_DATA_PATH)
+    labels, time_values, _, _ = load_global_cache_axis(store_path)
+    valid_indices = valid_global_initializations(labels, prediction_leads(Config))
+    available_years = {
+        int(str(int(labels[index]))[:4]) for index in valid_indices
+    }
+    expected_years = set(range(1979, 2025))
+    if available_years != expected_years:
+        raise RuntimeError(
+            "Global cache does not provide full MJJAS-valid initialization coverage for 1979-2024: "
+            f"missing={sorted(expected_years - available_years)}, extra={sorted(available_years - expected_years)}."
+        )
+    train_indices, val_indices, test_indices, train_years, val_years, test_years = build_crossval_split(
+        valid_indices,
+        time_values,
+    )
+    if not train_indices or not val_indices or not test_indices:
+        raise RuntimeError("Approved global fold produced an empty train, calibration, or test split.")
+    fold = int(getattr(Config, "CV_FOLD", Config.CV_TEST_OFFSETS[0]))
+    sidecar = fold_sidecar_path(store_path, fold, "normalization")
+    sidecar_ok = False
+    if is_main_process() and sidecar.exists():
+        try:
+            sidecar_ok = set(FoldFieldPreprocessor.load(sidecar).train_years) == set(train_years)
+        except Exception:
+            sidecar_ok = False
+    if ddp:
+        flag = torch.tensor(float(sidecar_ok), device=torch.device(f"cuda:{int(os.environ.get('LOCAL_RANK', 0))}"))
+        dist.broadcast(flag, src=0)
+        sidecar_ok = bool(flag.item() > 0.5)
+    if not sidecar_ok and is_main_process():
+        print(f"Fitting four-harmonic fold-safe global preprocessor: {sidecar}")
+        preprocessor = fit_fold_preprocessor_from_zarr(
+            store_path,
+            sorted(train_years),
+            anomaly_channels=ANOMALY_CHANNELS,
+            n_harmonics=Config.CLIMATOLOGY_HARMONICS,
+        )
+        preprocessor.save(sidecar)
+    if ddp:
+        dist.barrier()
+    preprocessor = FoldFieldPreprocessor.load(sidecar)
+    if set(preprocessor.train_years) != set(train_years):
+        raise RuntimeError("Global normalization sidecar train years do not match the approved fold.")
+    if require_conditions:
+        condition_vectors, condition_mean, condition_std = load_global_condition_vectors(
+            Config,
+            labels,
+            train_indices,
+        )
+    else:
+        condition_vectors = np.zeros((labels.size, Config.CONDITION_DIM), dtype=np.float32)
+        condition_mean = np.zeros(Config.CONDITION_DIM, dtype=np.float32)
+        condition_std = np.ones(Config.CONDITION_DIM, dtype=np.float32)
+    dataset_kwargs = {
+        "condition_vectors": condition_vectors,
+        "preprocessor": preprocessor,
+        "prediction_leads": prediction_leads(Config),
+    }
+    datasets = {
+        "train": GlobalHeatCastDataset(store_path, train_indices, **dataset_kwargs),
+        "val": GlobalHeatCastDataset(store_path, val_indices, **dataset_kwargs),
+        "test": GlobalHeatCastDataset(store_path, test_indices, **dataset_kwargs),
+    }
+    target_grid = target_grid_for_config(Config)
+    validation_mask = torch.from_numpy(target_grid.headline_mask().astype(np.float32))
+    return {
+        "datasets": datasets,
+        "time_values": time_values,
+        "date_labels": labels,
+        "train_indices": train_indices,
+        "val_indices": val_indices,
+        "test_indices": test_indices,
+        "train_years": train_years,
+        "val_years": val_years,
+        "test_years": test_years,
+        "preprocessor": preprocessor,
+        "normalization_sidecar": sidecar,
+        "condition_mean": condition_mean,
+        "condition_std": condition_std,
+        "validation_mask": validation_mask,
+    }
+
+
 def train_model(rank=0, world_size=1, checkpoint_path=None):
     ddp = world_size > 1
 
@@ -4062,6 +4254,8 @@ def train_model(rank=0, world_size=1, checkpoint_path=None):
         lead_time=active_max_lead,
         min_history=required_input_history(Config),
     )
+    if "valid_indices_override" in shared_data:
+        all_valid = list(shared_data["valid_indices_override"])
 
     if is_main_process():
         print(f"Total valid indices (max_lead={active_max_lead}): {len(all_valid)}")
@@ -4751,6 +4945,8 @@ def main():
                        help='Configured global latitude-longitude resolution.')
     parser.add_argument('--target_mode', choices=Config.TARGET_MODES, default=None,
                        help='Fold-safe target transformation; global default is climatology_anomaly.')
+    parser.add_argument('--fold_years_json', default=None,
+                       help='Approved global five-fold year-role table; required outside smoke tests.')
     parser.add_argument('--precision', choices=Config.VALID_PRECISIONS, default=None,
                        help='Training autocast precision; Phase A default is fp32.')
     parser.add_argument('--grad_checkpoint', action='store_true',
@@ -4877,6 +5073,8 @@ def main():
 
     args = parser.parse_args()
 
+    if args.fold_years_json is not None:
+        Config.CV_FOLD_YEARS_PATH = args.fold_years_json
     configure_domain(args.domain, args.resolution, args.target_mode, Config)
     if args.precision is not None:
         Config.PRECISION = args.precision
@@ -4895,6 +5093,11 @@ def main():
         from global_smoke_test import run_global_smoke_test
         run_global_smoke_test(seed=Config.SEED)
         return
+    if Config.DOMAIN == "global" and Config.CV_FOLD_YEARS is None:
+        raise RuntimeError(
+            "Global production requires --fold_years_json (or HEATCAST_FOLD_YEARS_JSON). "
+            "Resolve TODO(USER) in docs/DECISIONS_NEEDED.md; no fold years are inferred."
+        )
 
     if args.dry_run:
         Config.MAX_EPOCHS = 1
@@ -4990,6 +5193,7 @@ def main():
         Config.CV_STRIDE = args.cv_stride
     if args.cv_fold is not None:
         fold = int(args.cv_fold) % int(Config.CV_STRIDE)
+        Config.CV_FOLD = fold
         Config.CV_TEST_OFFSETS = (fold,)
         Config.CV_VAL_OFFSETS = ((fold + 1) % int(Config.CV_STRIDE),)
         if args.run_name is None:
