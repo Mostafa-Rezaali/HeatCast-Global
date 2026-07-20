@@ -30,9 +30,12 @@ do not partition all years exactly once.
 
 ## CDS credentials
 
-`TODO(USER)`: Install and validate the CDS API key in `~/.cdsapirc` on
-HiPerGator and accept the required ERA5/S2S dataset licenses before running the
-download workflow.
+`TODO(USER)`: Install and validate the ERA5 Climate Data Store API token in
+`~/.cdsapirc-era5` on HiPerGator, using
+`url: https://cds.climate.copernicus.eu/api`, and accept the required ERA5
+dataset licenses before running the download workflow. Keep any existing
+`~/.cdsapirc` using `https://ecds.ecmwf.int/api` for the separate ECMWF S2S
+workflow.
 
 This is an operational credential decision; no key or token belongs in Git.
 

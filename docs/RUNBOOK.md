@@ -32,12 +32,25 @@ Required runtime inputs:
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/rmm.txt
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/nino34.txt
 <approved fold-year JSON>
-~/.cdsapirc
+~/.cdsapirc-era5
 ```
 
 The five-index array must align exactly with the ERA5 cache time axis. The RMM
 and Niño files are parsed by the existing driver-table parsers; no alternate
 model-only parser is used.
+
+Keep ERA5 and ECMWF S2S credentials separate. Create `~/.cdsapirc-era5` from
+the Climate Data Store API profile with:
+
+```yaml
+url: https://cds.climate.copernicus.eu/api
+key: <CDS personal access token>
+```
+
+The data-build Slurm script exports this file through `CDSAPI_RC`. An existing
+`~/.cdsapirc` configured with `https://ecds.ecmwf.int/api` may remain unchanged
+for the ECMWF ECDS/S2S workflow; that endpoint does not serve ERA5 collection
+IDs.
 
 ## 2. Local/data-free preflight
 

@@ -31,9 +31,10 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-CDS_CONFIG=${CDSAPI_RC:-$HOME/.cdsapirc}
-test -s "$CDS_CONFIG" || {
-    echo "Missing CDS credentials at $CDS_CONFIG. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
+ERA5_CDS_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}
+export CDSAPI_RC="$ERA5_CDS_RC"
+test -s "$CDSAPI_RC" || {
+    echo "Missing ERA5 CDS credentials at $CDSAPI_RC. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
     exit 2
 }
 

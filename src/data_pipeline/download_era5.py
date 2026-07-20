@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ from cfm_mesh_train import Config
 PREFERRED_DAILY_DATASET = "derived-era5-single-levels-daily-statistics"
 HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"
 PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"
+CDS_CLIMATE_API_URL = "https://cds.climate.copernicus.eu/api"
 YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))
 MONTHS: Tuple[int, ...] = tuple(range(1, 13))
 HOURS: Tuple[str, ...] = tuple(f"{hour:02d}:00" for hour in range(24))
@@ -66,6 +68,43 @@ class DownloadTask:
     request: dict
     target: str
     source_choice: str
+
+
+def era5_cds_rc_path() -> Path:
+    """Return the ERA5 credential file without reusing the ECMWF ECDS file."""
+    return Path(os.environ.get("CDSAPI_RC", "~/.cdsapirc-era5")).expanduser()
+
+
+def _configured_cds_url(path: Path) -> Optional[str]:
+    """Read only the non-secret URL field from a cdsapi YAML configuration."""
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() == "url":
+            return value.strip().strip("'\"")
+    return None
+
+
+def validate_cds_endpoint(path: Optional[Path] = None) -> Path:
+    """Fail before task submission unless ERA5 is routed to Climate Data Store."""
+    config_path = Path(path).expanduser() if path is not None else era5_cds_rc_path()
+    if not config_path.is_file() or config_path.stat().st_size <= 0:
+        raise RuntimeError(
+            f"Missing ERA5 CDS credentials at {config_path}. Create this separate file "
+            f"with url: {CDS_CLIMATE_API_URL} and your CDS personal access token."
+        )
+    configured_url = _configured_cds_url(config_path)
+    if configured_url is None:
+        raise RuntimeError(f"Missing 'url:' in ERA5 CDS configuration {config_path}.")
+    if configured_url.rstrip("/") != CDS_CLIMATE_API_URL:
+        raise RuntimeError(
+            f"Wrong endpoint in {config_path}: {configured_url}. ERA5 collection IDs "
+            f"must use {CDS_CLIMATE_API_URL}; https://ecds.ecmwf.int/api is the "
+            "separate ECMWF ECDS/S2S service. Keep separate credential files."
+        )
+    return config_path
 
 
 def _days_for_month() -> list[str]:
@@ -305,12 +344,16 @@ def run_tasks(tasks: Iterable[DownloadTask], workers: int) -> None:
     """Run bounded independent CDS requests with one client per worker task."""
     if int(workers) < 1:
         raise ValueError("workers must be at least one.")
+    config_path = validate_cds_endpoint()
+    os.environ["CDSAPI_RC"] = str(config_path)
 
     def execute(task):
         try:
             import cdsapi
         except ImportError as exc:
-            raise RuntimeError("Install cdsapi and configure ~/.cdsapirc on HiPerGator.") from exc
+            raise RuntimeError(
+                "Install cdsapi and configure ~/.cdsapirc-era5 on HiPerGator."
+            ) from exc
         return retrieve_task(cdsapi.Client(), task)
 
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:

@@ -10,11 +10,13 @@ from netCDF4 import Dataset as NetCDFDataset
 from data_pipeline.build_cache import CACHE_CHANNELS, DailySlice, LazyGlobalZarrDataset, write_zarr_cache
 from data_pipeline.check_cache import check_cached_slice
 from data_pipeline.download_era5 import (
+    CDS_CLIMATE_API_URL,
     PREFERRED_DAILY_DATASET,
     PRESSURE_LEVEL_DATASET,
     build_download_tasks,
     retrieve_task,
     task_complete,
+    validate_cds_endpoint,
 )
 from data_pipeline.regrid import GridSpec, regrid_field
 from ens_target_grid import LazyGlobalChannel
@@ -48,6 +50,27 @@ def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path
     )
     with pytest.raises(RuntimeError, match="Pressure-level CDS dataset is empty"):
         retrieve_task(object(), blocked)
+
+
+def test_era5_endpoint_preflight_rejects_ecds_without_exposing_key(
+    tmp_path: Path, monkeypatch
+):
+    bad = tmp_path / "ecds.rc"
+    bad.write_text(
+        "url: https://ecds.ecmwf.int/api\nkey: secret-fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(bad))
+    with pytest.raises(RuntimeError, match="separate ECMWF ECDS/S2S") as error:
+        validate_cds_endpoint()
+    assert "secret-fixture-token" not in str(error.value)
+
+    good = tmp_path / "era5.rc"
+    good.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: secret-fixture-token\n",
+        encoding="utf-8",
+    )
+    assert validate_cds_endpoint(good) == good
 
 
 def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
