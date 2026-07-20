@@ -6,8 +6,6 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=500G
 #SBATCH --time=7-00:00:00
-#SBATCH --partition=hpg-b200
-#SBATCH --qos=nessie
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=mostafarezaali@ufl.edu
 
@@ -28,7 +26,6 @@ WINDOWS=(
 )
 
 cd "$WORK_DIR"
-module load cuda/12.9.1
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1

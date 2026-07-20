@@ -355,7 +355,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             f"--mail-user={EMAIL}",
             "REPO_DIR=/blue/nessie/mostafarezaali/HeatCast-Global",
             "DATA_ROOT=/blue/nessie/mostafarezaali/HeatCast-Global",
-            "module load cuda/12.9.1",
+            "unset PYTHONHOME PYTHONPATH",
             "ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}",
             "DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}",
             '--data_root "$DATA_ROOT"',
@@ -367,8 +367,10 @@ def audit_repository(root: Path) -> list[CheckResult]:
     global_data_slurm = _text(root, "slurm/submit_global_data_build.slurm")
     results.append(_result(
         "global.data_build_cpu_only_submission",
-        "--gres=" not in global_data_slurm,
-        "Global ERA5 download/regrid/cache build is CPU-only",
+        "--gres=" not in global_data_slurm
+        and "--partition=hpg-b200" not in global_data_slurm
+        and "module load cuda/" not in global_data_slurm,
+        "Global ERA5 download/regrid/cache build uses the default CPU partition",
     ))
 
     results.append(_required_tokens_check(
@@ -565,8 +567,10 @@ def audit_repository(root: Path) -> list[CheckResult]:
     global_ens_submission = _text(root, "slurm/submit_global_ens_cycles.slurm")
     results.append(_result(
         "global.ens_submission_cpu_only",
-        "--gres=" not in global_ens_submission,
-        "Global ENS ingest/scoring/comparison is CPU-only and requests no GPU",
+        "--gres=" not in global_ens_submission
+        and "--partition=hpg-b200" not in global_ens_submission
+        and "module load cuda/" not in global_ens_submission,
+        "Global ENS ingest/scoring/comparison uses the default CPU partition",
     ))
 
     results.append(_required_tokens_check(

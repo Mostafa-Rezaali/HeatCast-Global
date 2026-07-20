@@ -83,7 +83,9 @@ week3/week4/W34 threshold sidecars:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
 ```
 
-This is CPU/I/O work and requests no GPU. The expected cache is:
+This is CPU/I/O work. Following the original HeatCast CPU Slurm pattern, it
+uses HiPerGator's default CPU partition and requests no GPU. The expected cache
+is:
 
 ```text
 cache/era5_1.5deg.zarr/
