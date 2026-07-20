@@ -18,6 +18,7 @@ from data_pipeline.download_era5 import (
     DEFAULT_DOWNLOAD_WORKERS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_PER_DATASET_WORKERS,
+    MONTHS,
     PREFERRED_DAILY_DATASET,
     PRESSURE_LEVEL_DATASET,
     build_download_tasks,
@@ -37,7 +38,7 @@ def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path
     assert DEFAULT_DOWNLOAD_WORKERS == 8
     assert DEFAULT_PER_DATASET_WORKERS == 1
     assert DEFAULT_MAX_RETRIES == 12
-    tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
+    tasks = build_download_tasks(tmp_path, years=(1979,), months=MONTHS)
     assert len(tasks) == 6
     assert {task.group for task in tasks} == {
         "daily_tmax", "daily_t2m", "single_levels",
@@ -49,6 +50,8 @@ def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path
     assert daily.request["time_zone"] == "utc+00:00"
     assert daily.request["data_format"] == "netcdf"
     assert daily.request["download_format"] == "unarchived"
+    assert daily.request["month"] == [f"{value:02d}" for value in MONTHS]
+    assert Path(daily.target).name == "daily_tmax_1979.nc"
     assert all(task.year == 1979 for task in tasks)
     pressure = next(task for task in tasks if task.group == "pressure_850")
     assert pressure.dataset == PRESSURE_LEVEL_DATASET == "reanalysis-era5-pressure-levels"
@@ -62,6 +65,19 @@ def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path
     )
     with pytest.raises(RuntimeError, match="Pressure-level CDS dataset is empty"):
         retrieve_task(object(), blocked)
+
+
+def test_yearly_chunking_reduces_full_archive_to_231_requests(tmp_path: Path):
+    annual = build_download_tasks(tmp_path, years=range(1979, 2025), months=MONTHS)
+    monthly = build_download_tasks(
+        tmp_path,
+        years=(1979,),
+        months=MONTHS,
+        chunking="monthly",
+    )
+    assert len(annual) == 46 * 5 + 1 == 231
+    assert len(monthly) == 12 * 5 + 1 == 61
+    assert Path(monthly[0].target).name == "daily_tmax_197901.nc"
 
 
 def test_era5_endpoint_preflight_rejects_ecds_without_exposing_key(

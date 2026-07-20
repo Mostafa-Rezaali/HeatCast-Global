@@ -70,9 +70,10 @@ Expected: every contract passes, pytest is green, the smoke result reports
 
 The pressure-level source is pinned to the official CDS identifier
 `reanalysis-era5-pressure-levels`. The fresh-data workflow does not inspect or
-reuse the original HeatCast archive. Requests cover every month of 1979--2024,
-write unarchived NetCDF, validate each header before its atomic rename, and
-resume by skipping only files whose task metadata and NetCDF headers agree.
+reuse the original HeatCast archive. Requests cover all days of 1979--2024 and
+default to one NetCDF per variable group per year: 231 total tasks instead of
+2,761 monthly tasks. Every file is validated before its atomic rename, and
+resume skips only files whose task metadata and NetCDF headers agree.
 
 Submit the download alone first:
 
@@ -80,7 +81,8 @@ Submit the download alone first:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0 slurm/submit_global_data_build.slurm
 ```
 
-The downloader runs eight local worker threads, but admits at most one active
+The downloader uses `DOWNLOAD_CHUNKING=yearly` by default. It runs eight local
+worker threads, but admits at most one active
 request per CDS dataset. The three ERA5 collections can therefore progress in
 parallel without flooding any one dataset queue. Temporary CDS queue-limit
 responses are retried automatically with exponential backoff from 60 seconds
@@ -91,6 +93,10 @@ production default:
 ```bash
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0,DOWNLOAD_WORKERS=8,DOWNLOAD_PER_DATASET=1 slurm/submit_global_data_build.slurm
 ```
+
+If CDS rejects a particular annual payload for request-size rather than queue
+pressure, resubmit with `DOWNLOAD_CHUNKING=monthly`; annual and monthly target
+names are distinct, and the cache builder follows the same configured layout.
 
 Raw files and the deterministic request manifest are written below:
 

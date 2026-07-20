@@ -19,6 +19,7 @@ RESOLUTION=${RESOLUTION:-1.5deg}
 YEARS=${YEARS:-1979-2024}
 MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
+DOWNLOAD_CHUNKING=${DOWNLOAD_CHUNKING:-yearly}
 DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-1}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
 DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
@@ -46,6 +47,13 @@ case "$DOWNLOAD_WORKERS" in
         exit 2
         ;;
 esac
+case "$DOWNLOAD_CHUNKING" in
+    yearly|monthly) ;;
+    *)
+        echo "DOWNLOAD_CHUNKING must be yearly or monthly; got '$DOWNLOAD_CHUNKING'."
+        exit 2
+        ;;
+esac
 case "$DOWNLOAD_PER_DATASET" in
     ''|*[!0-9]*|0)
         echo "DOWNLOAD_PER_DATASET must be a positive integer; got '$DOWNLOAD_PER_DATASET'."
@@ -60,7 +68,7 @@ case "$DOWNLOAD_MAX_RETRIES" in
 esac
 
 git pull --ff-only origin main
-echo "ERA5 download concurrency: $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
+echo "ERA5 download plan: $DOWNLOAD_CHUNKING files, $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
 "$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py
 "$PY" src/repo_integrity.py
 
@@ -70,6 +78,7 @@ echo "ERA5 download concurrency: $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_
       --data_root "$DATA_ROOT" \
       --years "$YEARS" \
       --months "$MONTHS" \
+      --chunking "$DOWNLOAD_CHUNKING" \
       --target_source "$TARGET_SOURCE" \
       --pressure_dataset "$ERA5_PRESSURE_DATASET" \
       --workers "$DOWNLOAD_WORKERS" \
@@ -89,6 +98,7 @@ fi
       --data_root "$DATA_ROOT" \
       --years "$YEARS" \
       --months "$MONTHS" \
+      --chunking "$DOWNLOAD_CHUNKING" \
       --resolution "$RESOLUTION" \
       --target_source "$TARGET_SOURCE"
 )

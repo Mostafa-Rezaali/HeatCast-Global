@@ -1,4 +1,4 @@
-"""Stream monthly ERA5 downloads into a time-chunked global zarr cache.
+"""Stream annual or monthly ERA5 downloads into a time-chunked global cache.
 
 Only one UTC day and a bounded 20-day rolling history are resident at once.
 ``LazyGlobalZarrDataset`` reads metadata in its parent process but opens the
@@ -24,7 +24,12 @@ from netCDF4 import num2date
 from torch.utils.data import Dataset, get_worker_info
 
 from cfm_mesh_train import Config
-from data_pipeline.download_era5 import MONTHS, parse_years
+from data_pipeline.download_era5 import (
+    MONTHS,
+    download_target_path,
+    month_chunks,
+    parse_years,
+)
 from data_pipeline.regrid import GridSpec, grid_for_resolution, regrid_field
 
 
@@ -181,10 +186,6 @@ def _read_static(dataset, key: str) -> np.ndarray:
     return values
 
 
-def _monthly_path(raw_root: Path, group: str, year: int, month: int) -> Path:
-    return raw_root / group / str(int(year)) / f"{group}_{int(year):04d}{int(month):02d}.nc"
-
-
 def _regrid(
     field,
     dataset,
@@ -213,6 +214,7 @@ def iter_era5_daily_slices(
     weights_dir: Path,
     *,
     target_source: str,
+    chunking: str = "yearly",
 ) -> Iterable[DailySlice]:
     """Yield one cache-ready day while retaining at most 20 rolling fields."""
     static_path = raw_root / "static" / "era5_static.nc"
@@ -226,30 +228,56 @@ def iter_era5_daily_slices(
     swvl1_history: deque = deque(maxlen=20)
     swvl2_history: deque = deque(maxlen=20)
     z500_history: deque = deque(maxlen=20)
+    selected_months = tuple(sorted({int(value) for value in months}))
     for year in sorted({int(value) for value in years}):
-        for month in sorted({int(value) for value in months}):
+        for chunk_months in month_chunks(selected_months, chunking):
             with ExitStack() as stack:
                 if target_source == "daily_statistics":
-                    tmax_ds = stack.enter_context(NetCDFDataset(_monthly_path(raw_root, "daily_tmax", year, month)))
-                    t2m_ds = stack.enter_context(NetCDFDataset(_monthly_path(raw_root, "daily_t2m", year, month)))
+                    tmax_ds = stack.enter_context(NetCDFDataset(
+                        download_target_path(
+                            raw_root, "daily_tmax", year, chunk_months
+                        )
+                    ))
+                    t2m_ds = stack.enter_context(NetCDFDataset(
+                        download_target_path(
+                            raw_root, "daily_t2m", year, chunk_months
+                        )
+                    ))
                     tmax_reducer = "mean"
                     t2m_reducer = "mean"
                 elif target_source == "hourly_fallback":
-                    hourly_ds = stack.enter_context(NetCDFDataset(_monthly_path(raw_root, "hourly_t2m", year, month)))
+                    hourly_ds = stack.enter_context(NetCDFDataset(
+                        download_target_path(
+                            raw_root, "hourly_t2m", year, chunk_months
+                        )
+                    ))
                     tmax_ds = hourly_ds
                     t2m_ds = hourly_ds
                     tmax_reducer = "max"
                     t2m_reducer = "mean"
                 else:
                     raise ValueError(f"Unknown target_source={target_source!r}.")
-                single_ds = stack.enter_context(NetCDFDataset(_monthly_path(raw_root, "single_levels", year, month)))
+                single_ds = stack.enter_context(NetCDFDataset(
+                    download_target_path(
+                        raw_root, "single_levels", year, chunk_months
+                    )
+                ))
                 geopotential_ds = stack.enter_context(
-                    NetCDFDataset(_monthly_path(raw_root, "pressure_geopotential", year, month))
+                    NetCDFDataset(download_target_path(
+                        raw_root, "pressure_geopotential", year, chunk_months
+                    ))
                 )
-                pressure850_ds = stack.enter_context(NetCDFDataset(_monthly_path(raw_root, "pressure_850", year, month)))
+                pressure850_ds = stack.enter_context(NetCDFDataset(
+                    download_target_path(
+                        raw_root, "pressure_850", year, chunk_months
+                    )
+                ))
 
                 for valid_date in sorted(_date_indices(tmax_ds)):
-                    if valid_date.year != year or valid_date.month != month:
+                    if (
+                        valid_date.year != year
+                        or valid_date.month not in chunk_months
+                    ):
                         continue
                     tmax = _regrid(
                         _read_day(tmax_ds, "t2m", valid_date, reducer=tmax_reducer),
@@ -466,6 +494,7 @@ def main() -> int:
     parser.add_argument("--resolution", choices=tuple(Config.RESOLUTION_SPECS), default=Config.RESOLUTION)
     parser.add_argument("--years", default="1979-2024")
     parser.add_argument("--months", default=",".join(str(value) for value in MONTHS))
+    parser.add_argument("--chunking", choices=("yearly", "monthly"), default="yearly")
     parser.add_argument("--target_source", choices=("daily_statistics", "hourly_fallback"), default="daily_statistics")
     args = parser.parse_args()
     raw_root = args.raw_dir or args.data_root / "raw" / "era5"
@@ -478,6 +507,7 @@ def main() -> int:
         grid,
         args.data_root / "regrid_weights",
         target_source=args.target_source,
+        chunking=args.chunking,
     )
     metadata = write_zarr_cache(slices, output, grid, target_source=args.target_source)
     print(json.dumps(metadata, indent=2, sort_keys=True))

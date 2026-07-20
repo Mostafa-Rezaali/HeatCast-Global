@@ -66,11 +66,11 @@ NETCDF_VARIABLE_CANDIDATES = {
 
 @dataclass(frozen=True)
 class DownloadTask:
-    """One atomic monthly or static CDS retrieval."""
+    """One atomic annual, monthly, or static CDS retrieval."""
 
     group: str
     year: int
-    month: int
+    months: Tuple[int, ...]
     dataset: Optional[str]
     request: dict
     target: str
@@ -119,16 +119,44 @@ def _days_for_month() -> list[str]:
     return [f"{day:02d}" for day in range(1, 32)]
 
 
-def _target(raw_root: Path, group: str, year: int, month: int) -> Path:
-    return raw_root / group / str(int(year)) / f"{group}_{int(year):04d}{int(month):02d}.nc"
+def month_chunks(
+    months: Sequence[int],
+    chunking: str,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Return one annual month group or twelve independent monthly groups."""
+    selected = tuple(sorted({int(value) for value in months}))
+    if not selected or any(value < 1 or value > 12 for value in selected):
+        raise ValueError(f"Months must be within 1-12, got {selected}.")
+    if str(chunking) == "yearly":
+        return (selected,)
+    if str(chunking) == "monthly":
+        return tuple((value,) for value in selected)
+    raise ValueError("chunking must be 'yearly' or 'monthly'.")
 
 
-def _daily_request(year: int, month: int, statistic: str) -> dict:
+def download_target_path(
+    raw_root: Path,
+    group: str,
+    year: int,
+    months: Sequence[int],
+) -> Path:
+    """Return a collision-free target for one annual or monthly request."""
+    selected = tuple(int(value) for value in months)
+    if selected == MONTHS:
+        label = f"{int(year):04d}"
+    elif len(selected) == 1:
+        label = f"{int(year):04d}{selected[0]:02d}"
+    else:
+        label = f"{int(year):04d}_m{''.join(f'{value:02d}' for value in selected)}"
+    return raw_root / group / str(int(year)) / f"{group}_{label}.nc"
+
+
+def _daily_request(year: int, months: Sequence[int], statistic: str) -> dict:
     return {
         "product_type": "reanalysis",
         "variable": "2m_temperature",
         "year": str(int(year)),
-        "month": f"{int(month):02d}",
+        "month": [f"{int(month):02d}" for month in months],
         "day": _days_for_month(),
         "daily_statistic": str(statistic),
         "time_zone": "utc+00:00",
@@ -140,7 +168,7 @@ def _daily_request(year: int, month: int, statistic: str) -> dict:
 
 def _hourly_request(
     year: int,
-    month: int,
+    months: Sequence[int],
     variables: Sequence[str],
     pressure_levels=None,
     *,
@@ -150,7 +178,7 @@ def _hourly_request(
         "product_type": "reanalysis",
         "variable": list(variables),
         "year": str(int(year)),
-        "month": f"{int(month):02d}",
+        "month": [f"{int(month):02d}" for month in months],
         "day": _days_for_month(),
         "time": list(times),
         "data_format": "netcdf",
@@ -169,17 +197,17 @@ def build_download_tasks(
     target_source: str = "daily_statistics",
     pressure_dataset: Optional[str] = PRESSURE_LEVEL_DATASET,
     enable_heat_index: bool = False,
+    chunking: str = "yearly",
 ) -> Tuple[DownloadTask, ...]:
     """Return deterministic, chunked request tasks without contacting CDS."""
     if target_source not in ("daily_statistics", "hourly_fallback"):
         raise ValueError("target_source must be 'daily_statistics' or 'hourly_fallback'.")
+    chunks = month_chunks(months, chunking)
     tasks = []
     for year in sorted({int(value) for value in years}):
         if year < 1979 or year > 2024:
             raise ValueError(f"ERA5 year must be within 1979-2024, got {year}.")
-        for month in sorted({int(value) for value in months}):
-            if month < 1 or month > 12:
-                raise ValueError(f"Invalid calendar month {month}.")
+        for selected_months in chunks:
             if target_source == "daily_statistics":
                 daily_specs = (
                     ("daily_tmax", "daily_maximum"),
@@ -189,10 +217,14 @@ def build_download_tasks(
                     tasks.append(DownloadTask(
                         group=group,
                         year=year,
-                        month=month,
+                        months=selected_months,
                         dataset=PREFERRED_DAILY_DATASET,
-                        request=_daily_request(year, month, statistic),
-                        target=str(_target(raw_root, group, year, month)),
+                        request=_daily_request(year, selected_months, statistic),
+                        target=str(
+                            download_target_path(
+                                raw_root, group, year, selected_months
+                            )
+                        ),
                         source_choice=target_source,
                     ))
             else:
@@ -200,10 +232,14 @@ def build_download_tasks(
                 tasks.append(DownloadTask(
                     group=group,
                     year=year,
-                    month=month,
+                    months=selected_months,
                     dataset=HOURLY_SINGLE_LEVEL_DATASET,
-                    request=_hourly_request(year, month, ("2m_temperature",)),
-                    target=str(_target(raw_root, group, year, month)),
+                    request=_hourly_request(
+                        year, selected_months, ("2m_temperature",)
+                    ),
+                    target=str(
+                        download_target_path(raw_root, group, year, selected_months)
+                    ),
                     source_choice=target_source,
                 ))
 
@@ -213,32 +249,54 @@ def build_download_tasks(
             tasks.append(DownloadTask(
                 group="single_levels",
                 year=year,
-                month=month,
+                months=selected_months,
                 dataset=HOURLY_SINGLE_LEVEL_DATASET,
-                request=_hourly_request(year, month, single_variables, times=("00:00",)),
-                target=str(_target(raw_root, "single_levels", year, month)),
+                request=_hourly_request(
+                    year, selected_months, single_variables, times=("00:00",)
+                ),
+                target=str(
+                    download_target_path(
+                        raw_root, "single_levels", year, selected_months
+                    )
+                ),
                 source_choice=target_source,
             ))
             tasks.append(DownloadTask(
                 group="pressure_geopotential",
                 year=year,
-                month=month,
+                months=selected_months,
                 dataset=pressure_dataset,
                 request=_hourly_request(
-                    year, month, ("geopotential",), ("300", "500"), times=("00:00",)
+                    year,
+                    selected_months,
+                    ("geopotential",),
+                    ("300", "500"),
+                    times=("00:00",),
                 ),
-                target=str(_target(raw_root, "pressure_geopotential", year, month)),
+                target=str(
+                    download_target_path(
+                        raw_root, "pressure_geopotential", year, selected_months
+                    )
+                ),
                 source_choice=target_source,
             ))
             tasks.append(DownloadTask(
                 group="pressure_850",
                 year=year,
-                month=month,
+                months=selected_months,
                 dataset=pressure_dataset,
                 request=_hourly_request(
-                    year, month, PRESSURE_850_VARIABLES, ("850",), times=("00:00",)
+                    year,
+                    selected_months,
+                    PRESSURE_850_VARIABLES,
+                    ("850",),
+                    times=("00:00",),
                 ),
-                target=str(_target(raw_root, "pressure_850", year, month)),
+                target=str(
+                    download_target_path(
+                        raw_root, "pressure_850", year, selected_months
+                    )
+                ),
                 source_choice=target_source,
             ))
 
@@ -247,7 +305,7 @@ def build_download_tasks(
     tasks.append(DownloadTask(
         group="static",
         year=1979,
-        month=1,
+        months=(1,),
         dataset=HOURLY_SINGLE_LEVEL_DATASET,
         request={
             "product_type": "reanalysis",
@@ -267,6 +325,13 @@ def build_download_tasks(
 
 def _metadata_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ".metadata.json")
+
+
+def _task_record(task: DownloadTask) -> dict:
+    """Return the JSON-stable task contract used for manifests and resumes."""
+    record = asdict(task)
+    record["months"] = list(task.months)
+    return record
 
 
 def validate_download_file(path: Path, task: DownloadTask) -> None:
@@ -307,7 +372,7 @@ def task_complete(task: DownloadTask) -> bool:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    if metadata.get("task") != asdict(task):
+    if metadata.get("task") != _task_record(task):
         return False
     try:
         validate_download_file(target, task)
@@ -333,7 +398,7 @@ def retrieve_task(client, task: DownloadTask) -> str:
         validate_download_file(partial, task)
         partial.replace(target)
         metadata = {
-            "task": asdict(task),
+            "task": _task_record(task),
             "target_source": task.source_choice,
             "utc_days": True,
         }
@@ -417,7 +482,8 @@ def run_tasks(
                     )
                     print(
                         f"CDS queue limited dataset={task.dataset} "
-                        f"group={task.group} year={task.year} month={task.month:02d}; "
+                        f"group={task.group} year={task.year} "
+                        f"months={','.join(f'{value:02d}' for value in task.months)}; "
                         f"retry {retry_number + 1}/{int(max_retries)} "
                         f"in {delay:.0f}s.",
                         flush=True,
@@ -448,6 +514,7 @@ def main() -> int:
     parser.add_argument("--data_root", type=Path, default=Path(Config.DATA_ROOT))
     parser.add_argument("--years", default="1979-2024")
     parser.add_argument("--months", default=",".join(str(value) for value in MONTHS))
+    parser.add_argument("--chunking", choices=("yearly", "monthly"), default="yearly")
     parser.add_argument("--target_source", choices=("daily_statistics", "hourly_fallback"), default="daily_statistics")
     parser.add_argument("--pressure_dataset", default=PRESSURE_LEVEL_DATASET)
     parser.add_argument("--workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
@@ -469,10 +536,14 @@ def main() -> int:
         target_source=args.target_source,
         pressure_dataset=args.pressure_dataset,
         enable_heat_index=args.enable_heat_index,
+        chunking=args.chunking,
     )
     manifest = args.data_root / "manifests" / "era5_download_tasks.json"
     manifest.parent.mkdir(parents=True, exist_ok=True)
-    manifest.write_text(json.dumps([asdict(task) for task in tasks], indent=2), encoding="utf-8")
+    manifest.write_text(
+        json.dumps([_task_record(task) for task in tasks], indent=2),
+        encoding="utf-8",
+    )
     print(f"Wrote {len(tasks)} idempotent tasks to {manifest}")
     if args.manifest_only:
         return 0
