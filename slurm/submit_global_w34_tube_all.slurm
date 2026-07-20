@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/
+WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 TORCHRUN=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/torchrun
 LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28

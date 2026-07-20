@@ -1,9 +1,9 @@
 # HeatCast-Global Production Runbook
 
 This is the production order for the Phase A ERA5 `1.5deg` experiment on UF
-HiPerGator. The code clone is
-`/blue/nessie/mostafarezaali/HeatCast-Global`; runtime data remains external
-under `/blue/nessie/mostafarezaali/HeatCastGlobal/`.
+HiPerGator. The code clone and configured runtime root are both
+`/blue/nessie/mostafarezaali/HeatCast-Global`; generated data directories are
+Git-ignored.
 
 ## 1. Resolve the scientific gates
 
@@ -28,9 +28,9 @@ overlapping, or inferred assignments.
 Required runtime inputs:
 
 ```text
-/blue/nessie/mostafarezaali/HeatCastGlobal/cache/teleconnection_5.npy
-/blue/nessie/mostafarezaali/HeatCastGlobal/drivers/rmm.txt
-/blue/nessie/mostafarezaali/HeatCastGlobal/drivers/nino34.txt
+/blue/nessie/mostafarezaali/HeatCast-Global/cache/teleconnection_5.npy
+/blue/nessie/mostafarezaali/HeatCast-Global/drivers/rmm.txt
+/blue/nessie/mostafarezaali/HeatCast-Global/drivers/nino34.txt
 <approved fold-year JSON>
 ~/.cdsapirc
 ```
@@ -70,8 +70,8 @@ cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_O
 Raw files and the deterministic request manifest are written below:
 
 ```text
-/blue/nessie/mostafarezaali/HeatCastGlobal/raw/era5/
-/blue/nessie/mostafarezaali/HeatCastGlobal/manifests/era5_download_tasks.json
+/blue/nessie/mostafarezaali/HeatCast-Global/raw/era5/
+/blue/nessie/mostafarezaali/HeatCast-Global/manifests/era5_download_tasks.json
 ```
 
 After the download completes and the fold table is approved, rerun the same

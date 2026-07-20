@@ -14,7 +14,7 @@
 set -euo pipefail
 
 REPO_DIR=/blue/nessie/mostafarezaali/HeatCast-Global
-DATA_ROOT=/blue/nessie/mostafarezaali/HeatCastGlobal
+DATA_ROOT=/blue/nessie/mostafarezaali/HeatCast-Global
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 TARGET_SOURCE=${TARGET_SOURCE:-daily_statistics}
 RESOLUTION=${RESOLUTION:-1.5deg}

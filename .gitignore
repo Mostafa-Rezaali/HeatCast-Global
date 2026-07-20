@@ -28,6 +28,10 @@ pnpm-lock.yaml
 *.dat
 cds_cache/
 heatcast_global_netcdf_inventory_*.txt
+raw/
+cache/
+manifests/
+regrid_weights/
 data_cache/
 checkpoints/
 test_prediction_plots/

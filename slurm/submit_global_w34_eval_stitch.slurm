@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/
+WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 RESOLUTION=${RESOLUTION:-1.5deg}
 FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}

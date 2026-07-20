@@ -229,7 +229,7 @@ class Config:
     # ==================== DOMAIN AND SCIENTIFIC MODE ====================
     VALID_DOMAINS = ("conus", "global")
     DOMAIN = os.environ.get("HEATCAST_DOMAIN", "global").strip().lower()
-    DATA_ROOT = "/blue/nessie/mostafarezaali/HeatCastGlobal/"
+    DATA_ROOT = "/blue/nessie/mostafarezaali/HeatCast-Global/"
     CONUS_DATA_ROOT = "/blue/nessie/mostafarezaali/Teleconnection/"
     RESOLUTION_SPECS = {
         "1.5deg": {"shape": (121, 240), "mesh_level": 5},
