@@ -25,6 +25,7 @@ PREFERRED_DAILY_DATASET = "derived-era5-single-levels-daily-statistics"
 HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"
 PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"
 CDS_CLIMATE_API_URL = "https://cds.climate.copernicus.eu/api"
+DEFAULT_DOWNLOAD_WORKERS = 8
 YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))
 MONTHS: Tuple[int, ...] = tuple(range(1, 13))
 HOURS: Tuple[str, ...] = tuple(f"{hour:02d}:00" for hour in range(24))
@@ -344,8 +345,14 @@ def run_tasks(tasks: Iterable[DownloadTask], workers: int) -> None:
     """Run bounded independent CDS requests with one client per worker task."""
     if int(workers) < 1:
         raise ValueError("workers must be at least one.")
+    pending_tasks = tuple(tasks)
     config_path = validate_cds_endpoint()
     os.environ["CDSAPI_RC"] = str(config_path)
+    print(
+        f"Starting {len(pending_tasks)} CDS tasks with "
+        f"{int(workers)} parallel download workers.",
+        flush=True,
+    )
 
     def execute(task):
         try:
@@ -357,9 +364,12 @@ def run_tasks(tasks: Iterable[DownloadTask], workers: int) -> None:
         return retrieve_task(cdsapi.Client(), task)
 
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
-        futures = {executor.submit(execute, task): task for task in tasks}
-        for future in as_completed(futures):
-            print(future.result(), flush=True)
+        futures = {executor.submit(execute, task): task for task in pending_tasks}
+        for completed, future in enumerate(as_completed(futures), start=1):
+            print(
+                f"[{completed}/{len(futures)}] {future.result()}",
+                flush=True,
+            )
 
 
 def parse_years(text: str) -> Tuple[int, ...]:
@@ -378,7 +388,7 @@ def main() -> int:
     parser.add_argument("--months", default=",".join(str(value) for value in MONTHS))
     parser.add_argument("--target_source", choices=("daily_statistics", "hourly_fallback"), default="daily_statistics")
     parser.add_argument("--pressure_dataset", default=PRESSURE_LEVEL_DATASET)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
     parser.add_argument("--enable_heat_index", action="store_true", default=Config.ENABLE_HEAT_INDEX)
     parser.add_argument("--manifest_only", action="store_true")
     args = parser.parse_args()

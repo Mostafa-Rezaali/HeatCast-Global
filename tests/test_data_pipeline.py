@@ -2,6 +2,9 @@
 
 from datetime import date, timedelta
 from pathlib import Path
+import sys
+import threading
+import types
 
 import numpy as np
 import pytest
@@ -11,10 +14,12 @@ from data_pipeline.build_cache import CACHE_CHANNELS, DailySlice, LazyGlobalZarr
 from data_pipeline.check_cache import check_cached_slice
 from data_pipeline.download_era5 import (
     CDS_CLIMATE_API_URL,
+    DEFAULT_DOWNLOAD_WORKERS,
     PREFERRED_DAILY_DATASET,
     PRESSURE_LEVEL_DATASET,
     build_download_tasks,
     retrieve_task,
+    run_tasks,
     task_complete,
     validate_cds_endpoint,
 )
@@ -25,6 +30,7 @@ from spatial_weights import weighted_spatial_mean
 
 
 def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path: Path):
+    assert DEFAULT_DOWNLOAD_WORKERS == 8
     tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
     assert len(tasks) == 6
     assert {task.group for task in tasks} == {
@@ -71,6 +77,43 @@ def test_era5_endpoint_preflight_rejects_ecds_without_exposing_key(
         encoding="utf-8",
     )
     assert validate_cds_endpoint(good) == good
+
+
+def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+
+    barrier = threading.Barrier(2)
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def fake_retrieve(_client, task):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        barrier.wait(timeout=2.0)
+        with lock:
+            state["active"] -= 1
+        return f"retrieved fixture {task.group}"
+
+    monkeypatch.setattr(downloader, "retrieve_task", fake_retrieve)
+    tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))[:2]
+    run_tasks(tasks, workers=2)
+    output = capsys.readouterr().out
+    assert state["maximum"] == 2
+    assert "2 parallel download workers" in output
+    assert "[2/2]" in output
 
 
 def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):

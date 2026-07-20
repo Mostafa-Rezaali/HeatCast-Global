@@ -304,6 +304,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             'HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"',
             'PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"',
             'CDS_CLIMATE_API_URL = "https://cds.climate.copernicus.eu/api"',
+            "DEFAULT_DOWNLOAD_WORKERS = 8",
             'YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))',
             '"data_format": "netcdf"',
             '"download_format": "unarchived"',
@@ -316,6 +317,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "def validate_cds_endpoint(",
             "config_path = validate_cds_endpoint()",
             'ThreadPoolExecutor(max_workers=int(workers))',
+            "enumerate(as_completed(futures), start=1)",
         ),
     ))
 
@@ -361,9 +363,11 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "unset PYTHONHOME PYTHONPATH",
             "ERA5_CDS_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}",
             'export CDSAPI_RC="$ERA5_CDS_RC"',
+            "DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}",
             "ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}",
             "DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}",
             '--data_root "$DATA_ROOT"',
+            '--workers "$DOWNLOAD_WORKERS"',
             "data_pipeline.download_era5",
             "data_pipeline.build_cache",
         ),

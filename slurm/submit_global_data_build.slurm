@@ -18,7 +18,7 @@ TARGET_SOURCE=${TARGET_SOURCE:-daily_statistics}
 RESOLUTION=${RESOLUTION:-1.5deg}
 YEARS=${YEARS:-1979-2024}
 MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
-DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-4}
+DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
 BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
 ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
@@ -37,8 +37,15 @@ test -s "$CDSAPI_RC" || {
     echo "Missing ERA5 CDS credentials at $CDSAPI_RC. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
     exit 2
 }
+case "$DOWNLOAD_WORKERS" in
+    ''|*[!0-9]*|0)
+        echo "DOWNLOAD_WORKERS must be a positive integer; got '$DOWNLOAD_WORKERS'."
+        exit 2
+        ;;
+esac
 
 git pull --ff-only origin main
+echo "ERA5 download concurrency: $DOWNLOAD_WORKERS parallel CDS requests"
 "$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py
 "$PY" src/repo_integrity.py
 
