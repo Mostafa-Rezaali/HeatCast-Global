@@ -19,6 +19,9 @@ RESOLUTION=${RESOLUTION:-1.5deg}
 YEARS=${YEARS:-1979-2024}
 MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
+DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-1}
+DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
+DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
 BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
 ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
@@ -43,9 +46,21 @@ case "$DOWNLOAD_WORKERS" in
         exit 2
         ;;
 esac
+case "$DOWNLOAD_PER_DATASET" in
+    ''|*[!0-9]*|0)
+        echo "DOWNLOAD_PER_DATASET must be a positive integer; got '$DOWNLOAD_PER_DATASET'."
+        exit 2
+        ;;
+esac
+case "$DOWNLOAD_MAX_RETRIES" in
+    ''|*[!0-9]*)
+        echo "DOWNLOAD_MAX_RETRIES must be a nonnegative integer; got '$DOWNLOAD_MAX_RETRIES'."
+        exit 2
+        ;;
+esac
 
 git pull --ff-only origin main
-echo "ERA5 download concurrency: $DOWNLOAD_WORKERS parallel CDS requests"
+echo "ERA5 download concurrency: $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
 "$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py
 "$PY" src/repo_integrity.py
 
@@ -57,7 +72,10 @@ echo "ERA5 download concurrency: $DOWNLOAD_WORKERS parallel CDS requests"
       --months "$MONTHS" \
       --target_source "$TARGET_SOURCE" \
       --pressure_dataset "$ERA5_PRESSURE_DATASET" \
-      --workers "$DOWNLOAD_WORKERS"
+      --workers "$DOWNLOAD_WORKERS" \
+      --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
+      --max_retries "$DOWNLOAD_MAX_RETRIES" \
+      --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS"
 )
 
 if [ "$DOWNLOAD_ONLY" = "1" ]; then

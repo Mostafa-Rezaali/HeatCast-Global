@@ -80,13 +80,16 @@ Submit the download alone first:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0 slurm/submit_global_data_build.slurm
 ```
 
-The downloader runs eight monthly CDS requests concurrently by default and
-prints a completion counter. Override the bounded concurrency at submission
-time when needed, for example with `DOWNLOAD_WORKERS=12`; completed valid
-files remain resume-safe:
+The downloader runs eight local worker threads, but admits at most one active
+request per CDS dataset. The three ERA5 collections can therefore progress in
+parallel without flooding any one dataset queue. Temporary CDS queue-limit
+responses are retried automatically with exponential backoff from 60 seconds
+to 15 minutes; completed valid files remain resume-safe. `DOWNLOAD_WORKERS`
+controls the local task pool, while `DOWNLOAD_PER_DATASET=1` should remain the
+production default:
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0,DOWNLOAD_WORKERS=12 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0,DOWNLOAD_WORKERS=8,DOWNLOAD_PER_DATASET=1 slurm/submit_global_data_build.slurm
 ```
 
 Raw files and the deterministic request manifest are written below:

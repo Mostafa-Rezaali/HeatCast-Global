@@ -4,6 +4,7 @@ from datetime import date, timedelta
 from pathlib import Path
 import sys
 import threading
+import time
 import types
 
 import numpy as np
@@ -15,9 +16,12 @@ from data_pipeline.check_cache import check_cached_slice
 from data_pipeline.download_era5 import (
     CDS_CLIMATE_API_URL,
     DEFAULT_DOWNLOAD_WORKERS,
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_PER_DATASET_WORKERS,
     PREFERRED_DAILY_DATASET,
     PRESSURE_LEVEL_DATASET,
     build_download_tasks,
+    is_retryable_cds_error,
     retrieve_task,
     run_tasks,
     task_complete,
@@ -31,6 +35,8 @@ from spatial_weights import weighted_spatial_mean
 
 def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path: Path):
     assert DEFAULT_DOWNLOAD_WORKERS == 8
+    assert DEFAULT_PER_DATASET_WORKERS == 1
+    assert DEFAULT_MAX_RETRIES == 12
     tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
     assert len(tasks) == 6
     assert {task.group for task in tasks} == {
@@ -108,12 +114,89 @@ def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys
         return f"retrieved fixture {task.group}"
 
     monkeypatch.setattr(downloader, "retrieve_task", fake_retrieve)
-    tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))[:2]
+    all_tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
+    tasks = (
+        next(task for task in all_tasks if task.group == "daily_tmax"),
+        next(task for task in all_tasks if task.group == "single_levels"),
+    )
     run_tasks(tasks, workers=2)
     output = capsys.readouterr().out
     assert state["maximum"] == 2
-    assert "2 parallel download workers" in output
+    assert "2 local workers" in output
     assert "[2/2]" in output
+
+
+def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def observed_retrieve(_client, task):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        return f"retrieved fixture {task.group}"
+
+    monkeypatch.setattr(downloader, "retrieve_task", observed_retrieve)
+    tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))[:2]
+    run_tasks(tasks, workers=2, per_dataset_workers=1)
+    assert tasks[0].dataset == tasks[1].dataset
+    assert state["maximum"] == 1
+
+
+def test_cds_queue_limit_retries_with_backoff(tmp_path: Path, monkeypatch, capsys):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    attempts = []
+    sleeps = []
+
+    def throttled_once(_client, task):
+        attempts.append(task.group)
+        if len(attempts) == 1:
+            raise RuntimeError(
+                "Number queued requests for this dataset is temporarily limited."
+            )
+        return f"retrieved fixture {task.group}"
+
+    monkeypatch.setattr(downloader, "retrieve_task", throttled_once)
+    monkeypatch.setattr(downloader.time, "sleep", sleeps.append)
+    task = build_download_tasks(tmp_path, years=(1979,), months=(1,))[0]
+    run_tasks(
+        (task,),
+        workers=1,
+        max_retries=2,
+        retry_base_seconds=0.25,
+    )
+    assert len(attempts) == 2
+    assert sleeps == [0.25]
+    assert "retry 1/2 in 0s" in capsys.readouterr().out
+    assert is_retryable_cds_error(RuntimeError("unrelated failure")) is False
 
 
 def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):

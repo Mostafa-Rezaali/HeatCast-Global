@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -26,6 +28,10 @@ HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"
 PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"
 CDS_CLIMATE_API_URL = "https://cds.climate.copernicus.eu/api"
 DEFAULT_DOWNLOAD_WORKERS = 8
+DEFAULT_PER_DATASET_WORKERS = 1
+DEFAULT_MAX_RETRIES = 12
+DEFAULT_RETRY_BASE_SECONDS = 60.0
+MAX_RETRY_DELAY_SECONDS = 900.0
 YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))
 MONTHS: Tuple[int, ...] = tuple(range(1, 13))
 HOURS: Tuple[str, ...] = tuple(f"{hour:02d}:00" for hour in range(24))
@@ -341,16 +347,50 @@ def retrieve_task(client, task: DownloadTask) -> str:
     return f"retrieved: {target}"
 
 
-def run_tasks(tasks: Iterable[DownloadTask], workers: int) -> None:
-    """Run bounded independent CDS requests with one client per worker task."""
+def is_retryable_cds_error(error: Exception) -> bool:
+    """Return whether CDS reports transient queue pressure or server failure."""
+    message = str(error).lower()
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    queue_markers = (
+        "number queued requests for this dataset is temporarily limited",
+        "queued requests per user",
+        "too many requests",
+        "temporarily unavailable",
+    )
+    return status_code in (429, 500, 502, 503, 504) or any(
+        marker in message for marker in queue_markers
+    )
+
+
+def run_tasks(
+    tasks: Iterable[DownloadTask],
+    workers: int,
+    *,
+    per_dataset_workers: int = DEFAULT_PER_DATASET_WORKERS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
+) -> None:
+    """Run parallel CDS requests with per-dataset limits and queue backoff."""
     if int(workers) < 1:
         raise ValueError("workers must be at least one.")
+    if int(per_dataset_workers) < 1:
+        raise ValueError("per_dataset_workers must be at least one.")
+    if int(max_retries) < 0:
+        raise ValueError("max_retries cannot be negative.")
+    if float(retry_base_seconds) < 0:
+        raise ValueError("retry_base_seconds cannot be negative.")
     pending_tasks = tuple(tasks)
     config_path = validate_cds_endpoint()
     os.environ["CDSAPI_RC"] = str(config_path)
+    dataset_gates = {
+        dataset: threading.BoundedSemaphore(int(per_dataset_workers))
+        for dataset in {task.dataset for task in pending_tasks}
+    }
     print(
         f"Starting {len(pending_tasks)} CDS tasks with "
-        f"{int(workers)} parallel download workers.",
+        f"{int(workers)} local workers, at most {int(per_dataset_workers)} "
+        "active request(s) per dataset, and automatic queue backoff.",
         flush=True,
     )
 
@@ -361,7 +401,29 @@ def run_tasks(tasks: Iterable[DownloadTask], workers: int) -> None:
             raise RuntimeError(
                 "Install cdsapi and configure ~/.cdsapirc-era5 on HiPerGator."
             ) from exc
-        return retrieve_task(cdsapi.Client(), task)
+        with dataset_gates[task.dataset]:
+            for retry_number in range(int(max_retries) + 1):
+                try:
+                    return retrieve_task(cdsapi.Client(), task)
+                except Exception as exc:
+                    if (
+                        not is_retryable_cds_error(exc)
+                        or retry_number >= int(max_retries)
+                    ):
+                        raise
+                    delay = min(
+                        float(retry_base_seconds) * (2 ** retry_number),
+                        MAX_RETRY_DELAY_SECONDS,
+                    )
+                    print(
+                        f"CDS queue limited dataset={task.dataset} "
+                        f"group={task.group} year={task.year} month={task.month:02d}; "
+                        f"retry {retry_number + 1}/{int(max_retries)} "
+                        f"in {delay:.0f}s.",
+                        flush=True,
+                    )
+                    time.sleep(delay)
+        raise AssertionError("CDS retry loop ended unexpectedly.")
 
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:
         futures = {executor.submit(execute, task): task for task in pending_tasks}
@@ -389,6 +451,13 @@ def main() -> int:
     parser.add_argument("--target_source", choices=("daily_statistics", "hourly_fallback"), default="daily_statistics")
     parser.add_argument("--pressure_dataset", default=PRESSURE_LEVEL_DATASET)
     parser.add_argument("--workers", type=int, default=DEFAULT_DOWNLOAD_WORKERS)
+    parser.add_argument(
+        "--per_dataset_workers", type=int, default=DEFAULT_PER_DATASET_WORKERS
+    )
+    parser.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument(
+        "--retry_base_seconds", type=float, default=DEFAULT_RETRY_BASE_SECONDS
+    )
     parser.add_argument("--enable_heat_index", action="store_true", default=Config.ENABLE_HEAT_INDEX)
     parser.add_argument("--manifest_only", action="store_true")
     args = parser.parse_args()
@@ -407,7 +476,13 @@ def main() -> int:
     print(f"Wrote {len(tasks)} idempotent tasks to {manifest}")
     if args.manifest_only:
         return 0
-    run_tasks(tasks, args.workers)
+    run_tasks(
+        tasks,
+        args.workers,
+        per_dataset_workers=args.per_dataset_workers,
+        max_retries=args.max_retries,
+        retry_base_seconds=args.retry_base_seconds,
+    )
     return 0
 
 
