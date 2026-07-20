@@ -5,11 +5,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from netCDF4 import Dataset as NetCDFDataset
 
 from data_pipeline.build_cache import CACHE_CHANNELS, DailySlice, LazyGlobalZarrDataset, write_zarr_cache
 from data_pipeline.check_cache import check_cached_slice
 from data_pipeline.download_era5 import (
     PREFERRED_DAILY_DATASET,
+    PRESSURE_LEVEL_DATASET,
     build_download_tasks,
     retrieve_task,
     task_complete,
@@ -20,7 +22,7 @@ from global_dataset import GlobalHeatCastDataset, identity_preprocessor
 from spatial_weights import weighted_spatial_mean
 
 
-def test_download_manifest_is_chunked_and_does_not_guess_pressure_dataset(tmp_path: Path):
+def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path: Path):
     tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
     assert len(tasks) == 6
     assert {task.group for task in tasks} == {
@@ -31,11 +33,21 @@ def test_download_manifest_is_chunked_and_does_not_guess_pressure_dataset(tmp_pa
     assert daily.dataset == PREFERRED_DAILY_DATASET
     assert daily.request["daily_statistic"] == "daily_maximum"
     assert daily.request["time_zone"] == "utc+00:00"
+    assert daily.request["data_format"] == "netcdf"
+    assert daily.request["download_format"] == "unarchived"
     assert all(task.year == 1979 for task in tasks)
     pressure = next(task for task in tasks if task.group == "pressure_850")
-    assert pressure.dataset is None
-    with pytest.raises(RuntimeError, match=r"TODO\(USER\)"):
-        retrieve_task(object(), pressure)
+    assert pressure.dataset == PRESSURE_LEVEL_DATASET == "reanalysis-era5-pressure-levels"
+    assert pressure.request["time"] == ["00:00"]
+    assert pressure.request["data_format"] == "netcdf"
+    blocked = next(
+        task for task in build_download_tasks(
+            tmp_path, years=(1979,), months=(1,), pressure_dataset=None
+        )
+        if task.group == "pressure_850"
+    )
+    with pytest.raises(RuntimeError, match="Pressure-level CDS dataset is empty"):
+        retrieve_task(object(), blocked)
 
 
 def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
@@ -52,7 +64,16 @@ def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
         def retrieve(self, dataset, request, target):
             self.calls += 1
             assert dataset == PREFERRED_DAILY_DATASET
-            Path(target).write_bytes(b"fixture-netcdf")
+            with NetCDFDataset(target, "w") as output:
+                output.createDimension("valid_time", 1)
+                output.createDimension("latitude", 2)
+                output.createDimension("longitude", 3)
+                output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
+                output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
+                output.createVariable("longitude", "f4", ("longitude",))[:] = [0.0, 120.0, 240.0]
+                output.createVariable(
+                    "t2m", "f4", ("valid_time", "latitude", "longitude")
+                )[:] = 280.0
 
     client = Client()
     assert "retrieved:" in retrieve_task(client, task)

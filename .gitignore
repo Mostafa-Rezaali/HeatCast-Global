@@ -27,6 +27,7 @@ pnpm-lock.yaml
 *.grib2
 *.dat
 cds_cache/
+heatcast_global_netcdf_inventory_*.txt
 data_cache/
 checkpoints/
 test_prediction_plots/

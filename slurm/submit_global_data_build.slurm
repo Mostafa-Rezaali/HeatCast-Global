@@ -13,16 +13,19 @@
 
 set -euo pipefail
 
-WORK_DIR=/blue/nessie/mostafarezaali/HeatCastGlobal/
+REPO_DIR=/blue/nessie/mostafarezaali/HeatCast-Global
+DATA_ROOT=/blue/nessie/mostafarezaali/HeatCastGlobal
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 TARGET_SOURCE=${TARGET_SOURCE:-daily_statistics}
 RESOLUTION=${RESOLUTION:-1.5deg}
 YEARS=${YEARS:-1979-2024}
+MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-4}
 BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
-: "${ERA5_PRESSURE_DATASET:?TODO(USER): pin and export the pressure-level CDS dataset identifier}"
+DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
+ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
 
-cd "$WORK_DIR"
+cd "$REPO_DIR"
 module load cuda/12.9.1
 unset PYTHONHOME PYTHONPATH
 export PYTHONUNBUFFERED=1
@@ -44,23 +47,30 @@ git pull --ff-only origin main
 (
     cd src
     "$PY" -m data_pipeline.download_era5 \
-      --data_root "$WORK_DIR" \
+      --data_root "$DATA_ROOT" \
       --years "$YEARS" \
+      --months "$MONTHS" \
       --target_source "$TARGET_SOURCE" \
       --pressure_dataset "$ERA5_PRESSURE_DATASET" \
       --workers "$DOWNLOAD_WORKERS"
 )
 
+if [ "$DOWNLOAD_ONLY" = "1" ]; then
+    echo "MISSING-ONLY ERA5 DOWNLOAD COMPLETE: $DATA_ROOT"
+    exit 0
+fi
+
 (
     cd src
     "$PY" -m data_pipeline.build_cache \
-      --data_root "$WORK_DIR" \
+      --data_root "$DATA_ROOT" \
       --years "$YEARS" \
+      --months "$MONTHS" \
       --resolution "$RESOLUTION" \
       --target_source "$TARGET_SOURCE"
 )
 
-test -s "$WORK_DIR/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
+test -s "$DATA_ROOT/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
 if [ "$BUILD_FOLD_SIDECARS" = "1" ]; then
     FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}
     test -s "$FOLD_YEARS_JSON"
@@ -71,4 +81,4 @@ if [ "$BUILD_FOLD_SIDECARS" = "1" ]; then
           --resolution "$RESOLUTION"
     done
 fi
-echo "GLOBAL ERA5 CACHE BUILD COMPLETE: $WORK_DIR/cache/era5_${RESOLUTION}.zarr"
+echo "GLOBAL ERA5 CACHE BUILD COMPLETE: $DATA_ROOT/cache/era5_${RESOLUTION}.zarr"

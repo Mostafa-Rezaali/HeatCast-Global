@@ -118,9 +118,10 @@ and Phase B checklist are in [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 Production workflows target UF HiPerGator B200 nodes with `cuda/12.9.1` and
 the Python/torchrun executables under
-`/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/`. The single global
-data root is `/blue/nessie/mostafarezaali/HeatCastGlobal/`; code and Slurm
-workflows obtain it from `Config`.
+`/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/`. The code clone is
+`/blue/nessie/mostafarezaali/HeatCast-Global`; the separate global data root is
+`/blue/nessie/mostafarezaali/HeatCastGlobal/`. Slurm workflows keep repository
+code and downloaded runtime data in those distinct locations.
 
 ## Verification
 

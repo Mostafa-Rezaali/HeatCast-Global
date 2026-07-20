@@ -1,7 +1,8 @@
 # HeatCast-Global Production Runbook
 
 This is the production order for the Phase A ERA5 `1.5deg` experiment on UF
-HiPerGator. The repository remains code-only; all paths below are runtime paths
+HiPerGator. The code clone is
+`/blue/nessie/mostafarezaali/HeatCast-Global`; runtime data remains external
 under `/blue/nessie/mostafarezaali/HeatCastGlobal/`.
 
 ## 1. Resolve the scientific gates
@@ -52,15 +53,34 @@ git status --short
 Expected: every contract passes, pytest is green, the smoke result reports
 `grid_shape=[121,240]`, and Git contains no data/runtime artifacts.
 
-## 3. Build ERA5 cache and fold sidecars
+## 3. Download fresh ERA5, then build the cache and fold sidecars
 
-Export the exact CDS pressure-level dataset identifier only after it is
-approved. The job downloads monthly chunks, conservatively regrids Tmax,
-bilinearly regrids predictors, writes `time=1` zarr chunks, and then builds all
-five fold-safe normalization and week3/week4/W34 threshold sidecars.
+The pressure-level source is pinned to the official CDS identifier
+`reanalysis-era5-pressure-levels`. The fresh-data workflow does not inspect or
+reuse the original HeatCast archive. Requests cover every month of 1979--2024,
+write unarchived NetCDF, validate each header before its atomic rename, and
+resume by skipping only files whose task metadata and NetCDF headers agree.
+
+Submit the download alone first:
 
 ```bash
-sbatch --export=ALL,ERA5_PRESSURE_DATASET='<approved-id>',FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0 slurm/submit_global_data_build.slurm
+```
+
+Raw files and the deterministic request manifest are written below:
+
+```text
+/blue/nessie/mostafarezaali/HeatCastGlobal/raw/era5/
+/blue/nessie/mostafarezaali/HeatCastGlobal/manifests/era5_download_tasks.json
+```
+
+After the download completes and the fold table is approved, rerun the same
+workflow to conservatively regrid Tmax, bilinearly regrid predictors, write
+`time=1` zarr chunks, and build the five fold-safe normalization and
+week3/week4/W34 threshold sidecars:
+
+```bash
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
 ```
 
 This is CPU/I/O work and requests no GPU. The expected cache is:

@@ -15,12 +15,14 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
 
+from netCDF4 import Dataset as NetCDFDataset
+
 from cfm_mesh_train import Config
 
 
 PREFERRED_DAILY_DATASET = "derived-era5-single-levels-daily-statistics"
 HOURLY_SINGLE_LEVEL_DATASET = "reanalysis-era5-single-levels"
-PRESSURE_LEVEL_DATASET = None  # TODO(USER): pin the CDS pressure-level dataset identifier.
+PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"
 YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))
 MONTHS: Tuple[int, ...] = tuple(range(1, 13))
 HOURS: Tuple[str, ...] = tuple(f"{hour:02d}:00" for hour in range(24))
@@ -37,6 +39,20 @@ PRESSURE_850_VARIABLES: Tuple[str, ...] = (
     "u_component_of_wind",
     "v_component_of_wind",
 )
+NETCDF_VARIABLE_CANDIDATES = {
+    "2m_temperature": ("t2m", "2m_temperature"),
+    "2m_dewpoint_temperature": ("d2m", "2m_dewpoint_temperature"),
+    "volumetric_soil_water_layer_1": ("swvl1", "volumetric_soil_water_layer_1"),
+    "volumetric_soil_water_layer_2": ("swvl2", "volumetric_soil_water_layer_2"),
+    "sea_surface_temperature": ("sst", "sea_surface_temperature"),
+    "mean_sea_level_pressure": ("msl", "mean_sea_level_pressure"),
+    "geopotential": ("z", "geopotential"),
+    "temperature": ("t", "temperature"),
+    "specific_humidity": ("q", "specific_humidity"),
+    "u_component_of_wind": ("u", "u_component_of_wind"),
+    "v_component_of_wind": ("v", "v_component_of_wind"),
+    "land_sea_mask": ("lsm", "land_sea_mask"),
+}
 
 
 @dataclass(frozen=True)
@@ -71,19 +87,28 @@ def _daily_request(year: int, month: int, statistic: str) -> dict:
         "daily_statistic": str(statistic),
         "time_zone": "utc+00:00",
         "frequency": "1_hourly",
-        "format": "netcdf",
+        "data_format": "netcdf",
+        "download_format": "unarchived",
     }
 
 
-def _hourly_request(year: int, month: int, variables: Sequence[str], pressure_levels=None) -> dict:
+def _hourly_request(
+    year: int,
+    month: int,
+    variables: Sequence[str],
+    pressure_levels=None,
+    *,
+    times: Sequence[str] = HOURS,
+) -> dict:
     request = {
         "product_type": "reanalysis",
         "variable": list(variables),
         "year": str(int(year)),
         "month": f"{int(month):02d}",
         "day": _days_for_month(),
-        "time": list(HOURS),
-        "format": "netcdf",
+        "time": list(times),
+        "data_format": "netcdf",
+        "download_format": "unarchived",
     }
     if pressure_levels is not None:
         request["pressure_level"] = list(pressure_levels)
@@ -144,7 +169,7 @@ def build_download_tasks(
                 year=year,
                 month=month,
                 dataset=HOURLY_SINGLE_LEVEL_DATASET,
-                request=_hourly_request(year, month, single_variables),
+                request=_hourly_request(year, month, single_variables, times=("00:00",)),
                 target=str(_target(raw_root, "single_levels", year, month)),
                 source_choice=target_source,
             ))
@@ -153,7 +178,9 @@ def build_download_tasks(
                 year=year,
                 month=month,
                 dataset=pressure_dataset,
-                request=_hourly_request(year, month, ("geopotential",), ("300", "500")),
+                request=_hourly_request(
+                    year, month, ("geopotential",), ("300", "500"), times=("00:00",)
+                ),
                 target=str(_target(raw_root, "pressure_geopotential", year, month)),
                 source_choice=target_source,
             ))
@@ -162,7 +189,9 @@ def build_download_tasks(
                 year=year,
                 month=month,
                 dataset=pressure_dataset,
-                request=_hourly_request(year, month, PRESSURE_850_VARIABLES, ("850",)),
+                request=_hourly_request(
+                    year, month, PRESSURE_850_VARIABLES, ("850",), times=("00:00",)
+                ),
                 target=str(_target(raw_root, "pressure_850", year, month)),
                 source_choice=target_source,
             ))
@@ -181,7 +210,8 @@ def build_download_tasks(
             "month": "01",
             "day": "01",
             "time": "00:00",
-            "format": "netcdf",
+            "data_format": "netcdf",
+            "download_format": "unarchived",
         },
         target=str(static_target),
         source_choice=target_source,
@@ -191,6 +221,34 @@ def build_download_tasks(
 
 def _metadata_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ".metadata.json")
+
+
+def validate_download_file(path: Path, task: DownloadTask) -> None:
+    """Reject archives, corrupt files, and NetCDF payloads missing requested fields."""
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise RuntimeError(f"CDS retrieval produced no data: {path}")
+    try:
+        with NetCDFDataset(str(path)) as dataset:
+            available = set(dataset.variables)
+            if not any(name in available for name in ("latitude", "lat")):
+                raise RuntimeError("missing latitude coordinate")
+            if not any(name in available for name in ("longitude", "lon")):
+                raise RuntimeError("missing longitude coordinate")
+            requested_variables = task.request.get("variable", ())
+            if isinstance(requested_variables, str):
+                requested_variables = (requested_variables,)
+            missing = []
+            for requested in requested_variables:
+                candidates = NETCDF_VARIABLE_CANDIDATES.get(str(requested), (str(requested),))
+                if not any(candidate in available for candidate in candidates):
+                    missing.append(str(requested))
+            if missing:
+                raise RuntimeError(f"missing requested variables {missing}; available={sorted(available)}")
+            if not dataset.dimensions or any(len(value) <= 0 for value in dataset.dimensions.values()):
+                raise RuntimeError("empty NetCDF dimensions")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid NetCDF payload for {task.group}: {path}: {exc}") from exc
 
 
 def task_complete(task: DownloadTask) -> bool:
@@ -203,7 +261,13 @@ def task_complete(task: DownloadTask) -> bool:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
-    return metadata.get("task") == asdict(task)
+    if metadata.get("task") != asdict(task):
+        return False
+    try:
+        validate_download_file(target, task)
+    except RuntimeError:
+        return False
+    return True
 
 
 def retrieve_task(client, task: DownloadTask) -> str:
@@ -212,8 +276,7 @@ def retrieve_task(client, task: DownloadTask) -> str:
         return f"exists, skipping: {task.target}"
     if not task.dataset:
         raise RuntimeError(
-            "Pressure-level CDS dataset is not pinned. Set --pressure_dataset after resolving "
-            "TODO(USER) in docs/DECISIONS_NEEDED.md."
+            "Pressure-level CDS dataset is empty. Pass --pressure_dataset explicitly."
         )
     target = Path(task.target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -221,8 +284,7 @@ def retrieve_task(client, task: DownloadTask) -> str:
     partial.unlink(missing_ok=True)
     try:
         client.retrieve(task.dataset, task.request, str(partial))
-        if not partial.is_file() or partial.stat().st_size <= 0:
-            raise RuntimeError(f"CDS retrieval produced no data: {partial}")
+        validate_download_file(partial, task)
         partial.replace(target)
         metadata = {
             "task": asdict(task),

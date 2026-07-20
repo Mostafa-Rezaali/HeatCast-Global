@@ -36,14 +36,6 @@ download workflow.
 
 This is an operational credential decision; no key or token belongs in Git.
 
-## CDS pressure-level dataset identifier
-
-`TODO(USER)`: Pin the exact CDS dataset identifier used for ERA5 pressure-level
-geopotential, temperature, humidity, and wind retrievals. The prompt specifies
-the variables and levels but deliberately does not name this dataset; therefore
-`download_era5.py` exposes `--pressure_dataset` and production download refuses
-to guess it.
-
 ## W34 storyline summers
 
 `TODO(USER)`: Select one or two case summers that fall inside approved test
