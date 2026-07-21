@@ -14,6 +14,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple
@@ -381,8 +382,8 @@ def task_complete(task: DownloadTask) -> bool:
     return True
 
 
-def retrieve_task(client, task: DownloadTask) -> str:
-    """Retrieve one task atomically, or skip it when its contract matches."""
+def retrieve_task(client, task: DownloadTask, *, request_gate=None) -> str:
+    """Submit, then download one task without holding the CDS request gate."""
     if task_complete(task):
         return f"exists, skipping: {task.target}"
     if not task.dataset:
@@ -394,7 +395,18 @@ def retrieve_task(client, task: DownloadTask) -> str:
     partial = target.with_suffix(target.suffix + ".part")
     partial.unlink(missing_ok=True)
     try:
-        client.retrieve(task.dataset, task.request, str(partial))
+        # Waiting for CDS to prepare a result consumes the per-dataset request
+        # slot.  The subsequent HTTP transfer does not: release the slot as
+        # soon as CDS reports success so another request can start while this
+        # result downloads.
+        gate = request_gate if request_gate is not None else nullcontext()
+        with gate:
+            result = client.retrieve(task.dataset, task.request)
+        print(
+            f"CDS result ready; downloading group={task.group} year={task.year}",
+            flush=True,
+        )
+        result.download(str(partial))
         validate_download_file(partial, task)
         partial.replace(target)
         metadata = {
@@ -466,29 +478,32 @@ def run_tasks(
             raise RuntimeError(
                 "Install cdsapi and configure ~/.cdsapirc-era5 on HiPerGator."
             ) from exc
-        with dataset_gates[task.dataset]:
-            for retry_number in range(int(max_retries) + 1):
-                try:
-                    return retrieve_task(cdsapi.Client(), task)
-                except Exception as exc:
-                    if (
-                        not is_retryable_cds_error(exc)
-                        or retry_number >= int(max_retries)
-                    ):
-                        raise
-                    delay = min(
-                        float(retry_base_seconds) * (2 ** retry_number),
-                        MAX_RETRY_DELAY_SECONDS,
-                    )
-                    print(
-                        f"CDS queue limited dataset={task.dataset} "
-                        f"group={task.group} year={task.year} "
-                        f"months={','.join(f'{value:02d}' for value in task.months)}; "
-                        f"retry {retry_number + 1}/{int(max_retries)} "
-                        f"in {delay:.0f}s.",
-                        flush=True,
-                    )
-                    time.sleep(delay)
+        for retry_number in range(int(max_retries) + 1):
+            try:
+                return retrieve_task(
+                    cdsapi.Client(),
+                    task,
+                    request_gate=dataset_gates[task.dataset],
+                )
+            except Exception as exc:
+                if (
+                    not is_retryable_cds_error(exc)
+                    or retry_number >= int(max_retries)
+                ):
+                    raise
+                delay = min(
+                    float(retry_base_seconds) * (2 ** retry_number),
+                    MAX_RETRY_DELAY_SECONDS,
+                )
+                print(
+                    f"CDS queue limited dataset={task.dataset} "
+                    f"group={task.group} year={task.year} "
+                    f"months={','.join(f'{value:02d}' for value in task.months)}; "
+                    f"retry {retry_number + 1}/{int(max_retries)} "
+                    f"in {delay:.0f}s.",
+                    flush=True,
+                )
+                time.sleep(delay)
         raise AssertionError("CDS retry loop ended unexpectedly.")
 
     with ThreadPoolExecutor(max_workers=int(workers)) as executor:

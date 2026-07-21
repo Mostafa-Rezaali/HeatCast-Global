@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import threading
 import time
@@ -120,13 +121,14 @@ def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys
     state = {"active": 0, "maximum": 0}
     lock = threading.Lock()
 
-    def fake_retrieve(_client, task):
-        with lock:
-            state["active"] += 1
-            state["maximum"] = max(state["maximum"], state["active"])
-        barrier.wait(timeout=2.0)
-        with lock:
-            state["active"] -= 1
+    def fake_retrieve(_client, task, *, request_gate):
+        with request_gate:
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            barrier.wait(timeout=2.0)
+            with lock:
+                state["active"] -= 1
         return f"retrieved fixture {task.group}"
 
     monkeypatch.setattr(downloader, "retrieve_task", fake_retrieve)
@@ -159,13 +161,14 @@ def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
     state = {"active": 0, "maximum": 0}
     lock = threading.Lock()
 
-    def observed_retrieve(_client, task):
-        with lock:
-            state["active"] += 1
-            state["maximum"] = max(state["maximum"], state["active"])
-        time.sleep(0.02)
-        with lock:
-            state["active"] -= 1
+    def observed_retrieve(_client, task, *, request_gate):
+        with request_gate:
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(0.02)
+            with lock:
+                state["active"] -= 1
         return f"retrieved fixture {task.group}"
 
     monkeypatch.setattr(downloader, "retrieve_task", observed_retrieve)
@@ -173,6 +176,55 @@ def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
     run_tasks(tasks, workers=2, per_dataset_workers=1)
     assert tasks[0].dataset == tasks[1].dataset
     assert state["maximum"] == 1
+
+
+def test_same_dataset_next_request_starts_while_previous_result_downloads(
+    tmp_path: Path, monkeypatch
+):
+    import data_pipeline.download_era5 as downloader
+
+    monkeypatch.setattr(downloader, "validate_download_file", lambda _path, _task: None)
+    tasks = tuple(
+        next(
+            task for task in build_download_tasks(
+                tmp_path, years=(year,), months=(1,)
+            )
+            if task.group == "daily_tmax"
+        )
+        for year in (1979, 1980)
+    )
+    request_gate = threading.BoundedSemaphore(1)
+    second_request_started = threading.Event()
+    lock = threading.Lock()
+    request_count = 0
+
+    class Result:
+        def __init__(self, request_number):
+            self.request_number = request_number
+
+        def download(self, target):
+            if self.request_number == 1:
+                assert second_request_started.wait(timeout=2.0)
+            Path(target).write_bytes(b"fixture")
+
+    class Client:
+        def retrieve(self, _dataset, _request):
+            nonlocal request_count
+            with lock:
+                request_count += 1
+                request_number = request_count
+            if request_number == 2:
+                second_request_started.set()
+            return Result(request_number)
+
+    client = Client()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(retrieve_task, client, task, request_gate=request_gate)
+            for task in tasks
+        ]
+        assert all("retrieved:" in future.result(timeout=5.0) for future in futures)
+    assert second_request_started.is_set()
 
 
 def test_cds_queue_limit_retries_with_backoff(tmp_path: Path, monkeypatch, capsys):
@@ -192,12 +244,13 @@ def test_cds_queue_limit_retries_with_backoff(tmp_path: Path, monkeypatch, capsy
     attempts = []
     sleeps = []
 
-    def throttled_once(_client, task):
-        attempts.append(task.group)
-        if len(attempts) == 1:
-            raise RuntimeError(
-                "Number queued requests for this dataset is temporarily limited."
-            )
+    def throttled_once(_client, task, *, request_gate):
+        with request_gate:
+            attempts.append(task.group)
+            if len(attempts) == 1:
+                raise RuntimeError(
+                    "Number queued requests for this dataset is temporarily limited."
+                )
         return f"retrieved fixture {task.group}"
 
     monkeypatch.setattr(downloader, "retrieve_task", throttled_once)
@@ -226,19 +279,23 @@ def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
     class Client:
         calls = 0
 
-        def retrieve(self, dataset, request, target):
+        def retrieve(self, dataset, request):
             self.calls += 1
             assert dataset == PREFERRED_DAILY_DATASET
-            with NetCDFDataset(target, "w") as output:
-                output.createDimension("valid_time", 1)
-                output.createDimension("latitude", 2)
-                output.createDimension("longitude", 3)
-                output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
-                output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
-                output.createVariable("longitude", "f4", ("longitude",))[:] = [0.0, 120.0, 240.0]
-                output.createVariable(
-                    "t2m", "f4", ("valid_time", "latitude", "longitude")
-                )[:] = 280.0
+            class Result:
+                @staticmethod
+                def download(target):
+                    with NetCDFDataset(target, "w") as output:
+                        output.createDimension("valid_time", 1)
+                        output.createDimension("latitude", 2)
+                        output.createDimension("longitude", 3)
+                        output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
+                        output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
+                        output.createVariable("longitude", "f4", ("longitude",))[:] = [0.0, 120.0, 240.0]
+                        output.createVariable(
+                            "t2m", "f4", ("valid_time", "latitude", "longitude")
+                        )[:] = 280.0
+            return Result()
 
     client = Client()
     assert "retrieved:" in retrieve_task(client, task)
