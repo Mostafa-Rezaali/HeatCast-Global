@@ -382,26 +382,24 @@ def task_complete(task: DownloadTask) -> bool:
     return True
 
 
-def retrieve_task(client, task: DownloadTask, *, request_gate=None) -> str:
-    """Submit, then download one task without holding the CDS request gate."""
+def prepare_task(client, task: DownloadTask):
+    """Wait for one CDS result without downloading its payload."""
     if task_complete(task):
-        return f"exists, skipping: {task.target}"
+        return None
     if not task.dataset:
         raise RuntimeError(
             "Pressure-level CDS dataset is empty. Pass --pressure_dataset explicitly."
         )
+    return client.retrieve(task.dataset, task.request)
+
+
+def download_prepared_task(result, task: DownloadTask) -> str:
+    """Download, validate, and atomically publish one prepared CDS result."""
     target = Path(task.target)
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(target.suffix + ".part")
     partial.unlink(missing_ok=True)
     try:
-        # Waiting for CDS to prepare a result consumes the per-dataset request
-        # slot.  The subsequent HTTP transfer does not: release the slot as
-        # soon as CDS reports success so another request can start while this
-        # result downloads.
-        gate = request_gate if request_gate is not None else nullcontext()
-        with gate:
-            result = client.retrieve(task.dataset, task.request)
         print(
             f"CDS result ready; downloading group={task.group} year={task.year}",
             flush=True,
@@ -422,6 +420,16 @@ def retrieve_task(client, task: DownloadTask, *, request_gate=None) -> str:
         partial.unlink(missing_ok=True)
         raise
     return f"retrieved: {target}"
+
+
+def retrieve_task(client, task: DownloadTask, *, request_gate=None) -> str:
+    """Submit, then download one task without holding the CDS request gate."""
+    gate = request_gate if request_gate is not None else nullcontext()
+    with gate:
+        result = prepare_task(client, task)
+    if result is None:
+        return f"exists, skipping: {task.target}"
+    return download_prepared_task(result, task)
 
 
 def is_retryable_cds_error(error: Exception) -> bool:
@@ -460,18 +468,17 @@ def run_tasks(
     pending_tasks = tuple(tasks)
     config_path = validate_cds_endpoint()
     os.environ["CDSAPI_RC"] = str(config_path)
-    dataset_gates = {
-        dataset: threading.BoundedSemaphore(int(per_dataset_workers))
-        for dataset in {task.dataset for task in pending_tasks}
-    }
+    tasks_by_dataset = {}
+    for task in pending_tasks:
+        tasks_by_dataset.setdefault(task.dataset, []).append(task)
     print(
         f"Starting {len(pending_tasks)} CDS tasks with "
-        f"{int(workers)} local workers, at most {int(per_dataset_workers)} "
-        "active request(s) per dataset, and automatic queue backoff.",
+        f"{int(workers)} download workers, {int(per_dataset_workers)} "
+        "independent request lane(s) per dataset, and automatic queue backoff.",
         flush=True,
     )
 
-    def execute(task):
+    def prepare_with_retry(task):
         try:
             import cdsapi
         except ImportError as exc:
@@ -480,11 +487,7 @@ def run_tasks(
             ) from exc
         for retry_number in range(int(max_retries) + 1):
             try:
-                return retrieve_task(
-                    cdsapi.Client(),
-                    task,
-                    request_gate=dataset_gates[task.dataset],
-                )
+                return prepare_task(cdsapi.Client(), task)
             except Exception as exc:
                 if (
                     not is_retryable_cds_error(exc)
@@ -506,13 +509,57 @@ def run_tasks(
                 time.sleep(delay)
         raise AssertionError("CDS retry loop ended unexpectedly.")
 
-    with ThreadPoolExecutor(max_workers=int(workers)) as executor:
-        futures = {executor.submit(execute, task): task for task in pending_tasks}
-        for completed, future in enumerate(as_completed(futures), start=1):
-            print(
-                f"[{completed}/{len(futures)}] {future.result()}",
-                flush=True,
-            )
+    progress_lock = threading.Lock()
+    download_slots = threading.BoundedSemaphore(int(workers))
+    download_futures = []
+    download_futures_lock = threading.Lock()
+    completed = 0
+
+    def report(message):
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            print(f"[{completed}/{len(pending_tasks)}] {message}", flush=True)
+
+    def finish_download(future):
+        download_slots.release()
+        try:
+            report(future.result())
+        except BaseException:
+            # The main thread re-raises the same failure after joining lanes.
+            pass
+
+    with ThreadPoolExecutor(max_workers=int(workers)) as download_executor:
+        def request_lane(lane_tasks):
+            for task in lane_tasks:
+                result = prepare_with_retry(task)
+                if result is None:
+                    report(f"exists, skipping: {task.target}")
+                    continue
+                download_slots.acquire()
+                try:
+                    future = download_executor.submit(download_prepared_task, result, task)
+                except BaseException:
+                    download_slots.release()
+                    raise
+                with download_futures_lock:
+                    download_futures.append(future)
+                future.add_done_callback(finish_download)
+
+        lanes = []
+        for dataset_tasks in tasks_by_dataset.values():
+            lane_count = min(int(per_dataset_workers), len(dataset_tasks))
+            lanes.extend(dataset_tasks[index::lane_count] for index in range(lane_count))
+        with ThreadPoolExecutor(max_workers=len(lanes)) as request_executor:
+            request_futures = [
+                request_executor.submit(request_lane, lane_tasks)
+                for lane_tasks in lanes
+            ]
+            for future in as_completed(request_futures):
+                future.result()
+
+    for future in tuple(download_futures):
+        future.result()
 
 
 def parse_years(text: str) -> Tuple[int, ...]:

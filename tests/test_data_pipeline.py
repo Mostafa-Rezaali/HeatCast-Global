@@ -121,17 +121,21 @@ def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys
     state = {"active": 0, "maximum": 0}
     lock = threading.Lock()
 
-    def fake_retrieve(_client, task, *, request_gate):
-        with request_gate:
-            with lock:
-                state["active"] += 1
-                state["maximum"] = max(state["maximum"], state["active"])
-            barrier.wait(timeout=2.0)
-            with lock:
-                state["active"] -= 1
-        return f"retrieved fixture {task.group}"
+    def fake_prepare(_client, task):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        barrier.wait(timeout=2.0)
+        with lock:
+            state["active"] -= 1
+        return task
 
-    monkeypatch.setattr(downloader, "retrieve_task", fake_retrieve)
+    monkeypatch.setattr(downloader, "prepare_task", fake_prepare)
+    monkeypatch.setattr(
+        downloader,
+        "download_prepared_task",
+        lambda _result, task: f"retrieved fixture {task.group}",
+    )
     all_tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
     tasks = (
         next(task for task in all_tasks if task.group == "daily_tmax"),
@@ -140,7 +144,7 @@ def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys
     run_tasks(tasks, workers=2)
     output = capsys.readouterr().out
     assert state["maximum"] == 2
-    assert "2 local workers" in output
+    assert "2 download workers" in output
     assert "[2/2]" in output
 
 
@@ -161,21 +165,70 @@ def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
     state = {"active": 0, "maximum": 0}
     lock = threading.Lock()
 
-    def observed_retrieve(_client, task, *, request_gate):
-        with request_gate:
-            with lock:
-                state["active"] += 1
-                state["maximum"] = max(state["maximum"], state["active"])
-            time.sleep(0.02)
-            with lock:
-                state["active"] -= 1
-        return f"retrieved fixture {task.group}"
+    def observed_prepare(_client, task):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        return task
 
-    monkeypatch.setattr(downloader, "retrieve_task", observed_retrieve)
+    monkeypatch.setattr(downloader, "prepare_task", observed_prepare)
+    monkeypatch.setattr(
+        downloader,
+        "download_prepared_task",
+        lambda _result, task: f"retrieved fixture {task.group}",
+    )
     tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))[:2]
     run_tasks(tasks, workers=2, per_dataset_workers=1)
     assert tasks[0].dataset == tasks[1].dataset
     assert state["maximum"] == 1
+
+
+def test_congested_dataset_lane_does_not_starve_other_datasets(
+    tmp_path: Path, monkeypatch
+):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    daily_release = threading.Event()
+    single_downloaded = threading.Event()
+
+    def fake_prepare(_client, task):
+        if task.dataset == PREFERRED_DAILY_DATASET:
+            assert daily_release.wait(timeout=5.0)
+        return task
+
+    def fake_download(_result, task):
+        if task.group == "single_levels":
+            single_downloaded.set()
+        return f"retrieved fixture {task.group}"
+
+    monkeypatch.setattr(downloader, "prepare_task", fake_prepare)
+    monkeypatch.setattr(downloader, "download_prepared_task", fake_download)
+    all_tasks = build_download_tasks(tmp_path, years=(1979, 1980), months=(1,))
+    daily_tasks = tuple(
+        task for task in all_tasks if task.dataset == PREFERRED_DAILY_DATASET
+    )
+    single_task = next(task for task in all_tasks if task.group == "single_levels")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_tasks, daily_tasks + (single_task,), workers=2)
+        try:
+            assert single_downloaded.wait(timeout=2.0)
+        finally:
+            daily_release.set()
+        future.result(timeout=5.0)
 
 
 def test_same_dataset_next_request_starts_while_previous_result_downloads(
@@ -244,16 +297,20 @@ def test_cds_queue_limit_retries_with_backoff(tmp_path: Path, monkeypatch, capsy
     attempts = []
     sleeps = []
 
-    def throttled_once(_client, task, *, request_gate):
-        with request_gate:
-            attempts.append(task.group)
-            if len(attempts) == 1:
-                raise RuntimeError(
-                    "Number queued requests for this dataset is temporarily limited."
-                )
-        return f"retrieved fixture {task.group}"
+    def throttled_once(_client, task):
+        attempts.append(task.group)
+        if len(attempts) == 1:
+            raise RuntimeError(
+                "Number queued requests for this dataset is temporarily limited."
+            )
+        return task
 
-    monkeypatch.setattr(downloader, "retrieve_task", throttled_once)
+    monkeypatch.setattr(downloader, "prepare_task", throttled_once)
+    monkeypatch.setattr(
+        downloader,
+        "download_prepared_task",
+        lambda _result, task: f"retrieved fixture {task.group}",
+    )
     monkeypatch.setattr(downloader.time, "sleep", sleeps.append)
     task = build_download_tasks(tmp_path, years=(1979,), months=(1,))[0]
     run_tasks(
