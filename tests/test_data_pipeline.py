@@ -499,6 +499,34 @@ def test_cache_regridding_forces_reusable_scipy_backend(tmp_path: Path, monkeypa
     assert observed["prefer_xesmf"] is False
 
 
+def test_cache_regrids_execute_concurrently_on_in_memory_arrays(tmp_path: Path, monkeypatch):
+    import data_pipeline.build_cache as cache_module
+
+    barrier = threading.Barrier(2)
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def observed_regrid(field, *_args, **_kwargs):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        barrier.wait(timeout=2.0)
+        with lock:
+            state["active"] -= 1
+        return np.asarray(field)
+
+    monkeypatch.setattr(cache_module, "_regrid_array", observed_regrid)
+    requests = {
+        name: (np.full((2, 3), value), np.arange(2), np.arange(3), "bilinear", name)
+        for value, name in enumerate(("first", "second"))
+    }
+    grid = GridSpec(np.array([-45.0, 45.0]), np.array([0.0, 120.0, 240.0]), "fixture")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        output = cache_module._execute_regrid_requests(requests, grid, tmp_path, executor)
+    assert state["maximum"] == 2
+    assert set(output) == set(requests)
+
+
 class LogicalLazyArray:
     """Large logical array that allocates only the requested sample slice."""
 
@@ -565,7 +593,7 @@ def test_slice_checker_detects_agreement_and_corruption():
     assert next(check for check in checks if check.channel == "tmax").passed is False
 
 
-def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path):
+def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path, capsys):
     zarr = pytest.importorskip("zarr")
     grid = GridSpec(np.array([45.0, -45.0]), np.array([0.0, 120.0, 240.0]), "fixture")
 
@@ -578,12 +606,19 @@ def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path):
 
     store = tmp_path / "cache.zarr"
     write_zarr_cache((daily(0), daily(1)), store, grid, target_source="daily_statistics")
-    metadata = write_zarr_cache((daily(0), daily(1), daily(2)), store, grid, target_source="daily_statistics")
+    metadata = write_zarr_cache(
+        (daily(0), daily(1), daily(2)), store, grid,
+        target_source="daily_statistics", progress_every=1,
+    )
     root = zarr.open_group(str(store), mode="r")
     assert root["data"].shape == (3, 2, 3, len(CACHE_CHANNELS))
     assert root["data"].chunks[0] == 1
     assert root["time"][:].tolist() == [20000101, 20000102, 20000103]
     assert metadata["shape"][0] == 3
+    assert "CACHE_PROGRESS committed_days=3" in capsys.readouterr().out
+
+    from data_pipeline.build_cache import cache_resume_context_start
+    assert cache_resume_context_start(store) == date(1999, 12, 16)
 
     lazy_soil = LazyGlobalChannel(store, "swvl1_trailing20")
     selected = lazy_soil.read_pixels_times([0, 5], [0, 2])

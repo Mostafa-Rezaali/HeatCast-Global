@@ -10,10 +10,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time as monotonic_time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
@@ -144,13 +146,21 @@ def _date_indices(dataset) -> Dict[date, Tuple[int, ...]]:
     return {key: tuple(value) for key, value in output.items()}
 
 
-def _read_day(dataset, key: str, valid_date: date, *, level: Optional[int] = None, reducer="mean") -> np.ndarray:
+def _read_day(
+    dataset,
+    key: str,
+    valid_date: date,
+    *,
+    level: Optional[int] = None,
+    reducer="mean",
+    date_lookup: Optional[Mapping[date, Tuple[int, ...]]] = None,
+) -> np.ndarray:
     variable = dataset.variables[_variable_name(dataset, key)]
     dimensions = list(variable.dimensions)
     index = [slice(None)] * variable.ndim
     if any(name in dimensions for name in ("valid_time", "time", "date")):
         time_name = next(name for name in ("valid_time", "time", "date") if name in dimensions)
-        day_indices = _date_indices(dataset).get(valid_date)
+        day_indices = (date_lookup if date_lookup is not None else _date_indices(dataset)).get(valid_date)
         if not day_indices:
             raise KeyError(f"No {valid_date.isoformat()} values for {key} in {dataset.filepath()}.")
         index[dimensions.index(time_name)] = list(day_indices)
@@ -203,6 +213,19 @@ def _regrid(
     label: str,
 ) -> np.ndarray:
     lat, lon = _lat_lon(dataset)
+    return _regrid_array(field, lat, lon, target, method, weights_dir, label)
+
+
+def _regrid_array(
+    field,
+    lat,
+    lon,
+    target: GridSpec,
+    method: str,
+    weights_dir: Path,
+    label: str,
+) -> np.ndarray:
+    """Regrid an in-memory field without touching a NetCDF handle."""
     weights_path = weights_dir / f"{method}_{len(lat)}x{len(lon)}_to_{target.resolution}_{label}.npz"
     return regrid_field(
         field,
@@ -219,6 +242,42 @@ def _regrid(
     )
 
 
+def _execute_regrid_requests(requests, target, weights_dir, executor=None):
+    """Execute independent in-memory regrids serially or on a bounded thread pool."""
+    def execute(specification):
+        field, lat, lon, method, label = specification
+        return _regrid_array(field, lat, lon, target, method, weights_dir, label)
+
+    if executor is None:
+        return {name: execute(specification) for name, specification in requests.items()}
+    futures = {
+        name: executor.submit(execute, specification)
+        for name, specification in requests.items()
+    }
+    return {name: future.result() for name, future in futures.items()}
+
+
+def _date_from_label(value: int) -> date:
+    label = int(value)
+    return date(label // 10000, (label // 100) % 100, label % 100)
+
+
+def cache_resume_context_start(store_path: Path, history_days: int = 20) -> Optional[date]:
+    """Return the first context day needed to resume an existing cache."""
+    path = Path(store_path)
+    if not path.exists():
+        return None
+    root = _require_zarr().open_group(str(path), mode="r")
+    if "time" not in root:
+        return None
+    values = np.asarray(root["time"][:], dtype=np.int32)
+    zero_positions = np.flatnonzero(values == 0)
+    committed = int(zero_positions[0]) if zero_positions.size else int(values.size)
+    if committed <= 0:
+        return None
+    return _date_from_label(int(values[committed - 1])) - timedelta(days=max(0, int(history_days) - 2))
+
+
 def iter_era5_daily_slices(
     raw_root: Path,
     years: Sequence[int],
@@ -228,8 +287,13 @@ def iter_era5_daily_slices(
     *,
     target_source: str,
     chunking: str = "yearly",
+    workers: int = 1,
+    start_date: Optional[date] = None,
 ) -> Iterable[DailySlice]:
-    """Yield one cache-ready day while retaining at most 20 rolling fields."""
+    """Yield cache-ready days with bounded parallel in-memory regridding."""
+    worker_count = int(workers)
+    if worker_count <= 0:
+        raise ValueError("Cache regrid workers must be a positive integer.")
     static_path = raw_root / "static" / "era5_static.nc"
     if not static_path.is_file():
         raise FileNotFoundError(f"Missing ERA5 static download: {static_path}")
@@ -242,125 +306,169 @@ def iter_era5_daily_slices(
     swvl2_history: deque = deque(maxlen=20)
     z500_history: deque = deque(maxlen=20)
     selected_months = tuple(sorted({int(value) for value in months}))
-    for year in sorted({int(value) for value in years}):
-        for chunk_months in month_chunks(selected_months, chunking):
-            with ExitStack() as stack:
-                if target_source == "daily_statistics":
-                    tmax_ds = stack.enter_context(NetCDFDataset(
+    executor = ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
+    try:
+        for year in sorted({int(value) for value in years}):
+            if start_date is not None and year < start_date.year:
+                continue
+            for chunk_months in month_chunks(selected_months, chunking):
+                if start_date is not None and year == start_date.year and max(chunk_months) < start_date.month:
+                    continue
+                with ExitStack() as stack:
+                    if target_source == "daily_statistics":
+                        tmax_ds = stack.enter_context(NetCDFDataset(
+                            download_target_path(
+                                raw_root, "daily_tmax", year, chunk_months
+                            )
+                        ))
+                        t2m_ds = stack.enter_context(NetCDFDataset(
+                            download_target_path(
+                                raw_root, "daily_t2m", year, chunk_months
+                            )
+                        ))
+                        tmax_reducer = "mean"
+                        t2m_reducer = "mean"
+                    elif target_source == "hourly_fallback":
+                        hourly_ds = stack.enter_context(NetCDFDataset(
+                            download_target_path(
+                                raw_root, "hourly_t2m", year, chunk_months
+                            )
+                        ))
+                        tmax_ds = hourly_ds
+                        t2m_ds = hourly_ds
+                        tmax_reducer = "max"
+                        t2m_reducer = "mean"
+                    else:
+                        raise ValueError(f"Unknown target_source={target_source!r}.")
+                    single_ds = stack.enter_context(NetCDFDataset(
                         download_target_path(
-                            raw_root, "daily_tmax", year, chunk_months
+                            raw_root, "single_levels", year, chunk_months
                         )
                     ))
-                    t2m_ds = stack.enter_context(NetCDFDataset(
+                    geopotential_ds = stack.enter_context(
+                        NetCDFDataset(download_target_path(
+                            raw_root, "pressure_geopotential", year, chunk_months
+                        ))
+                    )
+                    pressure850_ds = stack.enter_context(NetCDFDataset(
                         download_target_path(
-                            raw_root, "daily_t2m", year, chunk_months
+                            raw_root, "pressure_850", year, chunk_months
                         )
                     ))
-                    tmax_reducer = "mean"
-                    t2m_reducer = "mean"
-                elif target_source == "hourly_fallback":
-                    hourly_ds = stack.enter_context(NetCDFDataset(
-                        download_target_path(
-                            raw_root, "hourly_t2m", year, chunk_months
-                        )
-                    ))
-                    tmax_ds = hourly_ds
-                    t2m_ds = hourly_ds
-                    tmax_reducer = "max"
-                    t2m_reducer = "mean"
-                else:
-                    raise ValueError(f"Unknown target_source={target_source!r}.")
-                single_ds = stack.enter_context(NetCDFDataset(
-                    download_target_path(
-                        raw_root, "single_levels", year, chunk_months
-                    )
-                ))
-                geopotential_ds = stack.enter_context(
-                    NetCDFDataset(download_target_path(
-                        raw_root, "pressure_geopotential", year, chunk_months
-                    ))
-                )
-                pressure850_ds = stack.enter_context(NetCDFDataset(
-                    download_target_path(
-                        raw_root, "pressure_850", year, chunk_months
-                    )
-                ))
-
-                for valid_date in sorted(_date_indices(tmax_ds)):
-                    if (
-                        valid_date.year != year
-                        or valid_date.month not in chunk_months
-                    ):
-                        continue
-                    tmax = _regrid(
-                        _read_day(tmax_ds, "t2m", valid_date, reducer=tmax_reducer),
-                        tmax_ds, target, "conservative", weights_dir, "tmax",
-                    )
-                    t2m = _regrid(
-                        _read_day(t2m_ds, "t2m", valid_date, reducer=t2m_reducer),
-                        t2m_ds, target, "bilinear", weights_dir, "smooth",
-                    )
-                    smooth = {}
-                    for key in ("swvl1", "swvl2", "sst", "mslp"):
-                        smooth[key] = _regrid(
-                            _read_day(single_ds, key, valid_date),
-                            single_ds, target, "bilinear", weights_dir, "smooth",
-                        )
-                    # Soil moisture is undefined over ocean.  Zero is the neutral
-                    # cached value there; the explicit land mask prevents it from
-                    # being interpreted as an observed ocean soil state.  SST has
-                    # its own validity channel by scientific contract.
-                    for key in ("swvl1", "swvl2"):
-                        smooth[key] = np.where(
-                            np.isfinite(smooth[key]), smooth[key], 0.0
-                        ).astype(np.float32)
-                    z500 = _regrid(
-                        _read_day(geopotential_ds, "z", valid_date, level=500),
-                        geopotential_ds, target, "bilinear", weights_dir, "pressure",
-                    )
-                    z300 = _regrid(
-                        _read_day(geopotential_ds, "z", valid_date, level=300),
-                        geopotential_ds, target, "bilinear", weights_dir, "pressure",
-                    )
-                    pressure850 = {
-                        key: _regrid(
-                            _read_day(pressure850_ds, key, valid_date, level=850),
-                            pressure850_ds, target, "bilinear", weights_dir, "pressure",
-                        )
-                        for key in ("t", "q", "u", "v")
+                    coordinates = {
+                        "tmax": _lat_lon(tmax_ds),
+                        "t2m": _lat_lon(t2m_ds),
+                        "single": _lat_lon(single_ds),
+                        "geopotential": _lat_lon(geopotential_ds),
+                        "pressure850": _lat_lon(pressure850_ds),
                     }
-                    swvl1_history.append(smooth["swvl1"])
-                    swvl2_history.append(smooth["swvl2"])
-                    z500_history.append(z500)
-                    sst_valid = np.isfinite(smooth["sst"]).astype(np.float32)
-                    fields = {
-                        "tmax": tmax,
-                        "t2m_mean": t2m,
-                        "swvl1": smooth["swvl1"],
-                        "swvl1_trailing20": np.nanmean(np.stack(tuple(swvl1_history)), axis=0),
-                        "swvl2_trailing20": np.nanmean(np.stack(tuple(swvl2_history)), axis=0),
-                        "sst": np.where(np.isfinite(smooth["sst"]), smooth["sst"], 0.0),
-                        "sst_valid": sst_valid,
-                        "z500": z500,
-                        "z500_low20": np.nanmean(np.stack(tuple(z500_history)), axis=0),
-                        "mslp": smooth["mslp"],
-                        "t850": pressure850["t"],
-                        "q850": pressure850["q"],
-                        "u850": pressure850["u"],
-                        "v850": pressure850["v"],
-                        "z300": z300,
-                        "orography": orography,
-                        "land_mask": land_mask,
+                    date_lookups = {
+                        "tmax": _date_indices(tmax_ds),
+                        "t2m": _date_indices(t2m_ds),
+                        "single": _date_indices(single_ds),
+                        "geopotential": _date_indices(geopotential_ds),
+                        "pressure850": _date_indices(pressure850_ds),
                     }
-                    nonfinite = tuple(
-                        name for name, value in fields.items()
-                        if not np.all(np.isfinite(value))
-                    )
-                    if nonfinite:
-                        raise RuntimeError(
-                            f"Non-finite regridded ERA5 fields on {valid_date}: {nonfinite}."
+                    for valid_date in sorted(date_lookups["tmax"]):
+                        if (
+                            valid_date.year != year
+                            or valid_date.month not in chunk_months
+                            or (start_date is not None and valid_date < start_date)
+                        ):
+                            continue
+                        requests = {
+                            "tmax": (
+                                _read_day(
+                                    tmax_ds, "t2m", valid_date, reducer=tmax_reducer,
+                                    date_lookup=date_lookups["tmax"],
+                                ),
+                                *coordinates["tmax"], "conservative", "tmax",
+                            ),
+                            "t2m": (
+                                _read_day(
+                                    t2m_ds, "t2m", valid_date, reducer=t2m_reducer,
+                                    date_lookup=date_lookups["t2m"],
+                                ),
+                                *coordinates["t2m"], "bilinear", "smooth",
+                            ),
+                        }
+                        for key in ("swvl1", "swvl2", "sst", "mslp"):
+                            requests[key] = (
+                                _read_day(
+                                    single_ds, key, valid_date,
+                                    date_lookup=date_lookups["single"],
+                                ),
+                                *coordinates["single"], "bilinear", "smooth",
+                            )
+                        for key, level in (("z500", 500), ("z300", 300)):
+                            requests[key] = (
+                                _read_day(
+                                    geopotential_ds, "z", valid_date, level=level,
+                                    date_lookup=date_lookups["geopotential"],
+                                ),
+                                *coordinates["geopotential"], "bilinear", "pressure",
+                            )
+                        for key in ("t", "q", "u", "v"):
+                            requests[f"{key}850"] = (
+                                _read_day(
+                                    pressure850_ds, key, valid_date, level=850,
+                                    date_lookup=date_lookups["pressure850"],
+                                ),
+                                *coordinates["pressure850"], "bilinear", "pressure",
+                            )
+                        regridded = _execute_regrid_requests(
+                            requests, target, weights_dir, executor
                         )
-                    yield DailySlice(valid_date=valid_date, fields=fields)
+                        tmax = regridded["tmax"]
+                        t2m = regridded["t2m"]
+                        smooth = {
+                            key: regridded[key]
+                            for key in ("swvl1", "swvl2", "sst", "mslp")
+                        }
+                        # Soil moisture is undefined over ocean. Zero is neutral
+                        # there because the land mask remains an explicit input.
+                        for key in ("swvl1", "swvl2"):
+                            smooth[key] = np.where(
+                                np.isfinite(smooth[key]), smooth[key], 0.0
+                            ).astype(np.float32)
+                        z500 = regridded["z500"]
+                        z300 = regridded["z300"]
+                        pressure850 = {key: regridded[f"{key}850"] for key in ("t", "q", "u", "v")}
+                        swvl1_history.append(smooth["swvl1"])
+                        swvl2_history.append(smooth["swvl2"])
+                        z500_history.append(z500)
+                        sst_valid = np.isfinite(smooth["sst"]).astype(np.float32)
+                        fields = {
+                            "tmax": tmax,
+                            "t2m_mean": t2m,
+                            "swvl1": smooth["swvl1"],
+                            "swvl1_trailing20": np.nanmean(np.stack(tuple(swvl1_history)), axis=0),
+                            "swvl2_trailing20": np.nanmean(np.stack(tuple(swvl2_history)), axis=0),
+                            "sst": np.where(np.isfinite(smooth["sst"]), smooth["sst"], 0.0),
+                            "sst_valid": sst_valid,
+                            "z500": z500,
+                            "z500_low20": np.nanmean(np.stack(tuple(z500_history)), axis=0),
+                            "mslp": smooth["mslp"],
+                            "t850": pressure850["t"],
+                            "q850": pressure850["q"],
+                            "u850": pressure850["u"],
+                            "v850": pressure850["v"],
+                            "z300": z300,
+                            "orography": orography,
+                            "land_mask": land_mask,
+                        }
+                        nonfinite = tuple(
+                            name for name, value in fields.items()
+                            if not np.all(np.isfinite(value))
+                        )
+                        if nonfinite:
+                            raise RuntimeError(
+                                f"Non-finite regridded ERA5 fields on {valid_date}: {nonfinite}."
+                            )
+                        yield DailySlice(valid_date=valid_date, fields=fields)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def write_zarr_cache(
@@ -369,8 +477,12 @@ def write_zarr_cache(
     grid: GridSpec,
     *,
     target_source: str,
+    progress_every: int = 30,
 ) -> dict:
     """Resume an append-only daily cache with ``time=1`` commit markers."""
+    progress_interval = int(progress_every)
+    if progress_interval <= 0:
+        raise ValueError("Cache progress interval must be a positive integer.")
     zarr = _require_zarr()
     path = Path(store_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,16 +511,25 @@ def write_zarr_cache(
         root.create_dataset("lon", data=grid.lon.astype(np.float32), chunks=(grid.shape[1],))
         existing_times = ()
         committed = 0
-    count = 0
+    if any(right <= left for left, right in zip(existing_times, existing_times[1:])):
+        raise RuntimeError("Existing cache dates are not strictly increasing.")
+    existing_time_set = set(existing_times)
+    count = committed
+    new_count = 0
+    started = monotonic_time.monotonic()
+    print(
+        f"CACHE_START committed_days={committed} progress_every={progress_interval}",
+        flush=True,
+    )
     for item in slices:
         date_label = item.valid_date.year * 10000 + item.valid_date.month * 100 + item.valid_date.day
-        if count < committed:
-            if existing_times[count] != date_label:
-                raise RuntimeError(
-                    f"Resume date mismatch at index {count}: cache={existing_times[count]}, source={date_label}."
-                )
-            count += 1
+        if date_label in existing_time_set:
             continue
+        if existing_times and date_label <= existing_times[-1]:
+            raise RuntimeError(
+                f"Resume context produced non-cached date {date_label} before "
+                f"last committed date {existing_times[-1]}."
+            )
         missing = tuple(name for name in CACHE_CHANNELS if name not in item.fields)
         if missing:
             raise KeyError(f"Daily slice {item.valid_date} is missing channels {missing}.")
@@ -420,6 +541,15 @@ def write_zarr_cache(
         data[count, :, :, :] = stacked
         time[count] = date_label
         count += 1
+        new_count += 1
+        if new_count == 1 or new_count % progress_interval == 0:
+            elapsed = max(monotonic_time.monotonic() - started, 1e-9)
+            print(
+                "CACHE_PROGRESS "
+                f"committed_days={count} new_days={new_count} "
+                f"last_date={date_label} rate_days_per_min={60.0 * new_count / elapsed:.2f}",
+                flush=True,
+            )
     metadata = {
         "schema_version": 1,
         "dimensions": ["time", "lat", "lon", "channel"],
@@ -525,10 +655,18 @@ def main() -> int:
     parser.add_argument("--months", default=",".join(str(value) for value in MONTHS))
     parser.add_argument("--chunking", choices=("yearly", "monthly"), default="yearly")
     parser.add_argument("--target_source", choices=("daily_statistics", "hourly_fallback"), default="daily_statistics")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--progress_every", type=int, default=30)
     args = parser.parse_args()
     raw_root = args.raw_dir or args.data_root / "raw" / "era5"
     output = args.output or args.data_root / "cache" / f"era5_{args.resolution}.zarr"
     grid = grid_for_resolution(args.resolution)
+    resume_start = cache_resume_context_start(output)
+    print(
+        f"CACHE_PLAN workers={args.workers} resume_context_start="
+        f"{resume_start.isoformat() if resume_start is not None else 'beginning'}",
+        flush=True,
+    )
     slices = iter_era5_daily_slices(
         raw_root,
         parse_years(args.years),
@@ -537,8 +675,16 @@ def main() -> int:
         args.data_root / "regrid_weights",
         target_source=args.target_source,
         chunking=args.chunking,
+        workers=args.workers,
+        start_date=resume_start,
     )
-    metadata = write_zarr_cache(slices, output, grid, target_source=args.target_source)
+    metadata = write_zarr_cache(
+        slices,
+        output,
+        grid,
+        target_source=args.target_source,
+        progress_every=args.progress_every,
+    )
     print(json.dumps(metadata, indent=2, sort_keys=True))
     return 0
 

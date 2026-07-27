@@ -27,6 +27,8 @@ BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
 SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
 CACHE_SAMPLE_COUNT=${CACHE_SAMPLE_COUNT:-9}
+CACHE_WORKERS=${CACHE_WORKERS:-12}
+CACHE_PROGRESS_EVERY=${CACHE_PROGRESS_EVERY:-30}
 ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
 
 cd "$REPO_DIR"
@@ -77,6 +79,18 @@ case "$DOWNLOAD_MAX_RETRIES" in
         exit 2
         ;;
 esac
+case "$CACHE_WORKERS" in
+    ''|*[!0-9]*|0)
+        echo "CACHE_WORKERS must be a positive integer; got '$CACHE_WORKERS'."
+        exit 2
+        ;;
+esac
+case "$CACHE_PROGRESS_EVERY" in
+    ''|*[!0-9]*|0)
+        echo "CACHE_PROGRESS_EVERY must be a positive integer; got '$CACHE_PROGRESS_EVERY'."
+        exit 2
+        ;;
+esac
 
 git pull --ff-only origin main
 "$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py src/data_pipeline/validate_pipeline.py
@@ -104,6 +118,7 @@ fi
 
 (
     cd src
+    echo "Validating completed ERA5 manifest before cache construction"
     "$PY" -m data_pipeline.validate_pipeline raw \
       --data_root "$DATA_ROOT" \
       --expected_tasks 231 \
@@ -123,7 +138,9 @@ fi
       --months "$MONTHS" \
       --chunking "$DOWNLOAD_CHUNKING" \
       --resolution "$RESOLUTION" \
-      --target_source "$TARGET_SOURCE"
+      --target_source "$TARGET_SOURCE" \
+      --workers "$CACHE_WORKERS" \
+      --progress_every "$CACHE_PROGRESS_EVERY"
 )
 
 test -s "$DATA_ROOT/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
