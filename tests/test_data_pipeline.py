@@ -527,6 +527,56 @@ def test_cache_regrids_execute_concurrently_on_in_memory_arrays(tmp_path: Path, 
     assert set(output) == set(requests)
 
 
+def test_cache_can_queue_multiple_days_for_a_large_worker_pool(tmp_path: Path, monkeypatch):
+    import data_pipeline.build_cache as cache_module
+
+    barrier = threading.Barrier(4)
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def observed_regrid(field, *_args, **_kwargs):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        barrier.wait(timeout=2.0)
+        with lock:
+            state["active"] -= 1
+        return np.asarray(field)
+
+    monkeypatch.setattr(cache_module, "_regrid_array", observed_regrid)
+    grid = GridSpec(
+        np.array([-45.0, 45.0]),
+        np.array([0.0, 120.0, 240.0]),
+        "fixture",
+    )
+
+    def requests(offset):
+        return {
+            name: (
+                np.full((2, 3), offset + value),
+                np.arange(2),
+                np.arange(3),
+                "bilinear",
+                name,
+            )
+            for value, name in enumerate(("first", "second"))
+        }
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        first = cache_module._submit_regrid_requests(
+            requests(0), grid, tmp_path, executor
+        )
+        second = cache_module._submit_regrid_requests(
+            requests(10), grid, tmp_path, executor
+        )
+        first_output = cache_module._resolve_regrid_futures(first)
+        second_output = cache_module._resolve_regrid_futures(second)
+
+    assert state["maximum"] == 4
+    assert set(first_output) == {"first", "second"}
+    assert set(second_output) == {"first", "second"}
+
+
 class LogicalLazyArray:
     """Large logical array that allocates only the requested sample slice."""
 

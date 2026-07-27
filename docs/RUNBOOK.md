@@ -112,13 +112,14 @@ regrids predictors, writes resumable `time=1` Zarr chunks, then validates the
 complete UTC-day axis, grid, schema, and bounded representative slices:
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,DOWNLOAD_ONLY=0,BUILD_FOLD_SIDECARS=0,RESOLUTION='1.5deg',CACHE_WORKERS=12,CACHE_PROGRESS_EVERY=30 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,DOWNLOAD_ONLY=0,BUILD_FOLD_SIDECARS=0,RESOLUTION='1.5deg',CACHE_WORKERS=64,CACHE_PROGRESS_EVERY=30 slurm/submit_global_data_build.slurm
 ```
 
-`CACHE_WORKERS=12` parallelizes the independent in-memory regrids for one day
-without reading NetCDF handles concurrently or holding more than one source day
-in memory. The cache restarts from only the 19 context days needed for the
-trailing-20 channels, and prints a committed-day/rate line every 30 new days.
+`CACHE_WORKERS=64` uses the 64 CPUs requested by the job. NetCDF reads remain
+serial and thread-safe, while a bounded queue holds six source days and runs
+their independent in-memory regrids concurrently. The cache restarts from only
+the 19 context days needed for the trailing-20 channels, and prints a
+committed-day/rate line every 30 new days.
 
 The validation reports are written outside Git at:
 

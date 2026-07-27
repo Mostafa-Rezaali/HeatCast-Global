@@ -1,6 +1,6 @@
 """Stream annual or monthly ERA5 downloads into a time-chunked global cache.
 
-Only one UTC day and a bounded 20-day rolling history are resident at once.
+Only a bounded queue of UTC days and a 20-day rolling history are resident.
 ``LazyGlobalZarrDataset`` reads metadata in its parent process but opens the
 zarr store only inside ``__getitem__`` in each DDP worker.
 """
@@ -17,6 +17,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from threading import Lock
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -68,6 +69,9 @@ VARIABLE_CANDIDATES = {
     "v": ("v", "v_component_of_wind"),
     "lsm": ("lsm", "land_sea_mask"),
 }
+
+
+_CONSERVATIVE_REGRID_LOCK = Lock()
 
 
 @dataclass(frozen=True)
@@ -242,19 +246,43 @@ def _regrid_array(
     )
 
 
-def _execute_regrid_requests(requests, target, weights_dir, executor=None):
-    """Execute independent in-memory regrids serially or on a bounded thread pool."""
-    def execute(specification):
-        field, lat, lon, method, label = specification
-        return _regrid_array(field, lat, lon, target, method, weights_dir, label)
+def _execute_regrid_specification(specification, target, weights_dir):
+    """Execute one in-memory regrid, protecting the shared weight cache."""
+    field, lat, lon, method, label = specification
+    if method == "conservative":
+        # Multiple queued days share one atomic .npz weight-cache path. Keep
+        # its first construction and reads single-threaded; the other eleven
+        # predictor regrids per day remain fully concurrent.
+        with _CONSERVATIVE_REGRID_LOCK:
+            return _regrid_array(field, lat, lon, target, method, weights_dir, label)
+    return _regrid_array(field, lat, lon, target, method, weights_dir, label)
 
-    if executor is None:
-        return {name: execute(specification) for name, specification in requests.items()}
-    futures = {
-        name: executor.submit(execute, specification)
+
+def _submit_regrid_requests(requests, target, weights_dir, executor):
+    """Submit one day's independent in-memory regrids without waiting."""
+    return {
+        name: executor.submit(
+            _execute_regrid_specification, specification, target, weights_dir
+        )
         for name, specification in requests.items()
     }
+
+
+def _resolve_regrid_futures(futures):
+    """Resolve a submitted day in deterministic channel order."""
     return {name: future.result() for name, future in futures.items()}
+
+
+def _execute_regrid_requests(requests, target, weights_dir, executor=None):
+    """Execute independent in-memory regrids serially or on a bounded thread pool."""
+    if executor is None:
+        return {
+            name: _execute_regrid_specification(specification, target, weights_dir)
+            for name, specification in requests.items()
+        }
+    return _resolve_regrid_futures(
+        _submit_regrid_requests(requests, target, weights_dir, executor)
+    )
 
 
 def _date_from_label(value: int) -> date:
@@ -307,6 +335,60 @@ def iter_era5_daily_slices(
     z500_history: deque = deque(maxlen=20)
     selected_months = tuple(sorted({int(value) for value in months}))
     executor = ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else None
+    requests_per_day = 12
+    pending_day_limit = max(1, (worker_count + requests_per_day - 1) // requests_per_day)
+
+    def complete_day(valid_date, regridded):
+        tmax = regridded["tmax"]
+        t2m = regridded["t2m"]
+        smooth = {
+            key: regridded[key]
+            for key in ("swvl1", "swvl2", "sst", "mslp")
+        }
+        # Soil moisture is undefined over ocean. Zero is neutral there
+        # because the land mask remains an explicit input.
+        for key in ("swvl1", "swvl2"):
+            smooth[key] = np.where(
+                np.isfinite(smooth[key]), smooth[key], 0.0
+            ).astype(np.float32)
+        z500 = regridded["z500"]
+        z300 = regridded["z300"]
+        pressure850 = {
+            key: regridded[f"{key}850"] for key in ("t", "q", "u", "v")
+        }
+        swvl1_history.append(smooth["swvl1"])
+        swvl2_history.append(smooth["swvl2"])
+        z500_history.append(z500)
+        sst_valid = np.isfinite(smooth["sst"]).astype(np.float32)
+        fields = {
+            "tmax": tmax,
+            "t2m_mean": t2m,
+            "swvl1": smooth["swvl1"],
+            "swvl1_trailing20": np.nanmean(np.stack(tuple(swvl1_history)), axis=0),
+            "swvl2_trailing20": np.nanmean(np.stack(tuple(swvl2_history)), axis=0),
+            "sst": np.where(np.isfinite(smooth["sst"]), smooth["sst"], 0.0),
+            "sst_valid": sst_valid,
+            "z500": z500,
+            "z500_low20": np.nanmean(np.stack(tuple(z500_history)), axis=0),
+            "mslp": smooth["mslp"],
+            "t850": pressure850["t"],
+            "q850": pressure850["q"],
+            "u850": pressure850["u"],
+            "v850": pressure850["v"],
+            "z300": z300,
+            "orography": orography,
+            "land_mask": land_mask,
+        }
+        nonfinite = tuple(
+            name for name, value in fields.items()
+            if not np.all(np.isfinite(value))
+        )
+        if nonfinite:
+            raise RuntimeError(
+                f"Non-finite regridded ERA5 fields on {valid_date}: {nonfinite}."
+            )
+        return DailySlice(valid_date=valid_date, fields=fields)
+
     try:
         for year in sorted({int(value) for value in years}):
             if start_date is not None and year < start_date.year:
@@ -315,6 +397,7 @@ def iter_era5_daily_slices(
                 if start_date is not None and year == start_date.year and max(chunk_months) < start_date.month:
                     continue
                 with ExitStack() as stack:
+                    pending_days: deque = deque()
                     if target_source == "daily_statistics":
                         tmax_ds = stack.enter_context(NetCDFDataset(
                             download_target_path(
@@ -416,56 +499,32 @@ def iter_era5_daily_slices(
                                 ),
                                 *coordinates["pressure850"], "bilinear", "pressure",
                             )
-                        regridded = _execute_regrid_requests(
-                            requests, target, weights_dir, executor
-                        )
-                        tmax = regridded["tmax"]
-                        t2m = regridded["t2m"]
-                        smooth = {
-                            key: regridded[key]
-                            for key in ("swvl1", "swvl2", "sst", "mslp")
-                        }
-                        # Soil moisture is undefined over ocean. Zero is neutral
-                        # there because the land mask remains an explicit input.
-                        for key in ("swvl1", "swvl2"):
-                            smooth[key] = np.where(
-                                np.isfinite(smooth[key]), smooth[key], 0.0
-                            ).astype(np.float32)
-                        z500 = regridded["z500"]
-                        z300 = regridded["z300"]
-                        pressure850 = {key: regridded[f"{key}850"] for key in ("t", "q", "u", "v")}
-                        swvl1_history.append(smooth["swvl1"])
-                        swvl2_history.append(smooth["swvl2"])
-                        z500_history.append(z500)
-                        sst_valid = np.isfinite(smooth["sst"]).astype(np.float32)
-                        fields = {
-                            "tmax": tmax,
-                            "t2m_mean": t2m,
-                            "swvl1": smooth["swvl1"],
-                            "swvl1_trailing20": np.nanmean(np.stack(tuple(swvl1_history)), axis=0),
-                            "swvl2_trailing20": np.nanmean(np.stack(tuple(swvl2_history)), axis=0),
-                            "sst": np.where(np.isfinite(smooth["sst"]), smooth["sst"], 0.0),
-                            "sst_valid": sst_valid,
-                            "z500": z500,
-                            "z500_low20": np.nanmean(np.stack(tuple(z500_history)), axis=0),
-                            "mslp": smooth["mslp"],
-                            "t850": pressure850["t"],
-                            "q850": pressure850["q"],
-                            "u850": pressure850["u"],
-                            "v850": pressure850["v"],
-                            "z300": z300,
-                            "orography": orography,
-                            "land_mask": land_mask,
-                        }
-                        nonfinite = tuple(
-                            name for name, value in fields.items()
-                            if not np.all(np.isfinite(value))
-                        )
-                        if nonfinite:
-                            raise RuntimeError(
-                                f"Non-finite regridded ERA5 fields on {valid_date}: {nonfinite}."
+                        if executor is None:
+                            yield complete_day(
+                                valid_date,
+                                _execute_regrid_requests(
+                                    requests, target, weights_dir, executor=None
+                                ),
                             )
-                        yield DailySlice(valid_date=valid_date, fields=fields)
+                            continue
+                        pending_days.append((
+                            valid_date,
+                            _submit_regrid_requests(
+                                requests, target, weights_dir, executor
+                            ),
+                        ))
+                        if len(pending_days) >= pending_day_limit:
+                            pending_date, pending_futures = pending_days.popleft()
+                            yield complete_day(
+                                pending_date,
+                                _resolve_regrid_futures(pending_futures),
+                            )
+                    while pending_days:
+                        pending_date, pending_futures = pending_days.popleft()
+                        yield complete_day(
+                            pending_date,
+                            _resolve_regrid_futures(pending_futures),
+                        )
     finally:
         if executor is not None:
             executor.shutdown(wait=True, cancel_futures=True)
