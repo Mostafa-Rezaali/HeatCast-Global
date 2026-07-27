@@ -266,7 +266,13 @@ def regrid_field(
     """Regrid one field, falling back to the pure-SciPy implementation."""
     if method not in ("conservative", "bilinear"):
         raise ValueError("method must be 'conservative' or 'bilinear'.")
-    if prefer_xesmf:
+    # ``.npz`` is the separable SciPy weight-cache format.  xESMF writes a
+    # NetCDF weight file and must never be handed that path: doing so can fail
+    # with misleading permission errors from the NetCDF backend.
+    xesmf_compatible_weights = (
+        weights_path is None or Path(weights_path).suffix.lower() != ".npz"
+    )
+    if prefer_xesmf and xesmf_compatible_weights:
         try:
             return _xesmf_regrid(
                 field, source_lat, source_lon, target.lat, target.lon, method, weights_path

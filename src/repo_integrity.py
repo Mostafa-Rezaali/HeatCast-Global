@@ -382,6 +382,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             'chunking: str = "yearly"',
             "month_chunks(selected_months, chunking)",
             "download_target_path(",
+            "prefer_xesmf=False",
         ),
     ))
 

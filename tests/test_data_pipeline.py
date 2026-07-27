@@ -447,6 +447,58 @@ def test_bilinear_regrid_wraps_zero_and_360_longitude():
     assert np.all(output > 0.98)
 
 
+def test_npz_weight_cache_never_routes_through_xesmf(tmp_path: Path, monkeypatch):
+    import data_pipeline.regrid as regrid_module
+
+    monkeypatch.setattr(
+        regrid_module,
+        "_xesmf_regrid",
+        lambda *_args, **_kwargs: pytest.fail("xESMF received a SciPy .npz cache path"),
+    )
+    source_lat = np.array([-45.0, 45.0])
+    source_lon = np.array([0.0, 90.0, 180.0, 270.0])
+    target = GridSpec(source_lat, source_lon, "fixture")
+    output = regrid_module.regrid_field(
+        np.ones((2, 4), dtype=np.float32),
+        source_lat,
+        source_lon,
+        target,
+        method="conservative",
+        weights_path=tmp_path / "weights.npz",
+    )
+    assert np.allclose(output, 1.0)
+
+
+def test_cache_regridding_forces_reusable_scipy_backend(tmp_path: Path, monkeypatch):
+    import data_pipeline.build_cache as cache_module
+
+    class Coordinate:
+        def __init__(self, values):
+            self.values = np.asarray(values)
+
+        def __getitem__(self, _key):
+            return self.values
+
+    class Dataset:
+        variables = {
+            "latitude": Coordinate([-45.0, 45.0]),
+            "longitude": Coordinate([0.0, 90.0, 180.0, 270.0]),
+        }
+
+    observed = {}
+
+    def fake_regrid(field, _lat, _lon, _target, **kwargs):
+        observed.update(kwargs)
+        return np.asarray(field)
+
+    monkeypatch.setattr(cache_module, "regrid_field", fake_regrid)
+    field = np.ones((2, 4), dtype=np.float32)
+    cache_module._regrid(field, Dataset(), GridSpec(
+        np.array([-45.0, 45.0]), np.array([0.0, 90.0, 180.0, 270.0]), "fixture"
+    ), "bilinear", tmp_path, "smooth")
+    assert observed["prefer_xesmf"] is False
+
+
 class LogicalLazyArray:
     """Large logical array that allocates only the requested sample slice."""
 

@@ -211,6 +211,11 @@ def _regrid(
         target,
         method=method,
         weights_path=weights_path if method == "conservative" else None,
+        # The cache builder processes tens of thousands of daily fields.
+        # Reuse the deterministic SciPy path instead of constructing a new
+        # xESMF regridder for every field/day. Conservative weights remain
+        # cached atomically in the .npz file above.
+        prefer_xesmf=False,
     )
 
 
