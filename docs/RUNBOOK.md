@@ -105,13 +105,28 @@ Raw files and the deterministic request manifest are written below:
 /blue/nessie/mostafarezaali/HeatCast-Global/manifests/era5_download_tasks.json
 ```
 
-After the download completes and the fold table is approved, rerun the same
-workflow to conservatively regrid Tmax, bilinearly regrid predictors, write
-`time=1` zarr chunks, and build the five fold-safe normalization and
-week3/week4/W34 threshold sidecars:
+After the download completes, run the post-download path below. It does not
+contact CDS or require CDS credentials. It revalidates all 231 manifest tasks
+and their metadata/NetCDF headers, conservatively regrids Tmax, bilinearly
+regrids predictors, writes resumable `time=1` Zarr chunks, then validates the
+complete UTC-day axis, grid, schema, and bounded representative slices:
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,DOWNLOAD_ONLY=0,BUILD_FOLD_SIDECARS=0,RESOLUTION='1.5deg' slurm/submit_global_data_build.slurm
+```
+
+The validation reports are written outside Git at:
+
+```text
+/blue/nessie/mostafarezaali/HeatCast-Global/manifests/era5_raw_validation.json
+/blue/nessie/mostafarezaali/HeatCast-Global/cache/era5_1.5deg_validation.json
+```
+
+After the fold table is approved, rerun the resume-safe workflow to build the
+five fold-safe normalization and week3/week4/W34 threshold sidecars:
+
+```bash
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
 ```
 
 This is CPU/I/O work. Following the original HeatCast CPU Slurm pattern, it

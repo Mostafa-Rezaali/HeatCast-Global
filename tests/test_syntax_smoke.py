@@ -25,6 +25,7 @@ CORE_SCRIPTS = (
     "figure_style.py",
     "publication_analysis_utils.py",
     "repo_integrity.py",
+    "data_pipeline/validate_pipeline.py",
 )
 
 

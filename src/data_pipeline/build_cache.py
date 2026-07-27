@@ -164,7 +164,11 @@ def _read_day(dataset, key: str, valid_date: date, *, level: Optional[int] = Non
             raise KeyError(f"Pressure level {level} unavailable for {key} in {dataset.filepath()}.")
         index[dimensions.index(level_name)] = int(matches[0])
 
-    values = np.asarray(variable[tuple(index)], dtype=np.float32)
+    raw_values = variable[tuple(index)]
+    values = np.asarray(
+        np.ma.filled(raw_values, np.nan) if np.ma.isMaskedArray(raw_values) else raw_values,
+        dtype=np.float32,
+    )
     lat_name = next(name for name in ("latitude", "lat") if name in dimensions)
     lon_name = next(name for name in ("longitude", "lon") if name in dimensions)
     remaining = [name for position, name in enumerate(dimensions) if not isinstance(index[position], int)]
@@ -176,7 +180,11 @@ def _read_day(dataset, key: str, valid_date: date, *, level: Optional[int] = Non
 
 def _read_static(dataset, key: str) -> np.ndarray:
     variable = dataset.variables[_variable_name(dataset, key)]
-    values = np.asarray(variable[:], dtype=np.float32)
+    raw_values = variable[:]
+    values = np.asarray(
+        np.ma.filled(raw_values, np.nan) if np.ma.isMaskedArray(raw_values) else raw_values,
+        dtype=np.float32,
+    )
     dimensions = list(variable.dimensions)
     lat_name = next(name for name in ("latitude", "lat") if name in dimensions)
     lon_name = next(name for name in ("longitude", "lon") if name in dimensions)
@@ -293,6 +301,14 @@ def iter_era5_daily_slices(
                             _read_day(single_ds, key, valid_date),
                             single_ds, target, "bilinear", weights_dir, "smooth",
                         )
+                    # Soil moisture is undefined over ocean.  Zero is the neutral
+                    # cached value there; the explicit land mask prevents it from
+                    # being interpreted as an observed ocean soil state.  SST has
+                    # its own validity channel by scientific contract.
+                    for key in ("swvl1", "swvl2"):
+                        smooth[key] = np.where(
+                            np.isfinite(smooth[key]), smooth[key], 0.0
+                        ).astype(np.float32)
                     z500 = _regrid(
                         _read_day(geopotential_ds, "z", valid_date, level=500),
                         geopotential_ds, target, "bilinear", weights_dir, "pressure",
@@ -331,6 +347,14 @@ def iter_era5_daily_slices(
                         "orography": orography,
                         "land_mask": land_mask,
                     }
+                    nonfinite = tuple(
+                        name for name, value in fields.items()
+                        if not np.all(np.isfinite(value))
+                    )
+                    if nonfinite:
+                        raise RuntimeError(
+                            f"Non-finite regridded ERA5 fields on {valid_date}: {nonfinite}."
+                        )
                     yield DailySlice(valid_date=valid_date, fields=fields)
 
 

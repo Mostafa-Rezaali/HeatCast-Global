@@ -350,6 +350,23 @@ def audit_repository(root: Path) -> list[CheckResult]:
 
     results.append(_required_tokens_check(
         root,
+        "global.post_download_validation_contract",
+        "src/data_pipeline/validate_pipeline.py",
+        (
+            "def validate_raw_manifest(",
+            "task_complete(task)",
+            'common_root.rglob("*.part")',
+            "def expected_date_labels(",
+            "def validate_cache_store(",
+            "expected_chunks = (1,) + grid.shape",
+            "Cache UTC-day axis differs",
+            "Non-finite cache value",
+            'choices=("raw", "cache")',
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
         "global.lazy_zarr_contract",
         "src/data_pipeline/build_cache.py",
         (
@@ -387,6 +404,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}",
             "ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}",
             "DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}",
+            "SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}",
+            "CACHE_SAMPLE_COUNT=${CACHE_SAMPLE_COUNT:-9}",
             '--data_root "$DATA_ROOT"',
             '--workers "$DOWNLOAD_WORKERS"',
             '--chunking "$DOWNLOAD_CHUNKING"',
@@ -395,6 +414,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             '--retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS"',
             "data_pipeline.download_era5",
             "data_pipeline.build_cache",
+            "data_pipeline.validate_pipeline raw",
+            "data_pipeline.validate_pipeline cache",
         ),
     ))
 

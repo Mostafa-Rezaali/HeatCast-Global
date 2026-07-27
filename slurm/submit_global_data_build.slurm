@@ -25,6 +25,8 @@ DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
 DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
 BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
+SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
+CACHE_SAMPLE_COUNT=${CACHE_SAMPLE_COUNT:-9}
 ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
 
 cd "$REPO_DIR"
@@ -35,12 +37,21 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-ERA5_CDS_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}
-export CDSAPI_RC="$ERA5_CDS_RC"
-test -s "$CDSAPI_RC" || {
-    echo "Missing ERA5 CDS credentials at $CDSAPI_RC. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
-    exit 2
-}
+case "$SKIP_DOWNLOAD" in
+    0|1) ;;
+    *)
+        echo "SKIP_DOWNLOAD must be 0 or 1; got '$SKIP_DOWNLOAD'."
+        exit 2
+        ;;
+esac
+if [ "$SKIP_DOWNLOAD" = "0" ]; then
+    ERA5_CDS_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}
+    export CDSAPI_RC="$ERA5_CDS_RC"
+    test -s "$CDSAPI_RC" || {
+        echo "Missing ERA5 CDS credentials at $CDSAPI_RC. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
+        exit 2
+    }
+fi
 case "$DOWNLOAD_WORKERS" in
     ''|*[!0-9]*|0)
         echo "DOWNLOAD_WORKERS must be a positive integer; got '$DOWNLOAD_WORKERS'."
@@ -68,23 +79,35 @@ case "$DOWNLOAD_MAX_RETRIES" in
 esac
 
 git pull --ff-only origin main
-echo "ERA5 download plan: $DOWNLOAD_CHUNKING files, $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
-"$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py
+"$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py src/data_pipeline/validate_pipeline.py
 "$PY" src/repo_integrity.py
+
+if [ "$SKIP_DOWNLOAD" = "0" ]; then
+    echo "ERA5 download plan: $DOWNLOAD_CHUNKING files, $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
+    (
+        cd src
+        "$PY" -m data_pipeline.download_era5 \
+          --data_root "$DATA_ROOT" \
+          --years "$YEARS" \
+          --months "$MONTHS" \
+          --chunking "$DOWNLOAD_CHUNKING" \
+          --target_source "$TARGET_SOURCE" \
+          --pressure_dataset "$ERA5_PRESSURE_DATASET" \
+          --workers "$DOWNLOAD_WORKERS" \
+          --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
+          --max_retries "$DOWNLOAD_MAX_RETRIES" \
+          --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS"
+    )
+else
+    echo "SKIP_DOWNLOAD=1: using the completed local ERA5 archive without contacting CDS"
+fi
 
 (
     cd src
-    "$PY" -m data_pipeline.download_era5 \
+    "$PY" -m data_pipeline.validate_pipeline raw \
       --data_root "$DATA_ROOT" \
-      --years "$YEARS" \
-      --months "$MONTHS" \
-      --chunking "$DOWNLOAD_CHUNKING" \
-      --target_source "$TARGET_SOURCE" \
-      --pressure_dataset "$ERA5_PRESSURE_DATASET" \
-      --workers "$DOWNLOAD_WORKERS" \
-      --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
-      --max_retries "$DOWNLOAD_MAX_RETRIES" \
-      --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS"
+      --expected_tasks 231 \
+      --report "$DATA_ROOT/manifests/era5_raw_validation.json"
 )
 
 if [ "$DOWNLOAD_ONLY" = "1" ]; then
@@ -104,6 +127,17 @@ fi
 )
 
 test -s "$DATA_ROOT/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
+(
+    cd src
+    "$PY" -m data_pipeline.validate_pipeline cache \
+      --data_root "$DATA_ROOT" \
+      --years "$YEARS" \
+      --months "$MONTHS" \
+      --resolution "$RESOLUTION" \
+      --target_source "$TARGET_SOURCE" \
+      --sample_count "$CACHE_SAMPLE_COUNT" \
+      --report "$DATA_ROOT/cache/era5_${RESOLUTION}_validation.json"
+)
 if [ "$BUILD_FOLD_SIDECARS" = "1" ]; then
     FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}
     test -s "$FOLD_YEARS_JSON"

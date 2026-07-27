@@ -1,6 +1,8 @@
 """Fast synthetic tests for ERA5 tasking, regridding, and lazy cache reads."""
 
 from datetime import date, timedelta
+from dataclasses import asdict
+import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import sys
@@ -30,6 +32,11 @@ from data_pipeline.download_era5 import (
     validate_cds_endpoint,
 )
 from data_pipeline.regrid import GridSpec, regrid_field
+from data_pipeline.validate_pipeline import (
+    expected_date_labels,
+    validate_cache_store,
+    validate_raw_manifest,
+)
 from ens_target_grid import LazyGlobalChannel
 from global_dataset import GlobalHeatCastDataset, identity_preprocessor
 from spatial_weights import weighted_spatial_mean
@@ -362,6 +369,39 @@ def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
     assert not Path(task.target).with_suffix(".nc.part").exists()
 
 
+def test_post_download_manifest_validation_is_offline_and_detects_partials(tmp_path: Path):
+    task = next(
+        task for task in build_download_tasks(tmp_path, years=(1979,), months=(1,))
+        if task.group == "daily_tmax"
+    )
+    target = Path(task.target)
+    target.parent.mkdir(parents=True)
+    with NetCDFDataset(target, "w") as output:
+        output.createDimension("valid_time", 1)
+        output.createDimension("latitude", 2)
+        output.createDimension("longitude", 3)
+        output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
+        output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
+        output.createVariable("longitude", "f4", ("longitude",))[:] = [0.0, 120.0, 240.0]
+        output.createVariable("t2m", "f4", ("valid_time", "latitude", "longitude"))[:] = 280.0
+    record = asdict(task)
+    record["months"] = list(task.months)
+    target.with_suffix(".nc.metadata.json").write_text(
+        json.dumps({"task": record, "target_source": task.source_choice, "utc_days": True}),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps([record]), encoding="utf-8")
+    summary = validate_raw_manifest(manifest, expected_task_count=1)
+    assert summary.task_count == 1
+    assert summary.total_bytes == target.stat().st_size
+
+    partial = target.parent / "orphan.nc.part"
+    partial.write_bytes(b"incomplete")
+    with pytest.raises(RuntimeError, match="partial files"):
+        validate_raw_manifest(manifest, expected_task_count=1)
+
+
 def test_conservative_regrid_preserves_global_area_mean_and_caches_weights(tmp_path: Path):
     source_lat = np.array([-67.5, -22.5, 22.5, 67.5])
     source_lon = np.arange(0.0, 360.0, 45.0)
@@ -497,6 +537,38 @@ def test_zarr_writer_uses_time_one_chunks_and_resumes(tmp_path: Path):
     selected = lazy_soil.read_pixels_times([0, 5], [0, 2])
     assert selected.shape == (2, 2)
     assert selected.tolist() == [[0.0, 2.0], [0.0, 2.0]]
+
+
+def test_completed_cache_validation_checks_calendar_schema_and_finite_samples(tmp_path: Path):
+    zarr = pytest.importorskip("zarr")
+    grid = GridSpec(np.array([45.0, -45.0]), np.array([0.0, 120.0, 240.0]), "fixture")
+    start = date(2000, 1, 1)
+
+    def daily(day):
+        fields = {
+            name: np.full(grid.shape, float(day), dtype=np.float32)
+            for name in CACHE_CHANNELS
+        }
+        fields["land_mask"][:] = 1.0
+        fields["sst_valid"][:] = 1.0
+        return DailySlice(start + timedelta(days=day), fields)
+
+    store = tmp_path / "validated.zarr"
+    write_zarr_cache(tuple(daily(day) for day in range(3)), store, grid, target_source="fixture")
+    labels = tuple(20000101 + day for day in range(3))
+    summary = validate_cache_store(
+        store, grid=grid, date_labels=labels, target_source="fixture", sample_count=3
+    )
+    assert summary.shape == (3, 2, 3, len(CACHE_CHANNELS))
+    assert summary.chunks[0] == 1
+    assert expected_date_labels((2000,), (2,))[:2] == (20000201, 20000202)
+
+    root = zarr.open_group(str(store), mode="a")
+    root["data"][1, 0, 0, CACHE_CHANNELS.index("tmax")] = np.inf
+    with pytest.raises(RuntimeError, match="Non-finite cache value"):
+        validate_cache_store(
+            store, grid=grid, date_labels=labels, target_source="fixture", sample_count=3
+        )
 
 
 def test_global_training_dataset_preserves_date_labels_while_exposing_legacy_offsets(tmp_path: Path):
