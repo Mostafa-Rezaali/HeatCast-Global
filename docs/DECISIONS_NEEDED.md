@@ -13,18 +13,17 @@ fixed `ens_comparison_period` to those matched years.
 Affected interfaces: ENS download metadata, cycle-specific ingest, the shared
 initialization calendar, comparison-period config, and paper tables.
 
-## Cross-validation fold years
+## Cross-validation fold years -- resolved 2026-07-31
 
-`TODO(USER)`: Approve the exact five year-disjoint train/calibration/test fold
-table for 1979--2024. Until approved, `Config.CV_FOLD_YEARS` remains `None`;
-data-free tests use synthetic fixture years and production scoring must refuse
-to infer a table.
+The user approved the interleaved five-fold table committed at
+`configs/global_fold_years.json`. Fold `k` tests `years[k::5]`, calibrates on
+`years[(k+1)%5::5]`, and trains on all remaining 1979--2024 years.
 
 Affected interfaces: fold-specific climatology, normalization, percentile
 thresholds, hindcast export, and all pooled comparisons.
 
-Production jobs require the approved table through `FOLD_YEARS_JSON` (or
-`HEATCAST_FOLD_YEARS_JSON`). `src/fold_config.py` rejects missing roles,
+Production jobs default to the approved table and may override it through
+`FOLD_YEARS_JSON` (or `HEATCAST_FOLD_YEARS_JSON`). `src/fold_config.py` rejects missing roles,
 within-fold overlap, incomplete 1979--2024 coverage, or pooled test folds that
 do not partition all years exactly once.
 

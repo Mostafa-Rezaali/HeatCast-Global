@@ -156,7 +156,7 @@ test -s "$DATA_ROOT/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
       --report "$DATA_ROOT/cache/era5_${RESOLUTION}_validation.json"
 )
 if [ "$BUILD_FOLD_SIDECARS" = "1" ]; then
-    FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}
+    FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$REPO_DIR/configs/global_fold_years.json}
     test -s "$FOLD_YEARS_JSON"
     for FOLD in 0 1 2 3 4; do
         "$PY" -u src/build_global_fold_sidecars.py \

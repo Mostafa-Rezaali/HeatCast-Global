@@ -7,11 +7,11 @@ Git-ignored.
 
 ## 1. Resolve the scientific gates
 
-Do not submit production training or ECMWF scoring until every applicable item
-in `docs/DECISIONS_NEEDED.md` is approved.
+The approved cross-validation roles are committed at
+`configs/global_fold_years.json`. Do not submit ECMWF scoring until its
+remaining applicable items in `docs/DECISIONS_NEEDED.md` are approved.
 
-Create an external JSON file (do not commit it until its scientific contents
-are approved) with:
+The committed JSON contains:
 
 - exactly five records under `folds`, with integer `fold` values `0` through
   `4`;
@@ -19,8 +19,10 @@ are approved) with:
 - disjoint roles within each fold that cover every year 1979–2024 exactly
   once;
 - test-year sets that partition 1979–2024 exactly once across the five folds;
-- `ens_comparison_period`, containing only the reforecast years supported by
-  the pinned ECMWF cycle/version.
+
+The still-unresolved ECMWF decision will later add an
+`ens_comparison_period` containing only reforecast years supported by the
+pinned cycle/version.
 
 `src/fold_config.py` validates this contract and refuses incomplete,
 overlapping, or inferred assignments.
@@ -31,7 +33,7 @@ Required runtime inputs:
 /blue/nessie/mostafarezaali/HeatCast-Global/cache/teleconnection_5.npy
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/rmm.txt
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/nino34.txt
-<approved fold-year JSON>
+configs/global_fold_years.json
 ~/.cdsapirc-era5
 ```
 
@@ -132,7 +134,7 @@ After the fold table is approved, rerun the resume-safe workflow to build the
 five fold-safe normalization and week3/week4/W34 threshold sidecars:
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,SKIP_DOWNLOAD=1,RESOLUTION='1.5deg',BUILD_FOLD_SIDECARS=1 slurm/submit_global_data_build.slurm
 ```
 
 This is CPU/I/O work. Following the original HeatCast CPU Slurm pattern, it
@@ -152,7 +154,7 @@ not prove scientific correctness.
 ## 4. Train five global folds
 
 ```bash
-sbatch --export=ALL,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg',PRECISION='fp32',GRAD_ACCUM=1,GRAD_CHECKPOINT=0 slurm/submit_global_w34_tube_all.slurm
+sbatch --export=ALL,RESOLUTION='1.5deg',PRECISION='fp32',GRAD_ACCUM=1,GRAD_CHECKPOINT=0 slurm/submit_global_w34_tube_all.slurm
 ```
 
 The job uses eight B200 GPUs, batch size one per rank, direct leads 15–28, the
@@ -170,7 +172,7 @@ effective scientific sample definition. `GRAD_CHECKPOINT=1` and
 The chained evaluation job can also be submitted directly:
 
 ```bash
-sbatch --export=ALL,FOLD_YEARS_JSON='/absolute/path/fold_years.json',RESOLUTION='1.5deg' slurm/submit_global_w34_eval_stitch.slurm
+sbatch --export=ALL,RESOLUTION='1.5deg' slurm/submit_global_w34_eval_stitch.slurm
 ```
 
 It performs, in order:

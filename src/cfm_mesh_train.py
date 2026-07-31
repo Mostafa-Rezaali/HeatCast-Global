@@ -254,7 +254,7 @@ class Config:
     ENABLE_HEAT_INDEX = False
     N_MEMBERS = 512
     CV_FOLD_YEARS_PATH = os.environ.get("HEATCAST_FOLD_YEARS_JSON")
-    CV_FOLD_YEARS = None  # TODO(USER): loaded only from the approved JSON for 1979-2024.
+    CV_FOLD_YEARS = None  # Loaded from the approved 1979-2024 JSON before global production.
     ENS_COMPARISON_PERIOD = None  # TODO(USER): pin after ECMWF cycle metadata is approved.
 
     # ==================== DATA PATHS ====================
@@ -5096,7 +5096,7 @@ def main():
     if Config.DOMAIN == "global" and Config.CV_FOLD_YEARS is None:
         raise RuntimeError(
             "Global production requires --fold_years_json (or HEATCAST_FOLD_YEARS_JSON). "
-            "Resolve TODO(USER) in docs/DECISIONS_NEEDED.md; no fold years are inferred."
+            "Use the approved configs/global_fold_years.json table."
         )
 
     if args.dry_run:

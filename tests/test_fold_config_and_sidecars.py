@@ -7,7 +7,7 @@ import pytest
 
 import cfm_mesh_train as cfm
 from build_global_fold_sidecars import build_streaming_thresholds
-from fold_config import GLOBAL_YEARS, validate_fold_table
+from fold_config import GLOBAL_YEARS, load_fold_table, validate_fold_table
 
 
 def fixture_fold_table():
@@ -33,6 +33,11 @@ def test_approved_fold_table_requires_disjoint_complete_five_fold_partition():
     attacked["folds"][0]["train_years"].append(attacked["folds"][0]["test_years"][0])
     with pytest.raises(ValueError, match="overlap"):
         validate_fold_table(attacked)
+
+
+def test_committed_fold_table_matches_the_user_approved_interleaved_roles():
+    path = Path(__file__).resolve().parents[1] / "configs" / "global_fold_years.json"
+    assert load_fold_table(path) == validate_fold_table(fixture_fold_table())
 
 
 class _ThresholdFixture:

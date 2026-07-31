@@ -149,7 +149,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             'TARGET_MODES = ("zscore_persistence", "climatology_anomaly")',
             'PREDICT_PERSISTENCE_RESIDUAL = TARGET_MODE == "zscore_persistence"',
             'USE_EXTENDED_GLOBAL_FIELDS = DOMAIN == "conus"',
-            'CV_FOLD_YEARS = None  # TODO(USER)',
+            'CV_FOLD_YEARS = None  # Loaded from the approved 1979-2024 JSON',
             'ENS_COMPARISON_PERIOD = None  # TODO(USER)',
             'def configure_domain(',
         ),
@@ -415,6 +415,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "#SBATCH --cpus-per-task=64",
             "CACHE_WORKERS=${CACHE_WORKERS:-64}",
             "CACHE_PROGRESS_EVERY=${CACHE_PROGRESS_EVERY:-30}",
+            "FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$REPO_DIR/configs/global_fold_years.json}",
             '--data_root "$DATA_ROOT"',
             '--workers "$DOWNLOAD_WORKERS"',
             '--chunking "$DOWNLOAD_CHUNKING"',
@@ -536,6 +537,23 @@ def audit_repository(root: Path) -> list[CheckResult]:
         ),
     ))
 
+    results.append(_required_tokens_check(
+        root,
+        "global.approved_fold_table_contract",
+        "configs/global_fold_years.json",
+        (
+            '"fold": 0',
+            '"fold": 1',
+            '"fold": 2',
+            '"fold": 3',
+            '"fold": 4',
+            '"train_years"',
+            '"calibration_years"',
+            '"test_years"',
+            "years[(k+1)%5::5]",
+        ),
+    ))
+
     results.append(_result(
         "global.production_training_data_contract",
         "def prepare_global_training_datasets(" in cfm
@@ -586,7 +604,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             f"--mail-user={EMAIL}",
             "WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/",
             "module load cuda/12.9.1",
-            "FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER)",
+            "FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$WORK_DIR/configs/global_fold_years.json}",
             "--domain global",
             "--target_mode climatology_anomaly",
             "--prediction_leads \"$LEADS\"",
@@ -606,6 +624,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--mem=500G",
             f"--mail-user={EMAIL}",
             "WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/",
+            "FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$WORK_DIR/configs/global_fold_years.json}",
             "15,16,17,18,19,20,21",
             "22,23,24,25,26,27,28",
             "src/stitch_exceedance_folds.py",

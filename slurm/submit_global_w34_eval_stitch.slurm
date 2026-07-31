@@ -17,7 +17,7 @@ set -euo pipefail
 WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 RESOLUTION=${RESOLUTION:-1.5deg}
-FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved five-fold year JSON}
+FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$WORK_DIR/configs/global_fold_years.json}
 RUNS=cvfold0_global_w34_dist_v1,cvfold1_global_w34_dist_v1,cvfold2_global_w34_dist_v1,cvfold3_global_w34_dist_v1,cvfold4_global_w34_dist_v1
 FULL_LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28
 WINDOWS=(
