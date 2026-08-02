@@ -41,6 +41,18 @@ The five-index array must align exactly with the ERA5 cache time axis. The RMM
 and Niño files are parsed by the existing driver-table parsers; no alternate
 model-only parser is used.
 
+After the ERA5 cache exists, build the approved PNA/NAO/Niño3.4/PDO/AO input
+array. This downloads only small public NOAA PSL text tables, validates every
+month on the ERA5 axis, records source hashes, and verifies that PNA, NAO, PDO,
+and AO reproduce the legacy CondTrain overlap before writing atomically:
+
+```bash
+cd /blue/nessie/mostafarezaali/HeatCast-Global && git pull --ff-only origin main && env -u PYTHONHOME -u PYTHONPATH /blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python -u src/data_pipeline/build_condition_cache.py --data_root /blue/nessie/mostafarezaali/HeatCast-Global --resolution 1.5deg --legacy_condtrain /blue/nessie/mostafarezaali/Teleconnection/CondTrain_ERA5.nc --refresh_sources
+```
+
+The output must report shape `[16802, 5]`, dates `19790101` through
+`20241231`, and passing legacy differences before training is submitted.
+
 Keep ERA5 and ECMWF S2S credentials separate. Create `~/.cdsapirc-era5` from
 the Climate Data Store API profile with:
 

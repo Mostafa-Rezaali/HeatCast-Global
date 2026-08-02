@@ -98,6 +98,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
     init_calendar = _text(root, "src/init_calendar.py")
     spatial_weights = _text(root, "src/spatial_weights.py")
     global_evaluation = _text(root, "src/global_evaluation.py")
+    condition_cache = _text(root, "src/data_pipeline/build_condition_cache.py")
     stitch = _text(root, "src/stitch_exceedance_folds.py")
     export = _text(root, "src/export_w34_stack_netcdf.py")
     ens_download = _text(root, "src/download_ecmwf_s2s.py")
@@ -520,7 +521,28 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "class GlobalHeatCastDataset(LazyGlobalZarrDataset):",
             "parse_rmm_components_file",
             "normalize_condition_vectors(",
+            '"pna", "nao", "nino34", "pdo", "ao", "rmm1", "rmm2", "mjo_amplitude"',
         ),
+    ))
+
+    results.append(_result(
+        "global.condition_cache_contract",
+        all(token in condition_cache for token in (
+            'TELECONNECTION_CHANNELS: Tuple[str, ...] = (',
+            '"pna",',
+            '"nao",',
+            '"nino34",',
+            '"pdo",',
+            '"ao",',
+            "validate_preserved_legacy_channels(",
+            "abs(value) >= 90.0",
+            "os.replace(partial, output_path)",
+            '"normalization": "raw values; mean/std fitted from active fold training initializations"',
+            '"sha256": _sha256',
+        ))
+        and '"teleconnection_1"' not in _text(root, "src/global_dataset.py")
+        and "3. Niño3.4 anomaly" in _text(root, "docs/MODEL_INPUTS.md"),
+        "Approved PNA/NAO/Nino3.4/PDO/AO cache is coverage-checked, legacy-validated, and fold-normalized",
     ))
 
     results.append(_required_tokens_check(

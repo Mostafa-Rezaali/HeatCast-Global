@@ -40,6 +40,9 @@ hindcast_paper_data/
 paper_figures/
 exports/
 drivers/fold_safe_tables/
+drivers/teleconnections/
+drivers/rmm.txt
+drivers/nino34.txt
 exceedance_eval*/
 ens_exceedance_incremental/
 ens_head_to_head*/

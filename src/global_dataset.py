@@ -48,8 +48,7 @@ GLOBAL_INPUT_CHANNELS: Tuple[str, ...] = (
 )
 
 VECTOR_INPUT_CHANNELS: Tuple[str, ...] = (
-    "teleconnection_1", "teleconnection_2", "teleconnection_3",
-    "teleconnection_4", "teleconnection_5", "rmm1", "rmm2", "mjo_amplitude",
+    "pna", "nao", "nino34", "pdo", "ao", "rmm1", "rmm2", "mjo_amplitude",
 )
 BASE_DATE = datetime(1981, 5, 1)
 

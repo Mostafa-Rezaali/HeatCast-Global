@@ -57,10 +57,21 @@ has `time=1` chunks.
 
 ### Vector input: 8 channels
 
-1--5. the existing five configured teleconnection indices
+1. PNA
+2. NAO
+3. Niño3.4 anomaly
+4. PDO
+5. AO
 6. MJO RMM1
 7. MJO RMM2
 8. MJO amplitude
+
+The five-channel base cache stores raw monthly PNA, NAO, Niño3.4, PDO, and
+AO values expanded onto the ERA5 daily axis. The active fold's training
+initializations alone determine vector means and standard deviations. The
+legacy OMI `PC2Coefficient` was replaced by Niño3.4 with user approval because
+the exact NOAA PSL legacy OMI series is frozen at 2024-05-20 and cannot cover
+the approved 2024 MJJAS initialization calendar without mixing definitions.
 
 RMM values use the parser shared with `build_driver_tables.py`; the model path
 does not implement a second parser. Vector normalization uses only the active
