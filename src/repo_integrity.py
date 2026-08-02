@@ -534,6 +534,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             '"nino34",',
             '"pdo",',
             '"ao",',
+            'if __package__ in (None, ""):',
             "validate_preserved_legacy_channels(",
             "abs(value) >= 90.0",
             "os.replace(partial, output_path)",

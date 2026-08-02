@@ -12,12 +12,16 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import time
 import urllib.request
 from pathlib import Path
 from typing import Dict, Mapping, Sequence, Tuple
 
 import numpy as np
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from build_driver_tables import parse_monthly_index_file, parse_nino34_file
 

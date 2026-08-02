@@ -2,6 +2,8 @@
 
 from datetime import datetime
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -11,6 +13,18 @@ from data_pipeline.build_condition_cache import (
     expand_monthly_indices,
     validate_preserved_legacy_channels,
 )
+
+
+def test_condition_cache_direct_script_entrypoint():
+    script = Path(__file__).resolve().parents[1] / "src" / "data_pipeline" / "build_condition_cache.py"
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--legacy_condtrain" in result.stdout
 
 
 def _sources():
