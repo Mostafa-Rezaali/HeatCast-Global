@@ -140,7 +140,7 @@ def build_model_condition_vectors(
     base = np.asarray(base_teleconnections, dtype=np.float32)
     if base.shape != (len(date_labels), 5):
         raise ValueError(f"Base teleconnections must be (time,5), got {base.shape}.")
-    rmm = parse_rmm_components_file(rmm_path)
+    rmm = parse_rmm_components_file(Path(rmm_path))
     output = np.empty((len(date_labels), len(VECTOR_INPUT_CHANNELS)), dtype=np.float32)
     output[:, :5] = base
     for index, label in enumerate(date_labels):

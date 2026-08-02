@@ -520,6 +520,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             '"global_fields": torch.empty((0,)',
             "class GlobalHeatCastDataset(LazyGlobalZarrDataset):",
             "parse_rmm_components_file",
+            "parse_rmm_components_file(Path(rmm_path))",
             "normalize_condition_vectors(",
             '"pna", "nao", "nino34", "pdo", "ao", "rmm1", "rmm2", "mjo_amplitude"',
         ),

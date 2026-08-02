@@ -117,7 +117,9 @@ def test_existing_rmm_parser_is_reused_for_model_components(tmp_path):
     assert parse_rmm_file(rmm)[20000501] == (3, 1.35)
     assert parse_rmm_components_file(rmm)[20000501] == (1.25, -0.5, 1.35)
     base = np.arange(10, dtype=np.float32).reshape(2, 5)
-    vectors = build_model_condition_vectors((20000501, 20000502), base, rmm)
+    # Production Config stores paths as strings; the model boundary must adapt
+    # them to the existing driver's Path-based parser contract.
+    vectors = build_model_condition_vectors((20000501, 20000502), base, str(rmm))
     assert vectors.shape == (2, 8)
     normalized, mean, std = normalize_condition_vectors(vectors, (0,))
     assert normalized.shape == vectors.shape
