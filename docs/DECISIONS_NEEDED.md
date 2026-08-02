@@ -33,9 +33,10 @@ The user approved replacing the legacy frozen OMI `PC2Coefficient` with
 Niño3.4. The five base indices are ordered PNA, NAO, Niño3.4, PDO, AO; the
 separate BOM RMM1, RMM2, and MJO-amplitude channels remain unchanged.
 
-`src/data_pipeline/build_condition_cache.py` downloads the configured NOAA PSL
-monthly sources, records their hashes, validates complete 1979--2024 coverage,
-and requires the four preserved channels to reproduce the legacy normalized
+`src/data_pipeline/build_condition_cache.py` downloads official daily CPC
+PNA/NAO/AO and monthly NOAA PSL Niño3.4, reuses the original ERSSTv5
+`PDO.xlsx`, records source hashes, validates complete 1979--2024 coverage, and
+requires the four preserved channels to reproduce the legacy normalized
 CondTrain overlap before it writes `cache/teleconnection_5.npy`.
 
 ## CDS credentials

@@ -41,6 +41,7 @@ paper_figures/
 exports/
 drivers/fold_safe_tables/
 drivers/teleconnections/
+drivers/candidates/
 drivers/rmm.txt
 drivers/nino34.txt
 exceedance_eval*/

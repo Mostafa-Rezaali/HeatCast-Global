@@ -33,21 +33,26 @@ Required runtime inputs:
 /blue/nessie/mostafarezaali/HeatCast-Global/cache/teleconnection_5.npy
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/rmm.txt
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/nino34.txt
+/blue/nessie/mostafarezaali/Teleconnection/PDO.xlsx
 configs/global_fold_years.json
 ~/.cdsapirc-era5
 ```
 
-The five-index array must align exactly with the ERA5 cache time axis. The RMM
-and Niño files are parsed by the existing driver-table parsers; no alternate
-model-only parser is used.
+The five-index array must align exactly with the ERA5 cache time axis. The RMM,
+Niño3.4, and PDO workbook are parsed by the existing driver-table parsing
+infrastructure; no spreadsheet dependency is required.
 
 After the ERA5 cache exists, build the approved PNA/NAO/Niño3.4/PDO/AO input
-array. This downloads only small public NOAA PSL text tables, validates every
-month on the ERA5 axis, records source hashes, and verifies that PNA, NAO, PDO,
-and AO reproduce the legacy CondTrain overlap before writing atomically:
+array. This downloads the small official daily CPC PNA/NAO/AO files and the
+monthly NOAA PSL Niño3.4 table, reuses the original ERSSTv5 `PDO.xlsx`, validates
+every day/month on the ERA5 axis, records source hashes, and verifies that the
+four preserved channels reproduce the legacy CondTrain overlap before writing
+atomically. CPC daily values are rounded to three decimals, so validation uses
+the measured normalized rounding bound (`2.5e-4`) while retaining a strict
+correlation check; PDO remains exact to `5e-6`.
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && git pull --ff-only origin main && env -u PYTHONHOME -u PYTHONPATH /blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python -u src/data_pipeline/build_condition_cache.py --data_root /blue/nessie/mostafarezaali/HeatCast-Global --resolution 1.5deg --legacy_condtrain /blue/nessie/mostafarezaali/Teleconnection/CondTrain_ERA5.nc --refresh_sources
+cd /blue/nessie/mostafarezaali/HeatCast-Global && git pull --ff-only origin main && env -u PYTHONHOME -u PYTHONPATH /blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python -u src/data_pipeline/build_condition_cache.py --data_root /blue/nessie/mostafarezaali/HeatCast-Global --resolution 1.5deg --legacy_condtrain /blue/nessie/mostafarezaali/Teleconnection/CondTrain_ERA5.nc --pdo_workbook /blue/nessie/mostafarezaali/Teleconnection/PDO.xlsx --refresh_sources
 ```
 
 The output must report shape `[16802, 5]`, dates `19790101` through

@@ -66,9 +66,10 @@ has `time=1` chunks.
 7. MJO RMM2
 8. MJO amplitude
 
-The five-channel base cache stores raw monthly PNA, NAO, Niño3.4, PDO, and
-AO values expanded onto the ERA5 daily axis. The active fold's training
-initializations alone determine vector means and standard deviations. The
+The five-channel base cache stores daily CPC PNA/NAO/AO and monthly Niño3.4/PDO
+values aligned to the ERA5 daily axis. PDO reuses the original HeatCast
+ERSSTv5 workbook. The active fold's training initializations alone determine
+vector means and standard deviations. The
 legacy OMI `PC2Coefficient` was replaced by Niño3.4 with user approval because
 the exact NOAA PSL legacy OMI series is frozen at 2024-05-20 and cannot cover
 the approved 2024 MJJAS initialization calendar without mixing definitions.

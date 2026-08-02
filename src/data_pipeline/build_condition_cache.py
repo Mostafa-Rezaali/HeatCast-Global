@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build the fold-normalized global teleconnection-vector input cache.
 
-The persisted array contains raw monthly indices expanded onto the ERA5 daily
-time axis. Fold-specific means and standard deviations remain fitted at model
-load time, so no test-year information enters preprocessing statistics.
+The persisted array combines daily CPC PNA/NAO/AO, monthly Nino3.4, and the
+preserved ERSSTv5 PDO workbook on the ERA5 daily time axis. Fold-specific means
+and standard deviations remain fitted at model load time, so no test-year
+information enters preprocessing statistics.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from build_driver_tables import parse_monthly_index_file, parse_nino34_file
+from build_driver_tables import parse_nino34_file, read_first_xlsx_sheet
 
 
 TELECONNECTION_CHANNELS: Tuple[str, ...] = (
@@ -35,11 +36,23 @@ TELECONNECTION_CHANNELS: Tuple[str, ...] = (
 )
 
 DEFAULT_SOURCE_URLS: Mapping[str, str] = {
-    "pna": "https://psl.noaa.gov/data/correlation/pna.data",
-    "nao": "https://psl.noaa.gov/data/correlation/nao.data",
+    "pna": "https://ftp.cpc.ncep.noaa.gov/cwlinks/norm.daily.pna.index.b500101.current.ascii",
+    "nao": "https://ftp.cpc.ncep.noaa.gov/cwlinks/norm.daily.nao.index.b500101.current.ascii",
     "nino34": "https://psl.noaa.gov/data/correlation/nina34.anom.data",
-    "pdo": "https://psl.noaa.gov/data/correlation/pdo.data",
-    "ao": "https://psl.noaa.gov/data/correlation/ao.data",
+    "ao": "https://ftp.cpc.ncep.noaa.gov/cwlinks/norm.daily.ao.index.b500101.current.ascii",
+}
+
+DAILY_CHANNELS: Tuple[str, ...] = ("pna", "nao", "ao")
+MONTHLY_CHANNELS: Tuple[str, ...] = ("nino34", "pdo")
+
+# CPC publishes the daily indices rounded to three decimals. The historical
+# CondTrain file was generated from higher-precision copies, and the observed
+# normalized differences are <=1.73e-4 across all 6,579 overlap dates.
+LEGACY_TOLERANCES: Mapping[str, float] = {
+    "pna": 2.5e-4,
+    "nao": 2.5e-4,
+    "pdo": 5e-6,
+    "ao": 2.5e-4,
 }
 
 LEGACY_COLUMN_MAP: Mapping[str, int] = {
@@ -50,22 +63,76 @@ LEGACY_COLUMN_MAP: Mapping[str, int] = {
 }
 
 
-def default_source_paths(data_root: Path) -> Dict[str, Path]:
+def default_source_paths(data_root: Path, pdo_workbook: Path) -> Dict[str, Path]:
     """Return generated source paths under the configured global data root."""
     driver_root = Path(data_root) / "drivers"
     return {
-        "pna": driver_root / "teleconnections" / "pna.data",
-        "nao": driver_root / "teleconnections" / "nao.data",
+        "pna": driver_root / "teleconnections" / "pna.daily",
+        "nao": driver_root / "teleconnections" / "nao.daily",
         "nino34": driver_root / "nino34.txt",
-        "pdo": driver_root / "teleconnections" / "pdo.data",
-        "ao": driver_root / "teleconnections" / "ao.data",
+        "pdo": Path(pdo_workbook),
+        "ao": driver_root / "teleconnections" / "ao.daily",
     }
 
 
-def _parse_source(name: str, path: Path) -> Mapping[Tuple[int, int], float]:
+def parse_daily_cpc_file(path: Path) -> Mapping[int, float]:
+    """Parse CPC ``year month day value`` indices keyed by YYYYMMDD."""
+    values: Dict[int, float] = {}
+    for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            year, month, day = (int(parts[index]) for index in range(3))
+            value = float(parts[3])
+        except ValueError:
+            continue
+        label = year * 10000 + month * 100 + day
+        if label in values:
+            raise RuntimeError(f"{path}:{line_number}: duplicate date {label}.")
+        values[label] = value
+    if not values:
+        raise RuntimeError(f"No daily CPC values parsed from {path}.")
+    return values
+
+
+def parse_pdo_workbook(path: Path) -> Mapping[Tuple[int, int], float]:
+    """Parse the preserved ERSSTv5 PDO workbook without openpyxl."""
+    headers, rows = read_first_xlsx_sheet(Path(path))
+    normalized = [str(value).strip().lower()[:3] for value in headers]
+    expected = ["yea", "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+    if normalized[:13] != expected:
+        raise RuntimeError(f"Unexpected PDO workbook columns in {path}: {headers}.")
+    values: Dict[Tuple[int, int], float] = {}
+    for row_number, row in enumerate(rows, 2):
+        if not row or str(row[0]).strip() == "":
+            continue
+        try:
+            year = int(float(str(row[0]).strip()))
+        except ValueError as exc:
+            raise RuntimeError(f"{path}:{row_number}: invalid PDO year {row[0]!r}.") from exc
+        for month in range(1, 13):
+            if month >= len(row) or str(row[month]).strip() == "":
+                continue
+            try:
+                values[(year, month)] = float(str(row[month]).strip())
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"{path}:{row_number}: invalid PDO value {row[month]!r} for month {month}."
+                ) from exc
+    if not values:
+        raise RuntimeError(f"No PDO values parsed from {path}.")
+    return values
+
+
+def _parse_source(name: str, path: Path) -> Mapping[object, float]:
+    if name in DAILY_CHANNELS:
+        return parse_daily_cpc_file(path)
     if name == "nino34":
         return parse_nino34_file(path)
-    return parse_monthly_index_file(path)
+    if name == "pdo":
+        return parse_pdo_workbook(path)
+    raise KeyError(f"Unsupported condition source: {name}")
 
 
 def download_source(url: str, target: Path, retries: int = 5) -> None:
@@ -109,6 +176,13 @@ def prepare_sources(
     """Ensure every configured source exists and passes its production parser."""
     for name in TELECONNECTION_CHANNELS:
         path = Path(paths[name])
+        if name == "pdo":
+            if not path.is_file() or path.stat().st_size == 0:
+                raise FileNotFoundError(f"Missing preserved PDO workbook: {path}")
+            parsed = _parse_source(name, path)
+            if not parsed:
+                raise RuntimeError(f"No values parsed for {name} from {path}.")
+            continue
         if refresh or not path.is_file() or path.stat().st_size == 0:
             if not allow_download:
                 raise FileNotFoundError(f"Missing teleconnection source with downloads disabled: {path}")
@@ -136,11 +210,11 @@ def load_cache_dates(store_path: Path) -> np.ndarray:
     return dates
 
 
-def expand_monthly_indices(
+def expand_condition_indices(
     date_labels: Sequence[int],
-    parsed_sources: Mapping[str, Mapping[Tuple[int, int], float]],
+    parsed_sources: Mapping[str, Mapping[object, float]],
 ) -> np.ndarray:
-    """Expand five monthly indices onto an exact daily YYYYMMDD axis."""
+    """Align mixed daily/monthly condition indices to exact YYYYMMDD labels."""
     labels = np.asarray(date_labels, dtype=np.int64)
     output = np.empty((labels.size, len(TELECONNECTION_CHANNELS)), dtype=np.float32)
     missing = []
@@ -150,7 +224,7 @@ def expand_monthly_indices(
         month = (int(label) // 100) % 100
         for column, name in enumerate(TELECONNECTION_CHANNELS):
             values = parsed_sources[name]
-            key = (year, month)
+            key = int(label) if name in DAILY_CHANNELS else (year, month)
             if key not in values:
                 missing.append((int(label), name))
                 output[row, column] = np.nan
@@ -170,6 +244,10 @@ def expand_monthly_indices(
     return output
 
 
+# Backward-compatible name retained for existing callers and fixtures.
+expand_monthly_indices = expand_condition_indices
+
+
 def _minmax(values: np.ndarray) -> np.ndarray:
     minimum = np.min(values, axis=0)
     span = np.max(values, axis=0) - minimum
@@ -182,7 +260,7 @@ def validate_preserved_legacy_channels(
     date_labels: Sequence[int],
     raw_values: np.ndarray,
     legacy_condtrain_path: Path,
-    tolerance: float = 5e-6,
+    tolerances: Mapping[str, float] = LEGACY_TOLERANCES,
 ) -> Dict[str, float]:
     """Prove the four preserved channels reproduce the legacy normalized file."""
     try:
@@ -226,7 +304,14 @@ def validate_preserved_legacy_channels(
         correlation = float(np.corrcoef(reconstructed, expected)[0, 1])
         report[f"{name}_max_abs_difference"] = difference
         report[f"{name}_correlation"] = correlation
-        if not np.isfinite(difference) or difference > float(tolerance):
+        tolerance = float(tolerances[name])
+        report[f"{name}_tolerance"] = tolerance
+        if (
+            not np.isfinite(difference)
+            or difference > tolerance
+            or not np.isfinite(correlation)
+            or correlation < 0.99999
+        ):
             failures.append((name, difference, correlation))
     report["matched_dates"] = int(len(legacy_labels))
     if failures:
@@ -271,7 +356,12 @@ def write_condition_cache(
         "sources": {
             name: {
                 "path": str(Path(source_paths[name]).resolve()),
-                "url": DEFAULT_SOURCE_URLS[name],
+                "url": DEFAULT_SOURCE_URLS.get(name),
+                "source_kind": (
+                    "daily_cpc" if name in DAILY_CHANNELS
+                    else "preserved_ersstv5_workbook" if name == "pdo"
+                    else "monthly_noaa_psl"
+                ),
                 "sha256": _sha256(Path(source_paths[name])),
             }
             for name in TELECONNECTION_CHANNELS
@@ -294,7 +384,7 @@ def build_condition_cache(
     """Build and validate the production five-index cache."""
     labels = load_cache_dates(store_path)
     parsed = {name: _parse_source(name, Path(source_paths[name])) for name in TELECONNECTION_CHANNELS}
-    values = expand_monthly_indices(labels, parsed)
+    values = expand_condition_indices(labels, parsed)
     legacy_report = validate_preserved_legacy_channels(
         labels,
         values,
@@ -317,6 +407,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_root", type=Path, required=True)
     parser.add_argument("--resolution", default="1.5deg")
     parser.add_argument("--legacy_condtrain", type=Path, required=True)
+    parser.add_argument(
+        "--pdo_workbook",
+        type=Path,
+        required=True,
+        help="Preserved PDO.xlsx used by the original HeatCast input pipeline.",
+    )
     parser.add_argument("--refresh_sources", action="store_true")
     parser.add_argument("--no_download", action="store_true")
     parser.add_argument("--download_retries", type=int, default=5)
@@ -328,7 +424,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.download_retries < 1:
         raise ValueError("--download_retries must be positive.")
     data_root = args.data_root.resolve()
-    paths = default_source_paths(data_root)
+    paths = default_source_paths(data_root, args.pdo_workbook.resolve())
     prepare_sources(
         paths,
         refresh=bool(args.refresh_sources),
