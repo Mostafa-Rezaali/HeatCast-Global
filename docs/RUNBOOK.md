@@ -184,6 +184,11 @@ all fold-safe normalization and threshold sidecars:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch slurm/submit_global_heat_index_build.slurm
 ```
 
+The Heat Index submission uses eight downloader workers and eight request
+lanes for the daily-statistics dataset, so the missing annual dewpoint requests
+are submitted concurrently. CDS may still queue or throttle them server-side;
+completed files remain atomic and resume-safe.
+
 Progress is reported as `HEAT_INDEX_PROGRESS`. Completion requires
 `heat_index_complete=1` for all 16,802 UTC days. Do not submit training until
 the log ends with `GLOBAL HEAT-INDEX TARGET AND FOLD SIDECARS COMPLETE`.

@@ -251,6 +251,50 @@ def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
     assert state["maximum"] == 1
 
 
+def test_same_dataset_requests_use_configured_parallel_lanes(tmp_path: Path, monkeypatch):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    barrier = threading.Barrier(2)
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    def observed_prepare(_client, task):
+        with lock:
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        barrier.wait(timeout=2.0)
+        with lock:
+            state["active"] -= 1
+        return task
+
+    monkeypatch.setattr(downloader, "prepare_task", observed_prepare)
+    monkeypatch.setattr(
+        downloader,
+        "download_prepared_task",
+        lambda _result, task: f"retrieved fixture {task.group}",
+    )
+    tasks = tuple(
+        next(
+            task for task in build_download_tasks(tmp_path, years=(year,), months=(1,))
+            if task.group == "daily_tmax"
+        )
+        for year in (1979, 1980)
+    )
+    run_tasks(tasks, workers=2, per_dataset_workers=2)
+    assert state["maximum"] == 2
+
+
 def test_congested_dataset_lane_does_not_starve_other_datasets(
     tmp_path: Path, monkeypatch
 ):

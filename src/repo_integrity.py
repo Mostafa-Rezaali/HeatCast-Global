@@ -479,6 +479,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--enable_heat_index",
             "--expected_tasks 277",
             "data_pipeline.build_heat_index_target",
+            "DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}",
+            "DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-8}",
             "HEAT_INDEX_WORKERS=${HEAT_INDEX_WORKERS:-64}",
             "HEATCAST_GLOBAL_TARGET=heat_index",
             "--force",
