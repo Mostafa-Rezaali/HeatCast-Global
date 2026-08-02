@@ -65,9 +65,17 @@ This is an operational credential decision; no key or token belongs in Git.
 folds for the 1000+ member CFM plausible-worst-case demonstration. These cases
 are illustrative figures, not verified headline metrics.
 
-## Heat-index scope
+## Heat-index target -- resolved 2026-08-02
 
-`TODO(USER)`: Decide whether the optional ERA5 dewpoint-derived heat-index
-target is in scope for the first paper. `ENABLE_HEAT_INDEX` remains off by
-default because enabling it increases target-side acquisition and cache
-volume.
+The user selected Heat Index instead of Tmax as the global primary target.
+The implementation exactly reuses the existing HeatIndex project convention:
+relative humidity is derived from ERA5 daily-mean 2 m dewpoint and daily Tmax,
+then the NOAA/Steadman simple expression or Rothfusz regression with dry/humid
+adjustments is evaluated in Fahrenheit and returned in Celsius. Humidity is not
+clipped. Heat Index is computed before conservative regridding. Tmax remains a
+lagged predictor, and the CONUS target path remains unchanged.
+
+`TODO(USER)`: Before the matched ECMWF benchmark, pin the S2S surface-humidity
+or dewpoint field and its temporal definition needed to calculate member-wise
+Heat Index. The existing `mx2t6`-only ENS archive is a Tmax benchmark and must
+not be presented as a matched Heat Index benchmark.

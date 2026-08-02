@@ -104,6 +104,7 @@ def main() -> int:
     parser.add_argument("--fold_years_json", required=True)
     parser.add_argument("--resolution", choices=("1.5deg", "0.25deg"), default="1.5deg")
     parser.add_argument("--block_pixels", type=int, default=256)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     cfm.Config.CV_FOLD_YEARS_PATH = args.fold_years_json
@@ -113,7 +114,7 @@ def main() -> int:
     cfm.Config.CV_VAL_OFFSETS = ((int(args.fold) + 1) % 5,)
     bundle = cfm.prepare_global_training_datasets(rank=0, ddp=False, require_conditions=False)
     destination = fold_sidecar_path(Path(cfm.Config.TRAINING_DATA_PATH), args.fold, "thresholds")
-    if destination.exists():
+    if destination.exists() and not args.force:
         _, _, saved_train_years = load_fold_window_statistics(destination, args.fold)
         if set(saved_train_years) == set(bundle["train_years"]):
             print(f"Fold {args.fold} thresholds already match approved train years: {destination}")

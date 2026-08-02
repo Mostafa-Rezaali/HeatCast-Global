@@ -47,7 +47,9 @@ def load_ens_scoring_shared_data(config=cfm.Config) -> Dict[str, np.ndarray]:
         root = _require_zarr().open_group(str(config.TRAINING_DATA_PATH), mode="r")
         time_labels = np.asarray(root["time"][:], dtype=np.int32)
         shared = {
-            "heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH)),
+            "heat_index": LazyGlobalTruth(
+                Path(config.TRAINING_DATA_PATH), config.GLOBAL_TARGET_VARIABLE
+            ),
             "time_values": time_values,
             "time_labels": time_labels,
         }

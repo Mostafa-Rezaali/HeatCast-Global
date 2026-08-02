@@ -12,7 +12,7 @@ ENS_BENCHMARK_BANNER = """ECMWF ENS benchmark on the HeatCast scoreboard
 ================================================
 Coverage: score only the per-fold intersection of ENS reforecast years and HeatCast test years.
 Initialization: score the downloaded MJJAS S2S hdate initializations common to ENS and HeatCast.
-Variable: ENS daily maximum 2 m temperature versus the configured HeatCast target.
+Variable: member-wise ENS Heat Index must be derived from matched Tmax and surface humidity/dewpoint; Tmax-only ENS files are not comparable.
 Members: ENS probabilities use the 11-member reforecast fraction, calibrated on fold validation years.
 Cycle discipline: bias correction and calibration are fit separately for each model cycle before merging.
 Discipline: identical events, grid, thresholds, init dates, test years, and fold-safe calibration."""

@@ -23,6 +23,7 @@ from init_calendar import W34_LEADS, window_falls_in_months
 
 
 ANOMALY_CHANNELS: Tuple[str, ...] = (
+    "heat_index",
     "tmax",
     "t2m_mean",
     "swvl1",
@@ -167,15 +168,16 @@ def identity_preprocessor(shape: Sequence[int]) -> FoldFieldPreprocessor:
     """Return a zero-climatology/unit-scale fixture preprocessor for smoke tests."""
     spatial_shape = tuple(int(value) for value in shape)
     coefficient_count = 1 + 2 * 4
+    channels = CACHE_CHANNELS + ("heat_index",)
     return FoldFieldPreprocessor(
-        channels=CACHE_CHANNELS,
+        channels=channels,
         anomaly_channels=ANOMALY_CHANNELS,
         coefficients={
             channel: np.zeros((coefficient_count,) + spatial_shape, dtype=np.float32)
             for channel in ANOMALY_CHANNELS
         },
-        means={channel: np.zeros(spatial_shape, dtype=np.float32) for channel in CACHE_CHANNELS},
-        stds={channel: np.ones(spatial_shape, dtype=np.float32) for channel in CACHE_CHANNELS},
+        means={channel: np.zeros(spatial_shape, dtype=np.float32) for channel in channels},
+        stds={channel: np.ones(spatial_shape, dtype=np.float32) for channel in channels},
         train_years=(1979,),
     )
 
@@ -189,17 +191,18 @@ def _raw_map(context: np.ndarray, history_position: int) -> Mapping[str, np.ndar
 
 def assemble_global_tensors(
     context,
-    target_tmax,
+    target_values,
     history_dates: Sequence[int],
     target_dates: Sequence[int],
     lat,
     lon,
     condition_vector,
     preprocessor: FoldFieldPreprocessor,
+    target_channel: str = "tmax",
 ):
     """Assemble one 26-channel sample without any disk access."""
     context = np.asarray(context, dtype=np.float32)
-    target_tmax = np.asarray(target_tmax, dtype=np.float32)
+    target_values = np.asarray(target_values, dtype=np.float32)
     if context.shape[0] != 3 or context.shape[-1] != len(CACHE_CHANNELS):
         raise ValueError(f"Context must be (3,H,W,{len(CACHE_CHANNELS)}), got {context.shape}.")
     current = _raw_map(context, 0)
@@ -243,7 +246,7 @@ def assemble_global_tensors(
     if len(spatial) != 23:
         raise AssertionError(f"Global spatial stack has {len(spatial)} channels, expected 23.")
     target = np.stack([
-        preprocessor.transform("tmax", target_dates[index], target_tmax[index])
+        preprocessor.transform(target_channel, target_dates[index], target_values[index])
         for index in range(len(target_dates))
     ])
     return {
@@ -312,6 +315,7 @@ class GlobalHeatCastDataset(LazyGlobalZarrDataset):
             lon,
             self.condition_vectors[raw["init_index"]],
             self.preprocessor,
+            target_channel=self.target_array,
         )
         return (
             assembled["target"], assembled["x_t"], assembled["x_tm1"], assembled["x_tm2"],

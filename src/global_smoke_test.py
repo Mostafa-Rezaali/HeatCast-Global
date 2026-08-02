@@ -40,6 +40,7 @@ def _synthetic_assembled_sample(height: int, width: int, seed: int):
         grid.lon,
         np.zeros(8, dtype=np.float32),
         identity_preprocessor((height, width)),
+        target_channel="heat_index",
     )
 
 

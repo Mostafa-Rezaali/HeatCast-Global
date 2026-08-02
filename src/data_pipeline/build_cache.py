@@ -58,6 +58,7 @@ CACHE_CHANNELS: Tuple[str, ...] = (
 
 VARIABLE_CANDIDATES = {
     "t2m": ("t2m", "2m_temperature"),
+    "d2m": ("d2m", "2m_dewpoint_temperature"),
     "swvl1": ("swvl1", "volumetric_soil_water_layer_1"),
     "swvl2": ("swvl2", "volumetric_soil_water_layer_2"),
     "sst": ("sst", "sea_surface_temperature"),
@@ -636,6 +637,7 @@ class LazyGlobalZarrDataset(Dataset):
         *,
         history_days: Sequence[int] = (0, 1, 2),
         prediction_leads: Sequence[int] = tuple(range(15, 29)),
+        target_array: str = "tmax",
         opener=None,
         metadata: Optional[Mapping] = None,
     ):
@@ -643,6 +645,7 @@ class LazyGlobalZarrDataset(Dataset):
         self.init_indices = tuple(int(value) for value in init_indices)
         self.history_days = tuple(int(value) for value in history_days)
         self.prediction_leads = tuple(int(value) for value in prediction_leads)
+        self.target_array = str(target_array)
         self._opener = opener
         self._store = None
         self._store_pid = None
@@ -686,7 +689,17 @@ class LazyGlobalZarrDataset(Dataset):
         history_indices = [init_index - lag for lag in self.history_days]
         target_indices = [init_index + lead for lead in self.prediction_leads]
         context = np.asarray(data.oindex[history_indices, :, :, :], dtype=np.float32)
-        target = np.asarray(data.oindex[target_indices, :, :, self.tmax_channel], dtype=np.float32)
+        if self.target_array == "tmax":
+            target = np.asarray(
+                data.oindex[target_indices, :, :, self.tmax_channel],
+                dtype=np.float32,
+            )
+        else:
+            if self.target_array not in root:
+                raise RuntimeError(
+                    f"Global target array {self.target_array!r} is missing from {self.store_path}."
+                )
+            target = np.asarray(root[self.target_array].oindex[target_indices, :, :], dtype=np.float32)
         date_axis = getattr(self, "cache_date_labels", self.time_values)
         if len(date_axis) == int(self.metadata["shape"][0]):
             history_dates = tuple(date_axis[index] for index in history_indices)

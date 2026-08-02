@@ -18,7 +18,7 @@ INGEST_WORKERS=${INGEST_WORKERS:-16}
 FOLD_WORKERS=${FOLD_WORKERS:-2}
 FOLD_YEARS_JSON=${FOLD_YEARS_JSON:?TODO(USER): path to approved fold and ENS comparison-year JSON}
 ECMWF_CYCLE_SPECS=${ECMWF_CYCLE_SPECS:?TODO(USER): comma-separated cycle_tag:member_count values}
-HEATCAST_RUNS=cvfold0_global_w34_dist_v1,cvfold1_global_w34_dist_v1,cvfold2_global_w34_dist_v1,cvfold3_global_w34_dist_v1,cvfold4_global_w34_dist_v1
+HEATCAST_RUNS=cvfold0_global_hi_w34_dist_v1,cvfold1_global_hi_w34_dist_v1,cvfold2_global_hi_w34_dist_v1,cvfold3_global_hi_w34_dist_v1,cvfold4_global_hi_w34_dist_v1
 WINDOWS=(
   15,16,17,18,19,20,21
   22,23,24,25,26,27,28
@@ -35,6 +35,10 @@ export NUMEXPR_NUM_THREADS=1
 export HEATCAST_DOMAIN=global
 export HEATCAST_RESOLUTION="$RESOLUTION"
 export HEATCAST_FOLD_YEARS_JSON="$FOLD_YEARS_JSON"
+export HEATCAST_GLOBAL_TARGET=heat_index
+
+echo "BLOCKED: the current ECMWF archive contains mx2t6 only. Pin the cycle-specific S2S surface humidity/dewpoint field before member-wise Heat Index ingestion (docs/DECISIONS_NEEDED.md)."
+exit 2
 
 test -s "$FOLD_YEARS_JSON"
 COMPARISON_YEARS=$("$PY" -c "from fold_config import comparison_period; import sys; print(','.join(map(str, comparison_period(sys.argv[1]))))" "$FOLD_YEARS_JSON")

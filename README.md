@@ -7,9 +7,10 @@
 
 HeatCast-Global extends the
 [HeatCast](https://github.com/Mostafa-Rezaali/HeatCast) week-3--4 system from
-CONUS/PRISM to global ERA5. Its primary experiment predicts daily maximum 2 m
-temperature anomalies for leads `t+15...t+28` and evaluates week 3, week 4,
-and W34 heat extremes over Northern Hemisphere land for MJJAS-valid windows.
+CONUS/PRISM to global ERA5. Its primary experiment predicts daily Heat Index
+anomalies for leads `t+15...t+28`, calculated from ERA5 daily Tmax and relative
+humidity derived from daily-mean 2 m dewpoint. It evaluates week 3, week 4,
+and W34 humid-heat extremes over Northern Hemisphere land for MJJAS-valid windows.
 ECMWF ENS comparisons use matched initializations and retain HeatCast's
 fold-safe calibration and year-block bootstrap design.
 
@@ -27,7 +28,7 @@ All global behavior is introduced behind `Config.DOMAIN`:
 
 | Mode | Target and grid | Status |
 |---|---|---|
-| `global` (default) | ERA5 daily Tmax; Phase A `1.5deg` (`121 x 240`) | Active development target |
+| `global` (default) | ERA5 daily Heat Index; Phase A `1.5deg` (`121 x 240`) | Active production target |
 | `conus` | Original PRISM T2max z-score/persistence-residual path | Preserved compatibility path |
 
 Phase B changes configuration to ERA5 `0.25deg` (`721 x 1440`) and a finer

@@ -25,6 +25,7 @@ CURRENT_SUBMISSIONS = (
     "slurm/submit_export_w34_stack_netcdf.slurm",
     "slurm/submit_global_data_build.slurm",
     "slurm/submit_global_ens_cycles.slurm",
+    "slurm/submit_global_heat_index_build.slurm",
     "slurm/submit_global_w34_eval_stitch.slurm",
     "slurm/submit_global_w34_tube_all.slurm",
     "slurm/submit_paper_evidence_blocks.slurm",
@@ -241,7 +242,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "resolution=np.array(str(resolution))",
         ))
         and all(token in ens_score for token in (
-            '"heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH))',
+            '"heat_index": LazyGlobalTruth(',
+            "config.GLOBAL_TARGET_VARIABLE",
             'fold_sidecar_path(Path(config.TRAINING_DATA_PATH), int(config.CV_FOLD), "normalization")',
             "load_fold_window_statistics(sidecar, int(cfm.Config.CV_FOLD))",
             '"primary_mask": "NH land, full valid window in MJJAS"',
@@ -429,6 +431,57 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "data_pipeline.build_cache",
             "data_pipeline.validate_pipeline raw",
             "data_pipeline.validate_pipeline cache",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.heat_index_formula_contract",
+        "src/heat_index.py",
+        (
+            "def relative_humidity_from_dewpoint(",
+            "100.0 * (",
+            "def heat_index_c(",
+            "mask_simple = temp_f < 80.0",
+            "-42.379",
+            "adjustment_low",
+            "adjustment_high",
+            "def heat_index_from_tmax_dewpoint_c(",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.heat_index_target_build_contract",
+        "src/data_pipeline/build_heat_index_target.py",
+        (
+            'TARGET_ARRAY = "heat_index"',
+            'COMPLETE_ARRAY = "heat_index_complete"',
+            'download_target_path(raw_root, "daily_tmax"',
+            'download_target_path(raw_root, "daily_d2m"',
+            "heat_index_from_tmax_dewpoint_c(",
+            'method="conservative"',
+            'chunks=(1,) + grid.shape',
+            "ThreadPoolExecutor(max_workers=worker_count)",
+            "HEAT_INDEX_PROGRESS",
+        ),
+    ))
+
+    results.append(_required_tokens_check(
+        root,
+        "global.heat_index_build_submission_contract",
+        "slurm/submit_global_heat_index_build.slurm",
+        (
+            "#SBATCH --cpus-per-task=64",
+            "--mem=500G",
+            f"--mail-user={EMAIL}",
+            "REPO_DIR=/blue/nessie/mostafarezaali/HeatCast-Global",
+            "--enable_heat_index",
+            "--expected_tasks 277",
+            "data_pipeline.build_heat_index_target",
+            "HEAT_INDEX_WORKERS=${HEAT_INDEX_WORKERS:-64}",
+            "HEATCAST_GLOBAL_TARGET=heat_index",
+            "--force",
         ),
     ))
 
@@ -641,6 +694,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "--tube_loss_daily_weight 0.80",
             "--tube_loss_weekly_weight 0.20",
             "--early_stop_metric w34_tac",
+            "HEATCAST_GLOBAL_TARGET=heat_index",
+            "global_hi_w34_dist_v1",
             "submit_global_w34_eval_stitch.slurm",
         ),
     ))
@@ -660,6 +715,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "src/stitch_exceedance_folds.py",
             "src/build_driver_tables.py",
             "src/forecasts_of_opportunity.py",
+            "HEATCAST_GLOBAL_TARGET=heat_index",
+            "global_hi_w34_dist_v1",
         ),
     ))
 
@@ -697,6 +754,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
             "Download fresh ERA5",
             "reanalysis-era5-pressure-levels",
             "submit_global_data_build.slurm",
+            "submit_global_heat_index_build.slurm",
             "submit_global_w34_tube_all.slurm",
             "submit_global_w34_eval_stitch.slurm",
             "submit_global_ens_cycles.slurm",

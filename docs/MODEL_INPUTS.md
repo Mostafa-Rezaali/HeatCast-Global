@@ -55,6 +55,10 @@ positional/calendar/insolation channels are assembled lazily per sample. The
 store is opened inside each Dataset worker, never in the parent process, and
 has `time=1` chunks.
 
+Daily-mean 2 m dewpoint is target-construction data, not an additional model
+input. Tmax remains the three lagged thermal-state inputs after the target is
+changed to Heat Index, so the established 26-channel architecture is unchanged.
+
 ### Vector input: 8 channels
 
 1. PNA
@@ -85,7 +89,15 @@ Monday/Thursday evaluation calendar is unchanged.
 
 ### Global target and outputs
 
-- Target: ERA5 daily maximum 2 m temperature for UTC days.
+- Target: daily Heat Index in degrees Celsius for UTC days. Relative humidity
+  is calculated as `100 * es(d2m_daily_mean) / es(Tmax)` using
+  `es(T)=6.112*exp(17.67*T/(T+243.5))`; the existing HeatIndex project's
+  NOAA/Steadman simple expression and Rothfusz regression/adjustments are then
+  applied without clipping humidity.
+- Construction: compute Heat Index from native-grid ERA5 daily Tmax and
+  daily-mean 2 m dewpoint, then conservatively regrid it to the configured grid.
+- Storage: the target is a separate lazy `heat_index(time,lat,lon)` zarr array;
+  the completed 17-channel predictor array is not duplicated or rebuilt.
 - Default target mode: `climatology_anomaly`.
 - Climatology: intercept plus the first four annual sine/cosine harmonics per
   grid cell, fitted from training years only.

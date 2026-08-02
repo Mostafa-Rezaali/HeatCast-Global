@@ -258,6 +258,7 @@ def fit_fold_preprocessor_from_zarr(
     *,
     anomaly_channels: Sequence[str],
     n_harmonics: int = DEFAULT_HARMONICS,
+    target_array: str | None = None,
 ) -> FoldFieldPreprocessor:
     """Fit from a time-chunked cache while reading exactly one day at a time."""
     try:
@@ -266,18 +267,28 @@ def fit_fold_preprocessor_from_zarr(
         raise RuntimeError("zarr<3 is required for global fold preprocessing.") from exc
     root = zarr.open_group(str(store_path), mode="r")
     channels = tuple(str(value) for value in root.attrs["channels"])
+    target_name = None if target_array is None else str(target_array)
+    if target_name is not None:
+        if target_name not in root:
+            raise RuntimeError(f"Target array {target_name!r} is missing from {store_path}.")
+        if target_name not in channels:
+            channels = channels + (target_name,)
     date_labels = tuple(int(value) for value in np.asarray(root["time"][:]).tolist())
     del root
 
     def iterator():
         worker_root = zarr.open_group(str(store_path), mode="r")
         data = worker_root["data"]
+        target = None if target_name is None else worker_root[target_name]
         for index, valid_date in enumerate(date_labels):
             daily = np.asarray(data[index, :, :, :], dtype=np.float32)
-            yield valid_date, {
+            fields = {
                 channel: daily[..., channel_index]
-                for channel_index, channel in enumerate(channels)
+                for channel_index, channel in enumerate(channels[:daily.shape[-1]])
             }
+            if target_name is not None and target_name not in fields:
+                fields[target_name] = np.asarray(target[index, :, :], dtype=np.float32)
+            yield valid_date, fields
 
     return fit_fold_preprocessor(
         iterator,

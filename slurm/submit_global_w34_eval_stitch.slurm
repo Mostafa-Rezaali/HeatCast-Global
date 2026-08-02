@@ -18,7 +18,7 @@ WORK_DIR=/blue/nessie/mostafarezaali/HeatCast-Global/
 PY=/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python
 RESOLUTION=${RESOLUTION:-1.5deg}
 FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$WORK_DIR/configs/global_fold_years.json}
-RUNS=cvfold0_global_w34_dist_v1,cvfold1_global_w34_dist_v1,cvfold2_global_w34_dist_v1,cvfold3_global_w34_dist_v1,cvfold4_global_w34_dist_v1
+RUNS=cvfold0_global_hi_w34_dist_v1,cvfold1_global_hi_w34_dist_v1,cvfold2_global_hi_w34_dist_v1,cvfold3_global_hi_w34_dist_v1,cvfold4_global_hi_w34_dist_v1
 FULL_LEADS=15,16,17,18,19,20,21,22,23,24,25,26,27,28
 WINDOWS=(
   15,16,17,18,19,20,21
@@ -37,6 +37,7 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export HEATCAST_DOMAIN=global
 export HEATCAST_RESOLUTION="$RESOLUTION"
 export HEATCAST_FOLD_YEARS_JSON="$FOLD_YEARS_JSON"
+export HEATCAST_GLOBAL_TARGET=heat_index
 
 test -s "$FOLD_YEARS_JSON"
 test -s "$WORK_DIR/drivers/rmm.txt"
@@ -47,7 +48,7 @@ git pull --ff-only origin main
 "$PY" src/repo_integrity.py
 
 for FOLD in 0 1 2 3 4; do
-    RUN=cvfold${FOLD}_global_w34_dist_v1
+    RUN=cvfold${FOLD}_global_hi_w34_dist_v1
     test -s "trained_cfm_direct15_${RUN}_best_monitor.pth"
     "$PY" -u src/cfm_mesh_train.py \
       --domain global \

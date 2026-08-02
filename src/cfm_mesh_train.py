@@ -251,7 +251,8 @@ class Config:
     PRIMARY_LAND_ONLY = True
     PRIMARY_SEASON_MONTHS = (5, 6, 7, 8, 9)
     ENABLE_GLOBAL_LOCAL_WARM_SEASON_SUPPLEMENT = False
-    ENABLE_HEAT_INDEX = False
+    ENABLE_HEAT_INDEX = True
+    GLOBAL_TARGET_VARIABLE = os.environ.get("HEATCAST_GLOBAL_TARGET", "heat_index")
     N_MEMBERS = 512
     CV_FOLD_YEARS_PATH = os.environ.get("HEATCAST_FOLD_YEARS_JSON")
     CV_FOLD_YEARS = None  # Loaded from the approved 1979-2024 JSON before global production.
@@ -276,7 +277,7 @@ class Config:
     )
     TOPOGRAPHY_PATH = None if DOMAIN == "global" else CONUS_TOPOGRAPHY_PATH
     TARGET_VARIABLE_CANDIDATES = (
-        ("t2m_daily_max", "tmax") if DOMAIN == "global" else ("t2m_prism", "HeatIndex")
+        ("heat_index",) if DOMAIN == "global" else ("t2m_prism", "HeatIndex")
     )
     OUTPUT_DIR_OVERRIDE = os.environ.get("HEATCAST_OUTPUT_DIR")
     OUTPUT_DIR = OUTPUT_DIR_OVERRIDE or (DATA_ROOT if DOMAIN == "global" else CONUS_DATA_ROOT)
@@ -468,7 +469,7 @@ def configure_domain(domain=None, resolution=None, target_mode=None, config=Conf
     )
     config.TOPOGRAPHY_PATH = None if selected_domain == "global" else config.CONUS_TOPOGRAPHY_PATH
     config.TARGET_VARIABLE_CANDIDATES = (
-        ("t2m_daily_max", "tmax") if selected_domain == "global" else ("t2m_prism", "HeatIndex")
+        ("heat_index",) if selected_domain == "global" else ("t2m_prism", "HeatIndex")
     )
     config.OUTPUT_DIR = config.OUTPUT_DIR_OVERRIDE or (
         config.DATA_ROOT if selected_domain == "global" else config.CONUS_DATA_ROOT
@@ -3892,7 +3893,9 @@ def prepare_shared_data(config, rank, world_size, ddp):
         from ens_target_grid import LazyGlobalTruth
 
         return {
-            "heat_index": LazyGlobalTruth(Path(config.TRAINING_DATA_PATH)),
+            "heat_index": LazyGlobalTruth(
+                Path(config.TRAINING_DATA_PATH), config.GLOBAL_TARGET_VARIABLE
+            ),
             "time_values": bundle["time_values"],
             "valid_indices_override": sorted(
                 bundle["train_indices"] + bundle["val_indices"] + bundle["test_indices"]
@@ -4101,19 +4104,22 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
     store_path = Path(Config.TRAINING_DATA_PATH)
     labels, time_values, _, _ = load_global_cache_axis(store_path)
     valid_indices = valid_global_initializations(labels, prediction_leads(Config))
-    excluded_condition_dates = ()
-    if require_conditions:
-        valid_indices, excluded_condition_dates = filter_condition_available_initializations(
-            valid_indices,
-            Config.GLOBAL_TELECONNECTION_VECTOR_PATH,
-            labels,
+    if require_conditions and Config.GLOBAL_TARGET_VARIABLE != "heat_index":
+        raise RuntimeError(
+            "HeatCast-Global production target must be 'heat_index'; "
+            f"got {Config.GLOBAL_TARGET_VARIABLE!r}."
         )
-        if is_main_process() and excluded_condition_dates:
-            print(
-                "Excluded global initializations with unavailable official conditions: "
-                f"{excluded_condition_dates}",
-                flush=True,
-            )
+    valid_indices, excluded_condition_dates = filter_condition_available_initializations(
+        valid_indices,
+        Config.GLOBAL_TELECONNECTION_VECTOR_PATH,
+        labels,
+    )
+    if is_main_process() and excluded_condition_dates:
+        print(
+            "Excluded global initializations with unavailable official conditions: "
+            f"{excluded_condition_dates}",
+            flush=True,
+        )
     available_years = {
         int(str(int(labels[index]))[:4]) for index in valid_indices
     }
@@ -4134,7 +4140,11 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
     sidecar_ok = False
     if is_main_process() and sidecar.exists():
         try:
-            sidecar_ok = set(FoldFieldPreprocessor.load(sidecar).train_years) == set(train_years)
+            saved_preprocessor = FoldFieldPreprocessor.load(sidecar)
+            sidecar_ok = (
+                set(saved_preprocessor.train_years) == set(train_years)
+                and Config.GLOBAL_TARGET_VARIABLE in saved_preprocessor.channels
+            )
         except Exception:
             sidecar_ok = False
     if ddp:
@@ -4148,6 +4158,7 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
             sorted(train_years),
             anomaly_channels=ANOMALY_CHANNELS,
             n_harmonics=Config.CLIMATOLOGY_HARMONICS,
+            target_array=Config.GLOBAL_TARGET_VARIABLE,
         )
         preprocessor.save(sidecar)
     if ddp:
@@ -4169,6 +4180,7 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
         "condition_vectors": condition_vectors,
         "preprocessor": preprocessor,
         "prediction_leads": prediction_leads(Config),
+        "target_array": Config.GLOBAL_TARGET_VARIABLE,
     }
     datasets = {
         "train": GlobalHeatCastDataset(store_path, train_indices, **dataset_kwargs),

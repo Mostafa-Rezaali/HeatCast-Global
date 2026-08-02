@@ -16,6 +16,7 @@ from netCDF4 import Dataset as NetCDFDataset
 
 from data_pipeline.build_cache import CACHE_CHANNELS, DailySlice, LazyGlobalZarrDataset, write_zarr_cache
 from data_pipeline.check_cache import check_cached_slice
+from data_pipeline.build_heat_index_target import iter_native_heat_index
 from data_pipeline.download_era5 import (
     CDS_CLIMATE_API_URL,
     DEFAULT_DOWNLOAD_WORKERS,
@@ -37,9 +38,10 @@ from data_pipeline.validate_pipeline import (
     validate_cache_store,
     validate_raw_manifest,
 )
-from ens_target_grid import LazyGlobalChannel
+from ens_target_grid import LazyGlobalChannel, LazyGlobalTruth
 from global_dataset import GlobalHeatCastDataset, identity_preprocessor
 from spatial_weights import weighted_spatial_mean
+from heat_index import heat_index_from_tmax_dewpoint_c
 
 
 def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path: Path):
@@ -86,6 +88,62 @@ def test_yearly_chunking_reduces_full_archive_to_231_requests(tmp_path: Path):
     assert len(annual) == 46 * 5 + 1 == 231
     assert len(monthly) == 12 * 5 + 1 == 61
     assert Path(monthly[0].target).name == "daily_tmax_197901.nc"
+
+
+def test_heat_index_download_adds_only_daily_mean_dewpoint(tmp_path: Path):
+    tasks = build_download_tasks(
+        tmp_path,
+        years=(1979,),
+        months=MONTHS,
+        enable_heat_index=True,
+    )
+    assert len(tasks) == 7
+    dewpoint = next(task for task in tasks if task.group == "daily_d2m")
+    assert dewpoint.dataset == PREFERRED_DAILY_DATASET
+    assert dewpoint.request["variable"] == "2m_dewpoint_temperature"
+    assert dewpoint.request["daily_statistic"] == "daily_mean"
+    assert Path(dewpoint.target).name == "daily_d2m_1979.nc"
+    single = next(task for task in tasks if task.group == "single_levels")
+    assert "2m_dewpoint_temperature" not in single.request["variable"]
+
+    full = build_download_tasks(
+        tmp_path,
+        years=range(1979, 2025),
+        months=MONTHS,
+        enable_heat_index=True,
+    )
+    assert len(full) == 46 * 6 + 1 == 277
+
+
+def test_native_heat_index_stream_uses_daily_tmax_and_daily_mean_dewpoint(tmp_path: Path):
+    raw_root = tmp_path / "raw" / "era5"
+    for group, variable, value in (
+        ("daily_tmax", "t2m", 303.15),
+        ("daily_d2m", "d2m", 293.15),
+    ):
+        path = raw_root / group / "1979" / f"{group}_197901.nc"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with NetCDFDataset(path, "w") as output:
+            output.createDimension("valid_time", 1)
+            output.createDimension("latitude", 2)
+            output.createDimension("longitude", 4)
+            output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
+            output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
+            output.createVariable("longitude", "f4", ("longitude",))[:] = [0, 90, 180, 270]
+            field = output.createVariable(
+                variable, "f4", ("valid_time", "latitude", "longitude")
+            )
+            field.units = "K"
+            field[:] = value
+    records = list(iter_native_heat_index(raw_root, (1979,), (1,), chunking="monthly"))
+    assert len(records) == 1
+    valid_date, values, lat, lon = records[0]
+    assert valid_date == date(1979, 1, 1)
+    assert values.shape == (2, 4)
+    expected = heat_index_from_tmax_dewpoint_c(np.array([30.0]), np.array([20.0]))[0]
+    assert np.allclose(values, expected, atol=1e-5)
+    assert np.array_equal(lat, [45.0, -45.0])
+    assert np.array_equal(lon, [0.0, 90.0, 180.0, 270.0])
 
 
 def test_era5_endpoint_preflight_rejects_ecds_without_exposing_key(
@@ -735,3 +793,40 @@ def test_global_training_dataset_preserves_date_labels_while_exposing_legacy_off
     assert dataset.date_labels[2] == 20000103
     assert dataset.time_values[2] == (date(2000, 1, 3) - date(1981, 5, 1)).days
     assert np.allclose(sample[0][0].numpy(), 17.0)
+
+
+def test_global_training_dataset_reads_separate_heat_index_target(tmp_path: Path):
+    zarr = pytest.importorskip("zarr")
+    grid = GridSpec(np.array([45.0, -45.0]), np.array([0.0, 120.0, 240.0]), "fixture")
+
+    def daily(day):
+        fields = {name: np.full(grid.shape, float(day), dtype=np.float32) for name in CACHE_CHANNELS}
+        fields["land_mask"][:] = 1.0
+        fields["sst_valid"][:] = 1.0
+        return DailySlice(date(2000, 1, 1) + timedelta(days=day), fields)
+
+    store = tmp_path / "heat-index-training.zarr"
+    write_zarr_cache(tuple(daily(day) for day in range(31)), store, grid, target_source="fixture")
+    root = zarr.open_group(str(store), mode="a")
+    heat = root.create_dataset(
+        "heat_index",
+        shape=(31,) + grid.shape,
+        chunks=(1,) + grid.shape,
+        dtype="f4",
+    )
+    for index in range(31):
+        heat[index] = 100.0 + index
+    root.attrs["primary_target"] = "heat_index"
+    dataset = GlobalHeatCastDataset(
+        store,
+        (2,),
+        condition_vectors=np.zeros((31, 8), dtype=np.float32),
+        preprocessor=identity_preprocessor(grid.shape),
+        target_array="heat_index",
+    )
+    sample = dataset[0]
+    np.testing.assert_allclose(sample[0][0].numpy(), 117.0)
+    np.testing.assert_allclose(sample[1].numpy(), 2.0)
+    lazy_truth = LazyGlobalTruth(store)
+    assert lazy_truth.channel == "heat_index"
+    np.testing.assert_allclose(lazy_truth[:, :, 17], 117.0)

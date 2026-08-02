@@ -3159,6 +3159,7 @@ def evaluate(args: argparse.Namespace) -> None:
             Path(cfm.Config.TRAINING_DATA_PATH),
             bundle["preprocessor"],
             bundle["date_labels"],
+            target_array=cfm.Config.GLOBAL_TARGET_VARIABLE,
         )
     print(f"Evaluating split={eval_split}, samples={len(dataset)}")
     leakage_ok = True

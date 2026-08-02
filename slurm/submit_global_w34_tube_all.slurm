@@ -33,11 +33,13 @@ export PYTORCH_ALLOC_CONF=expandable_segments:True
 export HEATCAST_DOMAIN=global
 export HEATCAST_RESOLUTION="$RESOLUTION"
 export HEATCAST_FOLD_YEARS_JSON="$FOLD_YEARS_JSON"
+export HEATCAST_GLOBAL_TARGET=heat_index
 
 test -s "$FOLD_YEARS_JSON"
 test -s "$WORK_DIR/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
 test -s "$WORK_DIR/cache/teleconnection_5.npy"
 test -s "$WORK_DIR/drivers/rmm.txt"
+"$PY" -c 'import sys,zarr,numpy as np; p=f"{sys.argv[1]}/cache/era5_{sys.argv[2]}.zarr"; r=zarr.open_group(p,mode="r"); n=len(r["time"]); assert "heat_index" in r and "heat_index_complete" in r; assert int(np.count_nonzero(r["heat_index_complete"][:]))==n; print(f"PASS heat_index target: {n}/{n} complete")' "$WORK_DIR" "$RESOLUTION"
 
 git pull --ff-only origin main
 "$PY" -m py_compile src/repo_integrity.py src/cfm_mesh_train.py src/global_dataset.py src/global_targets.py
@@ -57,7 +59,7 @@ fold_training_complete() {
 }
 
 for FOLD in 0 1 2 3 4; do
-    RUN=cvfold${FOLD}_global_w34_dist_v1
+    RUN=cvfold${FOLD}_global_hi_w34_dist_v1
     test -s "$WORK_DIR/cache/era5_${RESOLUTION}.zarr.sidecars/fold${FOLD}_normalization.npz"
     test -s "$WORK_DIR/cache/era5_${RESOLUTION}.zarr.sidecars/fold${FOLD}_thresholds.npz"
     if [ "$CLEAN_START" = "0" ] && fold_training_complete "$RUN"; then

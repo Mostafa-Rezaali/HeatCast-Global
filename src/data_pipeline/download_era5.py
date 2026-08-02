@@ -152,10 +152,15 @@ def download_target_path(
     return raw_root / group / str(int(year)) / f"{group}_{label}.nc"
 
 
-def _daily_request(year: int, months: Sequence[int], statistic: str) -> dict:
+def _daily_request(
+    year: int,
+    months: Sequence[int],
+    statistic: str,
+    variable: str = "2m_temperature",
+) -> dict:
     return {
         "product_type": "reanalysis",
-        "variable": "2m_temperature",
+        "variable": str(variable),
         "year": str(int(year)),
         "month": [f"{int(month):02d}" for month in months],
         "day": _days_for_month(),
@@ -210,17 +215,26 @@ def build_download_tasks(
             raise ValueError(f"ERA5 year must be within 1979-2024, got {year}.")
         for selected_months in chunks:
             if target_source == "daily_statistics":
-                daily_specs = (
-                    ("daily_tmax", "daily_maximum"),
-                    ("daily_t2m", "daily_mean"),
-                )
-                for group, statistic in daily_specs:
+                daily_specs = [
+                    ("daily_tmax", "daily_maximum", "2m_temperature"),
+                    ("daily_t2m", "daily_mean", "2m_temperature"),
+                ]
+                if enable_heat_index:
+                    daily_specs.append(
+                        ("daily_d2m", "daily_mean", "2m_dewpoint_temperature")
+                    )
+                for group, statistic, variable in daily_specs:
                     tasks.append(DownloadTask(
                         group=group,
                         year=year,
                         months=selected_months,
                         dataset=PREFERRED_DAILY_DATASET,
-                        request=_daily_request(year, selected_months, statistic),
+                        request=_daily_request(
+                            year,
+                            selected_months,
+                            statistic,
+                            variable,
+                        ),
                         target=str(
                             download_target_path(
                                 raw_root, group, year, selected_months
@@ -245,8 +259,6 @@ def build_download_tasks(
                 ))
 
             single_variables = list(SINGLE_LEVEL_VARIABLES)
-            if enable_heat_index:
-                single_variables.append("2m_dewpoint_temperature")
             tasks.append(DownloadTask(
                 group="single_levels",
                 year=year,
@@ -587,7 +599,7 @@ def main() -> int:
     parser.add_argument(
         "--retry_base_seconds", type=float, default=DEFAULT_RETRY_BASE_SECONDS
     )
-    parser.add_argument("--enable_heat_index", action="store_true", default=Config.ENABLE_HEAT_INDEX)
+    parser.add_argument("--enable_heat_index", action="store_true", default=False)
     parser.add_argument("--manifest_only", action="store_true")
     args = parser.parse_args()
     raw_root = args.data_root / "raw" / "era5"

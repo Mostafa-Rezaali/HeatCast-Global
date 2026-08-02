@@ -121,18 +121,20 @@ def global_cache_time_axis(store_path: Path) -> Tuple[np.ndarray, np.ndarray, Di
 
 
 class LazyGlobalChannel:
-    """Expose one cache channel as ``(lat, lon, time)`` without eager loading."""
+    """Expose one cache channel or standalone target without eager loading."""
 
     def __init__(self, store_path: Path, channel: str):
-        if channel not in CACHE_CHANNELS:
-            raise ValueError(f"Unknown global cache channel {channel!r}.")
         self.store_path = str(store_path)
         self.channel = str(channel)
-        self.channel_index = CACHE_CHANNELS.index(self.channel)
         self._root = None
         self._pid = None
         zarr = _require_zarr()
         root = zarr.open_group(self.store_path, mode="r")
+        self.channel_index = (
+            CACHE_CHANNELS.index(self.channel) if self.channel in CACHE_CHANNELS else None
+        )
+        if self.channel_index is None and self.channel not in root:
+            raise ValueError(f"Unknown global cache channel or target {channel!r}.")
         self.shape = (int(root["lat"].shape[0]), int(root["lon"].shape[0]), int(root["time"].shape[0]))
         self.ndim = 3
 
@@ -156,10 +158,13 @@ class LazyGlobalChannel:
             slices = [self[lat_index, lon_index, int(value)] for value in times]
             return np.stack(slices, axis=-1) if slices else np.empty((0,), dtype=np.float32)
         root = self._open()
-        field = np.asarray(
-            root["data"][int(time_index), :, :, self.channel_index],
-            dtype=np.float32,
-        )
+        if self.channel_index is None:
+            field = np.asarray(root[self.channel][int(time_index), :, :], dtype=np.float32)
+        else:
+            field = np.asarray(
+                root["data"][int(time_index), :, :, self.channel_index],
+                dtype=np.float32,
+            )
         return field[lat_index, lon_index]
 
     def read_pixels_times(self, flat_pixels, time_indices) -> np.ndarray:
@@ -178,17 +183,20 @@ class LazyGlobalChannel:
 
 
 class LazyGlobalTruth(LazyGlobalChannel):
-    """Expose zarr Tmax through the worker/process-lazy channel interface."""
+    """Expose the configured zarr target through the process-lazy interface."""
 
-    def __init__(self, store_path: Path):
-        super().__init__(store_path, "tmax")
+    def __init__(self, store_path: Path, target_array: str | None = None):
+        zarr = _require_zarr()
+        root = zarr.open_group(str(store_path), mode="r")
+        selected = str(target_array or root.attrs.get("primary_target", "tmax"))
+        super().__init__(store_path, selected)
 
 
 class LazyNormalizedGlobalTruth(LazyGlobalTruth):
-    """Apply a fold preprocessor to each lazily read Tmax day."""
+    """Apply a fold preprocessor to each lazily read configured-target day."""
 
-    def __init__(self, store_path: Path, preprocessor, date_labels):
-        super().__init__(store_path)
+    def __init__(self, store_path: Path, preprocessor, date_labels, target_array=None):
+        super().__init__(store_path, target_array=target_array)
         self.preprocessor = preprocessor
         self.date_labels = np.asarray(date_labels, dtype=np.int32)
         if self.date_labels.size != self.shape[2]:
@@ -205,7 +213,7 @@ class LazyNormalizedGlobalTruth(LazyGlobalTruth):
             (slice(None), slice(None), int(time_index)),
         )
         normalized = self.preprocessor.transform(
-            "tmax",
+            self.channel,
             int(self.date_labels[int(time_index)]),
             full_field,
         )

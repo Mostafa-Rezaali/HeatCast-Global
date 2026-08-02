@@ -173,6 +173,21 @@ not prove scientific correctness.
 
 ## 4. Train five global folds
 
+### Build the Heat Index target (required)
+
+The predictor cache remains unchanged. This CPU job adds only 46 annual ERA5
+daily-mean 2 m dewpoint requests to the completed archive, calculates Heat
+Index on the native grid, writes the separate lazy target array, and rebuilds
+all fold-safe normalization and threshold sidecars:
+
+```bash
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch slurm/submit_global_heat_index_build.slurm
+```
+
+Progress is reported as `HEAT_INDEX_PROGRESS`. Completion requires
+`heat_index_complete=1` for all 16,802 UTC days. Do not submit training until
+the log ends with `GLOBAL HEAT-INDEX TARGET AND FOLD SIDECARS COMPLETE`.
+
 ```bash
 sbatch --export=ALL,RESOLUTION='1.5deg',PRECISION='fp32',GRAD_ACCUM=1,GRAD_CHECKPOINT=0 slurm/submit_global_w34_tube_all.slurm
 ```
@@ -182,6 +197,8 @@ unchanged `0.80` daily + `0.20` W34 Gaussian-CRPS tube loss, and early stopping
 on area-weighted NH-land `w34_tac`. It resumes fold checkpoints unless
 `CLEAN_START=1` is explicitly supplied. When all five folds pass their
 completion checks, it submits `submit_global_w34_eval_stitch.slurm`.
+Heat Index runs use `cvfold{0..4}_global_hi_w34_dist_v1`; Tmax checkpoints are
+never resumed into a Heat Index experiment.
 
 For Phase A memory pressure, increase `GRAD_ACCUM` without changing the
 effective scientific sample definition. `GRAD_CHECKPOINT=1` and
