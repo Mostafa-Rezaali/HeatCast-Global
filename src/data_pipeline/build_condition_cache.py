@@ -45,6 +45,17 @@ DEFAULT_SOURCE_URLS: Mapping[str, str] = {
 DAILY_CHANNELS: Tuple[str, ...] = ("pna", "nao", "ao")
 MONTHLY_CHANNELS: Tuple[str, ...] = ("nino34", "pdo")
 
+# These isolated dates are absent from the official CPC daily files as served
+# on 2026-08-02. They remain NaN in the aligned cache; production datasets
+# exclude any initialization whose condition vector is incomplete.
+KNOWN_CPC_DAILY_GAPS: Tuple[Tuple[int, str], ...] = (
+    (20030430, "ao"),
+    (20061026, "pna"),
+    (20061026, "nao"),
+    (20070126, "pna"),
+    (20070126, "nao"),
+)
+
 # CPC publishes the daily indices rounded to three decimals. The historical
 # CondTrain file was generated from higher-precision copies, and the observed
 # normalized differences are <=1.73e-4 across all 6,579 overlap dates.
@@ -235,10 +246,11 @@ def expand_condition_indices(
                 output[row, column] = np.nan
                 continue
             output[row, column] = value
-    if missing or invalid:
+    unexpected_missing = sorted(set(missing) - set(KNOWN_CPC_DAILY_GAPS))
+    if unexpected_missing or invalid:
         raise RuntimeError(
             "Teleconnection sources do not cover the ERA5 cache axis: "
-            f"missing={missing[:10]} ({len(missing)} total), "
+            f"missing={unexpected_missing[:10]} ({len(unexpected_missing)} unexpected), "
             f"invalid={invalid[:10]} ({len(invalid)} total)."
         )
     return output
@@ -346,6 +358,10 @@ def write_condition_cache(
     os.replace(partial, output_path)
 
     labels = np.asarray(date_labels, dtype=np.int64)
+    missing_values = [
+        {"date": int(labels[row]), "channel": TELECONNECTION_CHANNELS[column]}
+        for row, column in np.argwhere(~np.isfinite(values))
+    ]
     metadata = {
         "channels": list(TELECONNECTION_CHANNELS),
         "shape": list(values.shape),
@@ -353,6 +369,11 @@ def write_condition_cache(
         "last_date": int(labels[-1]),
         "normalization": "raw values; mean/std fitted from active fold training initializations",
         "decision": "Legacy OMI PC2 replaced by NOAA PSL Nino3.4 anomaly; user approved 2026-08-02.",
+        "missing_value_policy": (
+            "Known official CPC daily gaps remain NaN; condition-incomplete "
+            "initializations are excluded without interpolation. User approved 2026-08-02."
+        ),
+        "missing_values": missing_values,
         "sources": {
             name: {
                 "path": str(Path(source_paths[name]).resolve()),
@@ -391,6 +412,10 @@ def build_condition_cache(
         legacy_condtrain_path,
     )
     metadata_path = write_condition_cache(output_path, labels, values, source_paths, legacy_report)
+    missing_values = [
+        {"date": int(labels[row]), "channel": TELECONNECTION_CHANNELS[column]}
+        for row, column in np.argwhere(~np.isfinite(values))
+    ]
     return {
         "output": str(output_path),
         "metadata": str(metadata_path),
@@ -398,6 +423,7 @@ def build_condition_cache(
         "channels": list(TELECONNECTION_CHANNELS),
         "first_date": int(labels[0]),
         "last_date": int(labels[-1]),
+        "missing_values": missing_values,
         "legacy_validation": legacy_report,
     }
 

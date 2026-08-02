@@ -4089,6 +4089,7 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
     from global_dataset import (
         ANOMALY_CHANNELS,
         GlobalHeatCastDataset,
+        filter_condition_available_initializations,
         load_global_cache_axis,
         load_global_condition_vectors,
         valid_global_initializations,
@@ -4100,6 +4101,19 @@ def prepare_global_training_datasets(rank=0, ddp=False, require_conditions=True)
     store_path = Path(Config.TRAINING_DATA_PATH)
     labels, time_values, _, _ = load_global_cache_axis(store_path)
     valid_indices = valid_global_initializations(labels, prediction_leads(Config))
+    excluded_condition_dates = ()
+    if require_conditions:
+        valid_indices, excluded_condition_dates = filter_condition_available_initializations(
+            valid_indices,
+            Config.GLOBAL_TELECONNECTION_VECTOR_PATH,
+            labels,
+        )
+        if is_main_process() and excluded_condition_dates:
+            print(
+                "Excluded global initializations with unavailable official conditions: "
+                f"{excluded_condition_dates}",
+                flush=True,
+            )
     available_years = {
         int(str(int(labels[index]))[:4]) for index in valid_indices
     }

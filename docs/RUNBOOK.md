@@ -56,7 +56,10 @@ cd /blue/nessie/mostafarezaali/HeatCast-Global && git pull --ff-only origin main
 ```
 
 The output must report shape `[16802, 5]`, dates `19790101` through
-`20241231`, and passing legacy differences before training is submitted.
+`20241231`, the five documented CPC missing values, and passing legacy
+differences before training is submitted. Training excludes the sole affected
+MJJAS-valid initialization (`2003-04-30`) without interpolation; matched
+Monday/Thursday evaluation dates are unchanged.
 
 Keep ERA5 and ECMWF S2S credentials separate. Create `~/.cdsapirc-era5` from
 the Climate Data Store API profile with:

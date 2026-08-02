@@ -1,6 +1,6 @@
 """Data-free tests for the approved global teleconnection cache builder."""
 
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import subprocess
 import sys
@@ -9,7 +9,10 @@ import zipfile
 import numpy as np
 import pytest
 
+from init_calendar import mjjas_mon_thu, window_falls_in_months
+
 from data_pipeline.build_condition_cache import (
+    KNOWN_CPC_DAILY_GAPS,
     TELECONNECTION_CHANNELS,
     expand_condition_indices,
     expand_monthly_indices,
@@ -66,6 +69,30 @@ def test_monthly_indices_reject_missing_and_sentinel_values():
     sources["ao"] = {20000101: -999.0}
     with pytest.raises(RuntimeError, match="do not cover the ERA5 cache axis"):
         expand_monthly_indices(np.array([20000101, 20000201]), sources)
+
+
+def test_known_cpc_daily_gaps_remain_nan_without_interpolation():
+    labels = np.array([20030429, 20030430, 20030501], dtype=np.int32)
+    sources = {
+        "pna": {20030429: 0.1, 20030430: 0.2, 20030501: 0.3},
+        "nao": {20030429: -0.1, 20030430: -0.2, 20030501: -0.3},
+        "nino34": {(2003, 4): 0.4, (2003, 5): 0.5},
+        "pdo": {(2003, 4): -0.4, (2003, 5): -0.5},
+        "ao": {20030429: 0.25, 20030501: 0.57},
+    }
+    values = expand_condition_indices(labels, sources)
+    assert (20030430, "ao") in KNOWN_CPC_DAILY_GAPS
+    assert np.isnan(values[1, TELECONNECTION_CHANNELS.index("ao")])
+    assert np.isfinite(values[[0, 2]]).all()
+
+
+def test_known_gap_exclusion_does_not_change_matched_evaluation_calendar():
+    affected = date(2003, 4, 30)
+    assert window_falls_in_months(affected)
+    assert affected.weekday() == 2
+    assert affected not in set(mjjas_mon_thu(2003))
+    assert not window_falls_in_months(date(2006, 10, 26))
+    assert not window_falls_in_months(date(2007, 1, 26))
 
 
 def test_daily_cpc_parser(tmp_path: Path):

@@ -78,6 +78,11 @@ RMM values use the parser shared with `build_driver_tables.py`; the model path
 does not implement a second parser. Vector normalization uses only the active
 fold's training indices.
 
+The official CPC daily files omit five isolated values. They remain explicitly
+missing rather than being interpolated. Dataset construction excludes the sole
+affected full-W34 MJJAS initialization (`2003-04-30`); the matched
+Monday/Thursday evaluation calendar is unchanged.
+
 ### Global target and outputs
 
 - Target: ERA5 daily maximum 2 m temperature for UTC days.

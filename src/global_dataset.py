@@ -100,6 +100,28 @@ def valid_global_initializations(date_labels, prediction_leads=W34_LEADS) -> Tup
     return tuple(output)
 
 
+def filter_condition_available_initializations(
+    initialization_indices: Sequence[int],
+    base_teleconnection_path,
+    date_labels: Sequence[int],
+) -> Tuple[Tuple[int, ...], Tuple[int, ...]]:
+    """Exclude initializations with non-finite base conditions, without imputation."""
+    labels = np.asarray(date_labels, dtype=np.int32)
+    base = np.load(base_teleconnection_path, mmap_mode="r")
+    if base.shape == (5, len(labels)):
+        base = base.T
+    if base.shape != (len(labels), 5):
+        raise ValueError(f"Base teleconnections must be (time,5), got {base.shape}.")
+    kept = []
+    excluded_labels = []
+    for index in (int(value) for value in initialization_indices):
+        if np.all(np.isfinite(base[index])):
+            kept.append(index)
+        else:
+            excluded_labels.append(int(labels[index]))
+    return tuple(kept), tuple(excluded_labels)
+
+
 def load_global_condition_vectors(config, date_labels, train_indices):
     """Load five indices plus RMM and normalize only with the fold's train dates."""
     base = np.load(config.GLOBAL_TELECONNECTION_VECTOR_PATH, mmap_mode="r")

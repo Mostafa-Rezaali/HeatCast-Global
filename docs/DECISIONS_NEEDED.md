@@ -39,6 +39,15 @@ PNA/NAO/AO and monthly NOAA PSL Niño3.4, reuses the original ERSSTv5
 requires the four preserved channels to reproduce the legacy normalized
 CondTrain overlap before it writes `cache/teleconnection_5.npy`.
 
+## Isolated CPC daily-index gaps -- resolved 2026-08-02
+
+The user approved retaining the five values absent from the official CPC files
+as missing and excluding condition-incomplete initialization rows without
+interpolation. The only affected full-W34 MJJAS model initialization is
+2003-04-30; it is a Wednesday and therefore is not in the matched ECMWF
+Monday/Thursday evaluation calendar. Missing PNA/NAO values on 2006-10-26 and
+2007-01-26 fall outside the valid MJJAS initialization season.
+
 ## CDS credentials
 
 `TODO(USER)`: Install and validate the ERA5 Climate Data Store API token in

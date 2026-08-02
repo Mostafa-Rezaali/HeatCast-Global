@@ -12,6 +12,7 @@ from global_dataset import (
     VECTOR_INPUT_CHANNELS,
     assemble_global_tensors,
     build_model_condition_vectors,
+    filter_condition_available_initializations,
     identity_preprocessor,
     normalize_condition_vectors,
 )
@@ -121,3 +122,16 @@ def test_existing_rmm_parser_is_reused_for_model_components(tmp_path):
     normalized, mean, std = normalize_condition_vectors(vectors, (0,))
     assert normalized.shape == vectors.shape
     assert mean.shape == std.shape == (8,)
+
+
+def test_condition_incomplete_initialization_is_excluded_without_imputation(tmp_path):
+    labels = np.array([20030429, 20030430, 20030501], dtype=np.int32)
+    base = np.ones((3, 5), dtype=np.float32)
+    base[1, 4] = np.nan
+    path = tmp_path / "teleconnection_5.npy"
+    np.save(path, base)
+    kept, excluded = filter_condition_available_initializations((0, 1, 2), path, labels)
+    assert kept == (0, 2)
+    assert excluded == (20030430,)
+    loaded = np.load(path)
+    assert np.isnan(loaded[1, 4])

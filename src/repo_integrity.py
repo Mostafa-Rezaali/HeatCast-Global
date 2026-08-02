@@ -539,6 +539,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             'DAILY_CHANNELS: Tuple[str, ...] = ("pna", "nao", "ao")',
             '"preserved_ersstv5_workbook"',
             "correlation < 0.99999",
+            "KNOWN_CPC_DAILY_GAPS",
+            '"missing_value_policy"',
             "abs(value) >= 90.0",
             "os.replace(partial, output_path)",
             '"normalization": "raw values; mean/std fitted from active fold training initializations"',
@@ -584,6 +586,7 @@ def audit_repository(root: Path) -> list[CheckResult]:
         "global.production_training_data_contract",
         "def prepare_global_training_datasets(" in cfm
         and "fit_fold_preprocessor_from_zarr(" in cfm
+        and "filter_condition_available_initializations(" in cfm
         and 'GlobalHeatCastDataset(store_path, train_indices' in cfm
         and '"valid_indices_override"' in cfm
         and "Global production requires --fold_years_json" in cfm
