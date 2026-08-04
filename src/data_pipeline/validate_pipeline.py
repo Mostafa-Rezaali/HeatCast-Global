@@ -92,7 +92,8 @@ def validate_raw_manifest(
     if len(set(targets)) != len(targets):
         raise RuntimeError("ERA5 download manifest contains duplicate target paths.")
 
-    incomplete = [str(task.target) for task in tasks if not task_complete(task)]
+    # The audit, unlike a downloader resume, must reopen every NetCDF header.
+    incomplete = [str(task.target) for task in tasks if not task_complete(task, deep=True)]
     if incomplete:
         preview = "\n".join(incomplete[:20])
         suffix = "" if len(incomplete) <= 20 else f"\n... and {len(incomplete) - 20} more"

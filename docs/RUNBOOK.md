@@ -184,13 +184,23 @@ all fold-safe normalization and threshold sidecars:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch slurm/submit_global_heat_index_build.slurm
 ```
 
-The Heat Index submission uses eight downloader workers and eight request
+The Heat Index submission uses eight downloader workers and sixteen request
 lanes for the daily-statistics dataset, so the missing annual dewpoint requests
-are submitted concurrently. Each ready result is additionally attempted with
-four HTTP byte-range segments; if the signed CDS result server does not support
-ranges, the downloader automatically falls back to its standard single stream.
-CDS may still queue or throttle transfers server-side; completed files remain
-atomic and resume-safe.
+are submitted concurrently. Resumes are resolved before any lane opens: a target
+whose metadata sidecar matches the task and its recorded byte count is skipped
+without reopening the NetCDF header, because that sidecar is published only
+after the header was validated. The 231 files already in the archive therefore
+cost one `stat` each instead of a serialized HDF5 open, and the missing requests
+reach the CDS queue immediately. Pass `--revalidate` to force the full header
+audit during a resume; `validate_pipeline raw` always performs it.
+
+A ready result is handed to the transfer pool and the lane submits its next CDS
+request at once, so queue time is never spent waiting on local writes. Each
+result is additionally attempted with four HTTP byte-range segments written
+directly into their offsets in one preallocated file; if the signed CDS result
+server does not support ranges, the downloader automatically falls back to its
+standard single stream. CDS may still queue or throttle transfers server-side;
+completed files remain atomic and resume-safe.
 
 Progress is reported as `HEAT_INDEX_PROGRESS`. Completion requires
 `heat_index_complete=1` for all 16,802 UTC days. Do not submit training until

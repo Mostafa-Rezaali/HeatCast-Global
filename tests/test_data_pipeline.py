@@ -564,6 +564,160 @@ def test_download_task_is_atomic_idempotent_and_records_source(tmp_path: Path):
     assert not Path(task.target).with_suffix(".nc.part").exists()
 
 
+def _write_completed_task(task, *, payload_variable: str = "t2m") -> Path:
+    """Publish a fixture target plus the sidecar a finished download would write."""
+    target = Path(task.target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with NetCDFDataset(target, "w") as output:
+        output.createDimension("valid_time", 1)
+        output.createDimension("latitude", 2)
+        output.createDimension("longitude", 3)
+        output.createVariable("valid_time", "i8", ("valid_time",))[:] = [19790101]
+        output.createVariable("latitude", "f4", ("latitude",))[:] = [45.0, -45.0]
+        output.createVariable("longitude", "f4", ("longitude",))[:] = [0.0, 120.0, 240.0]
+        output.createVariable(
+            payload_variable, "f4", ("valid_time", "latitude", "longitude")
+        )[:] = 280.0
+    record = asdict(task)
+    record["months"] = list(task.months)
+    target.with_suffix(".nc.metadata.json").write_text(
+        json.dumps({
+            "task": record,
+            "target_source": task.source_choice,
+            "utc_days": True,
+            "validated_bytes": target.stat().st_size,
+        }),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_resume_check_trusts_validated_sidecar_without_reopening_netcdf(
+    tmp_path: Path, monkeypatch
+):
+    import data_pipeline.download_era5 as downloader
+
+    task = next(
+        task for task in build_download_tasks(tmp_path, years=(1979,), months=(1,))
+        if task.group == "daily_tmax"
+    )
+    target = _write_completed_task(task)
+
+    opens = []
+
+    def forbidden(path, *_args, **_kwargs):
+        opens.append(str(path))
+        raise AssertionError("resume must not reopen archived NetCDF headers")
+
+    monkeypatch.setattr(downloader, "NetCDFDataset", forbidden)
+    assert task_complete(task) is True
+    assert opens == []
+
+    # A truncated archive still fails the cheap check through the recorded size.
+    target.write_bytes(b"truncated")
+    assert task_complete(task) is False
+
+
+def test_deep_resume_check_still_reads_every_archived_header(tmp_path: Path):
+    task = next(
+        task for task in build_download_tasks(tmp_path, years=(1979,), months=(1,))
+        if task.group == "daily_tmax"
+    )
+    target = _write_completed_task(task, payload_variable="unexpected")
+    assert task_complete(task) is True
+    assert task_complete(task, deep=True) is False
+    assert target.is_file()
+
+
+def test_completed_tasks_are_resolved_before_any_request_lane_opens(
+    tmp_path: Path, monkeypatch, capsys
+):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    all_tasks = build_download_tasks(tmp_path, years=(1979, 1980), months=(1,))
+    tasks = tuple(task for task in all_tasks if task.group == "daily_tmax")
+    _write_completed_task(tasks[0])
+
+    requested = []
+    monkeypatch.setattr(
+        downloader,
+        "prepare_task",
+        lambda _client, task: requested.append(task.target) or task,
+    )
+    monkeypatch.setattr(
+        downloader,
+        "download_prepared_task",
+        lambda _result, task, *_args: f"retrieved fixture {task.group}",
+    )
+    run_tasks(tasks, workers=2, per_dataset_workers=2)
+    output = capsys.readouterr().out
+    assert requested == [tasks[1].target]
+    assert "Starting 1 CDS tasks" in output
+    assert f"exists, skipping: {tasks[0].target}" in output
+    assert "[2/2]" in output
+
+
+def test_request_lane_submits_next_request_while_transfer_slots_are_full(
+    tmp_path: Path, monkeypatch
+):
+    import data_pipeline.download_era5 as downloader
+
+    config = tmp_path / "era5.rc"
+    config.write_text(
+        f"url: {CDS_CLIMATE_API_URL}\nkey: fixture-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CDSAPI_RC", str(config))
+    monkeypatch.setitem(
+        sys.modules,
+        "cdsapi",
+        types.SimpleNamespace(Client=lambda: object()),
+    )
+    last_request_started = threading.Event()
+    requests_made = []
+    lock = threading.Lock()
+
+    def counting_prepare(_client, task):
+        with lock:
+            requests_made.append(task.target)
+            count = len(requests_made)
+        if count == 3:
+            last_request_started.set()
+        return task
+
+    def blocking_download(_result, task, *_args):
+        # The one transfer slot stays occupied until every CDS request is out,
+        # which only happens if the lane hands results off instead of waiting.
+        assert last_request_started.wait(timeout=5.0)
+        return f"retrieved fixture {task.group}"
+
+    monkeypatch.setattr(downloader, "prepare_task", counting_prepare)
+    monkeypatch.setattr(downloader, "download_prepared_task", blocking_download)
+    tasks = tuple(
+        next(
+            task for task in build_download_tasks(tmp_path, years=(year,), months=(1,))
+            if task.group == "daily_tmax"
+        )
+        for year in (1979, 1980, 1981)
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_tasks, tasks, workers=1, per_dataset_workers=1)
+        future.result(timeout=10.0)
+    assert last_request_started.is_set()
+    assert requests_made == [task.target for task in tasks]
+
+
 def test_post_download_manifest_validation_is_offline_and_detects_partials(tmp_path: Path):
     task = next(
         task for task in build_download_tasks(tmp_path, years=(1979,), months=(1,))
