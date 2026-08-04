@@ -32,6 +32,7 @@ from data_pipeline.download_era5 import (
     retrieve_task,
     run_tasks,
     task_complete,
+    validate_download_file,
     validate_cds_endpoint,
 )
 from data_pipeline.regrid import GridSpec, regrid_field
@@ -335,6 +336,56 @@ def test_ready_cds_result_downloads_with_parallel_http_ranges(tmp_path: Path, mo
     assert target.read_bytes() == payload
     assert sorted(observed) == [(0, 5), (6, 12), (13, 18), (19, 25)]
     assert not tuple(tmp_path.glob("*.segment*"))
+
+
+def test_netcdf_header_validation_is_serialized_for_thread_unsafe_hdf5(
+    tmp_path: Path, monkeypatch
+):
+    import data_pipeline.download_era5 as downloader
+
+    state = {"active": 0, "maximum": 0}
+    lock = threading.Lock()
+
+    class Dataset:
+        variables = {"latitude": object(), "longitude": object(), "t2m": object()}
+        dimensions = {"valid_time": [0], "latitude": [0], "longitude": [0]}
+
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            with lock:
+                state["active"] += 1
+                state["maximum"] = max(state["maximum"], state["active"])
+            time.sleep(0.03)
+            return self
+
+        def __exit__(self, *_args):
+            with lock:
+                state["active"] -= 1
+            return False
+
+    monkeypatch.setattr(downloader, "NetCDFDataset", Dataset)
+    tasks = tuple(
+        next(
+            task for task in build_download_tasks(tmp_path, years=(year,), months=(1,))
+            if task.group == "daily_tmax"
+        )
+        for year in (1979, 1980)
+    )
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"fixture{index}.nc"
+        path.write_bytes(b"netcdf-fixture")
+        paths.append(path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(validate_download_file, path, task)
+            for path, task in zip(paths, tasks)
+        ]
+        for future in futures:
+            future.result()
+    assert state["maximum"] == 1
 
 
 def test_congested_dataset_lane_does_not_starve_other_datasets(

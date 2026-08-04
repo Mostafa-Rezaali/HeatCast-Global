@@ -318,6 +318,8 @@ def audit_repository(root: Path) -> list[CheckResult]:
             '"download_format": "unarchived"',
             'times=("00:00",)',
             "def validate_download_file(",
+            "_NETCDF_VALIDATION_LOCK = threading.Lock()",
+            "with _NETCDF_VALIDATION_LOCK:",
             "validate_download_file(partial, task)",
             'target.with_suffix(target.suffix + ".part")',
             'partial.replace(target)',

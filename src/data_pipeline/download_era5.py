@@ -66,6 +66,11 @@ NETCDF_VARIABLE_CANDIDATES = {
 }
 
 
+# The HiPerGator netCDF4/HDF5 build is not thread-safe. CDS requests and HTTP
+# transfers remain parallel, but every local NetCDF header open is serialized.
+_NETCDF_VALIDATION_LOCK = threading.Lock()
+
+
 @dataclass(frozen=True)
 class DownloadTask:
     """One atomic annual, monthly, or static CDS retrieval."""
@@ -354,24 +359,31 @@ def validate_download_file(path: Path, task: DownloadTask) -> None:
     if not path.is_file() or path.stat().st_size <= 0:
         raise RuntimeError(f"CDS retrieval produced no data: {path}")
     try:
-        with NetCDFDataset(str(path)) as dataset:
-            available = set(dataset.variables)
-            if not any(name in available for name in ("latitude", "lat")):
-                raise RuntimeError("missing latitude coordinate")
-            if not any(name in available for name in ("longitude", "lon")):
-                raise RuntimeError("missing longitude coordinate")
-            requested_variables = task.request.get("variable", ())
-            if isinstance(requested_variables, str):
-                requested_variables = (requested_variables,)
-            missing = []
-            for requested in requested_variables:
-                candidates = NETCDF_VARIABLE_CANDIDATES.get(str(requested), (str(requested),))
-                if not any(candidate in available for candidate in candidates):
-                    missing.append(str(requested))
-            if missing:
-                raise RuntimeError(f"missing requested variables {missing}; available={sorted(available)}")
-            if not dataset.dimensions or any(len(value) <= 0 for value in dataset.dimensions.values()):
-                raise RuntimeError("empty NetCDF dimensions")
+        with _NETCDF_VALIDATION_LOCK:
+            with NetCDFDataset(str(path)) as dataset:
+                available = set(dataset.variables)
+                if not any(name in available for name in ("latitude", "lat")):
+                    raise RuntimeError("missing latitude coordinate")
+                if not any(name in available for name in ("longitude", "lon")):
+                    raise RuntimeError("missing longitude coordinate")
+                requested_variables = task.request.get("variable", ())
+                if isinstance(requested_variables, str):
+                    requested_variables = (requested_variables,)
+                missing = []
+                for requested in requested_variables:
+                    candidates = NETCDF_VARIABLE_CANDIDATES.get(
+                        str(requested), (str(requested),)
+                    )
+                    if not any(candidate in available for candidate in candidates):
+                        missing.append(str(requested))
+                if missing:
+                    raise RuntimeError(
+                        f"missing requested variables {missing}; available={sorted(available)}"
+                    )
+                if not dataset.dimensions or any(
+                    len(value) <= 0 for value in dataset.dimensions.values()
+                ):
+                    raise RuntimeError("empty NetCDF dimensions")
     except (OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(f"Invalid NetCDF payload for {task.group}: {path}: {exc}") from exc
 
