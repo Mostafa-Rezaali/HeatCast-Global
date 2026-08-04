@@ -20,6 +20,7 @@ MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_CHUNKING=${DOWNLOAD_CHUNKING:-yearly}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
 DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-8}
+DOWNLOAD_SEGMENTS_PER_FILE=${DOWNLOAD_SEGMENTS_PER_FILE:-4}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
 DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
 HEAT_INDEX_WORKERS=${HEAT_INDEX_WORKERS:-64}
@@ -62,6 +63,7 @@ echo "Downloading only missing Heat Index source data: 46 annual daily-mean dewp
       --pressure_dataset "$ERA5_PRESSURE_DATASET" \
       --workers "$DOWNLOAD_WORKERS" \
       --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
+      --segments_per_file "$DOWNLOAD_SEGMENTS_PER_FILE" \
       --max_retries "$DOWNLOAD_MAX_RETRIES" \
       --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS" \
       --enable_heat_index

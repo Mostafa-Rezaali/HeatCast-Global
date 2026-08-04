@@ -22,10 +22,12 @@ from data_pipeline.download_era5 import (
     DEFAULT_DOWNLOAD_WORKERS,
     DEFAULT_MAX_RETRIES,
     DEFAULT_PER_DATASET_WORKERS,
+    DEFAULT_SEGMENTS_PER_FILE,
     MONTHS,
     PREFERRED_DAILY_DATASET,
     PRESSURE_LEVEL_DATASET,
     build_download_tasks,
+    _download_result_in_segments,
     is_retryable_cds_error,
     retrieve_task,
     run_tasks,
@@ -48,6 +50,7 @@ def test_download_manifest_is_chunked_and_uses_pinned_official_datasets(tmp_path
     assert DEFAULT_DOWNLOAD_WORKERS == 8
     assert DEFAULT_PER_DATASET_WORKERS == 1
     assert DEFAULT_MAX_RETRIES == 12
+    assert DEFAULT_SEGMENTS_PER_FILE == 1
     tasks = build_download_tasks(tmp_path, years=(1979,), months=MONTHS)
     assert len(tasks) == 6
     assert {task.group for task in tasks} == {
@@ -199,7 +202,7 @@ def test_download_tasks_execute_concurrently(tmp_path: Path, monkeypatch, capsys
     monkeypatch.setattr(
         downloader,
         "download_prepared_task",
-        lambda _result, task: f"retrieved fixture {task.group}",
+        lambda _result, task, *_args: f"retrieved fixture {task.group}",
     )
     all_tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))
     tasks = (
@@ -243,7 +246,7 @@ def test_same_dataset_requests_are_serialized(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         downloader,
         "download_prepared_task",
-        lambda _result, task: f"retrieved fixture {task.group}",
+        lambda _result, task, *_args: f"retrieved fixture {task.group}",
     )
     tasks = build_download_tasks(tmp_path, years=(1979,), months=(1,))[:2]
     run_tasks(tasks, workers=2, per_dataset_workers=1)
@@ -282,7 +285,7 @@ def test_same_dataset_requests_use_configured_parallel_lanes(tmp_path: Path, mon
     monkeypatch.setattr(
         downloader,
         "download_prepared_task",
-        lambda _result, task: f"retrieved fixture {task.group}",
+        lambda _result, task, *_args: f"retrieved fixture {task.group}",
     )
     tasks = tuple(
         next(
@@ -293,6 +296,45 @@ def test_same_dataset_requests_use_configured_parallel_lanes(tmp_path: Path, mon
     )
     run_tasks(tasks, workers=2, per_dataset_workers=2)
     assert state["maximum"] == 2
+
+
+def test_ready_cds_result_downloads_with_parallel_http_ranges(tmp_path: Path, monkeypatch):
+    payload = b"abcdefghijklmnopqrstuvwxyz"
+    observed = []
+
+    class Response:
+        status_code = 206
+
+        def __init__(self, content):
+            self.content = content
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def iter_content(self, chunk_size):
+            assert chunk_size > 0
+            yield self.content
+
+    def get(_url, *, headers, stream, timeout):
+        assert stream is True
+        assert timeout == (30, 300)
+        start, stop = map(int, headers["Range"].removeprefix("bytes=").split("-"))
+        observed.append((start, stop))
+        return Response(payload[start:stop + 1])
+
+    monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=get))
+    result = types.SimpleNamespace(
+        location="https://signed.example/result.nc",
+        content_length=len(payload),
+    )
+    target = tmp_path / "result.nc.part"
+    assert _download_result_in_segments(result, target, segments=4) is True
+    assert target.read_bytes() == payload
+    assert sorted(observed) == [(0, 5), (6, 12), (13, 18), (19, 25)]
+    assert not tuple(tmp_path.glob("*.segment*"))
 
 
 def test_congested_dataset_lane_does_not_starve_other_datasets(
@@ -319,7 +361,7 @@ def test_congested_dataset_lane_does_not_starve_other_datasets(
             assert daily_release.wait(timeout=5.0)
         return task
 
-    def fake_download(_result, task):
+    def fake_download(_result, task, *_args):
         if task.group == "single_levels":
             single_downloaded.set()
         return f"retrieved fixture {task.group}"
@@ -418,7 +460,7 @@ def test_cds_queue_limit_retries_with_backoff(tmp_path: Path, monkeypatch, capsy
     monkeypatch.setattr(
         downloader,
         "download_prepared_task",
-        lambda _result, task: f"retrieved fixture {task.group}",
+        lambda _result, task, *_args: f"retrieved fixture {task.group}",
     )
     monkeypatch.setattr(downloader.time, "sleep", sleeps.append)
     task = build_download_tasks(tmp_path, years=(1979,), months=(1,))[0]

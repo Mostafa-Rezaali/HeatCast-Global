@@ -186,8 +186,11 @@ cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch slurm/submit_global_hea
 
 The Heat Index submission uses eight downloader workers and eight request
 lanes for the daily-statistics dataset, so the missing annual dewpoint requests
-are submitted concurrently. CDS may still queue or throttle them server-side;
-completed files remain atomic and resume-safe.
+are submitted concurrently. Each ready result is additionally attempted with
+four HTTP byte-range segments; if the signed CDS result server does not support
+ranges, the downloader automatically falls back to its standard single stream.
+CDS may still queue or throttle transfers server-side; completed files remain
+atomic and resume-safe.
 
 Progress is reported as `HEAT_INDEX_PROGRESS`. Completion requires
 `heat_index_complete=1` for all 16,802 UTC days. Do not submit training until

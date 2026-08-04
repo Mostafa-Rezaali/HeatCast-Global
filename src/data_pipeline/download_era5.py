@@ -30,6 +30,7 @@ PRESSURE_LEVEL_DATASET = "reanalysis-era5-pressure-levels"
 CDS_CLIMATE_API_URL = "https://cds.climate.copernicus.eu/api"
 DEFAULT_DOWNLOAD_WORKERS = 8
 DEFAULT_PER_DATASET_WORKERS = 1
+DEFAULT_SEGMENTS_PER_FILE = 1
 DEFAULT_MAX_RETRIES = 12
 DEFAULT_RETRY_BASE_SECONDS = 60.0
 MAX_RETRY_DELAY_SECONDS = 900.0
@@ -405,7 +406,92 @@ def prepare_task(client, task: DownloadTask):
     return client.retrieve(task.dataset, task.request)
 
 
-def download_prepared_task(result, task: DownloadTask) -> str:
+def _download_result_in_segments(result, target: Path, segments: int) -> bool:
+    """Download one signed CDS result with HTTP ranges when supported."""
+    segment_count = int(segments)
+    location = getattr(result, "location", None)
+    content_length = int(getattr(result, "content_length", 0) or 0)
+    if segment_count <= 1 or not location or content_length <= 1:
+        return False
+    try:
+        import requests
+    except ImportError:
+        return False
+    segment_count = min(segment_count, content_length)
+    boundaries = [
+        (index * content_length // segment_count,
+         ((index + 1) * content_length // segment_count) - 1)
+        for index in range(segment_count)
+    ]
+    segment_paths = tuple(
+        target.with_suffix(target.suffix + f".segment{index:02d}")
+        for index in range(segment_count)
+    )
+
+    def fetch(index: int) -> None:
+        start, stop = boundaries[index]
+        path = segment_paths[index]
+        path.unlink(missing_ok=True)
+        with requests.get(
+            str(location),
+            headers={"Range": f"bytes={start}-{stop}", "Accept-Encoding": "identity"},
+            stream=True,
+            timeout=(30, 300),
+        ) as response:
+            if response.status_code != 206:
+                raise RuntimeError(
+                    f"CDS result server did not honor byte range {start}-{stop}: "
+                    f"HTTP {response.status_code}."
+                )
+            with path.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
+        expected = stop - start + 1
+        if path.stat().st_size != expected:
+            raise RuntimeError(
+                f"CDS range size mismatch for {path}: {path.stat().st_size} != {expected}."
+            )
+
+    try:
+        print(
+            f"Using {segment_count} HTTP range segments for {content_length / 2**20:.1f} MiB CDS result.",
+            flush=True,
+        )
+        with ThreadPoolExecutor(max_workers=segment_count) as executor:
+            futures = [executor.submit(fetch, index) for index in range(segment_count)]
+            for future in as_completed(futures):
+                future.result()
+        with target.open("wb") as output:
+            for path in segment_paths:
+                with path.open("rb") as source:
+                    while True:
+                        chunk = source.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+        if target.stat().st_size != content_length:
+            raise RuntimeError(
+                f"Joined CDS result size mismatch: {target.stat().st_size} != {content_length}."
+            )
+        return True
+    except Exception as exc:
+        target.unlink(missing_ok=True)
+        print(
+            f"Segmented CDS download unavailable ({exc}); falling back to one stream.",
+            flush=True,
+        )
+        return False
+    finally:
+        for path in segment_paths:
+            path.unlink(missing_ok=True)
+
+
+def download_prepared_task(
+    result,
+    task: DownloadTask,
+    segments_per_file: int = DEFAULT_SEGMENTS_PER_FILE,
+) -> str:
     """Download, validate, and atomically publish one prepared CDS result."""
     target = Path(task.target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -416,7 +502,8 @@ def download_prepared_task(result, task: DownloadTask) -> str:
             f"CDS result ready; downloading group={task.group} year={task.year}",
             flush=True,
         )
-        result.download(str(partial))
+        if not _download_result_in_segments(result, partial, segments_per_file):
+            result.download(str(partial))
         validate_download_file(partial, task)
         partial.replace(target)
         metadata = {
@@ -465,6 +552,7 @@ def run_tasks(
     workers: int,
     *,
     per_dataset_workers: int = DEFAULT_PER_DATASET_WORKERS,
+    segments_per_file: int = DEFAULT_SEGMENTS_PER_FILE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
 ) -> None:
@@ -473,6 +561,8 @@ def run_tasks(
         raise ValueError("workers must be at least one.")
     if int(per_dataset_workers) < 1:
         raise ValueError("per_dataset_workers must be at least one.")
+    if int(segments_per_file) < 1:
+        raise ValueError("segments_per_file must be at least one.")
     if int(max_retries) < 0:
         raise ValueError("max_retries cannot be negative.")
     if float(retry_base_seconds) < 0:
@@ -486,7 +576,8 @@ def run_tasks(
     print(
         f"Starting {len(pending_tasks)} CDS tasks with "
         f"{int(workers)} download workers, {int(per_dataset_workers)} "
-        "independent request lane(s) per dataset, and automatic queue backoff.",
+        f"independent request lane(s) per dataset, {int(segments_per_file)} "
+        "HTTP segment(s) per file, and automatic queue backoff.",
         flush=True,
     )
 
@@ -550,7 +641,12 @@ def run_tasks(
                     continue
                 download_slots.acquire()
                 try:
-                    future = download_executor.submit(download_prepared_task, result, task)
+                    future = download_executor.submit(
+                        download_prepared_task,
+                        result,
+                        task,
+                        int(segments_per_file),
+                    )
                 except BaseException:
                     download_slots.release()
                     raise
@@ -595,6 +691,9 @@ def main() -> int:
     parser.add_argument(
         "--per_dataset_workers", type=int, default=DEFAULT_PER_DATASET_WORKERS
     )
+    parser.add_argument(
+        "--segments_per_file", type=int, default=DEFAULT_SEGMENTS_PER_FILE
+    )
     parser.add_argument("--max_retries", type=int, default=DEFAULT_MAX_RETRIES)
     parser.add_argument(
         "--retry_base_seconds", type=float, default=DEFAULT_RETRY_BASE_SECONDS
@@ -625,6 +724,7 @@ def main() -> int:
         tasks,
         args.workers,
         per_dataset_workers=args.per_dataset_workers,
+        segments_per_file=args.segments_per_file,
         max_retries=args.max_retries,
         retry_base_seconds=args.retry_base_seconds,
     )
