@@ -35,7 +35,6 @@ Required runtime inputs:
 /blue/nessie/mostafarezaali/HeatCast-Global/drivers/nino34.txt
 /blue/nessie/mostafarezaali/Teleconnection/PDO.xlsx
 configs/global_fold_years.json
-~/.cdsapirc-era5
 ```
 
 The five-index array must align exactly with the ERA5 cache time axis. The RMM,
@@ -61,18 +60,17 @@ differences before training is submitted. Training excludes the sole affected
 MJJAS-valid initialization (`2003-04-30`) without interpolation; matched
 Monday/Thursday evaluation dates are unchanged.
 
-Keep ERA5 and ECMWF S2S credentials separate. Create `~/.cdsapirc-era5` from
-the Climate Data Store API profile with:
+ERA5 reanalysis is read anonymously from the public Google ARCO-ERA5 Zarr
+store; no ERA5 CDS credential is required. Install TensorStore once in the
+unchanged production Python environment:
 
-```yaml
-url: https://cds.climate.copernicus.eu/api
-key: <CDS personal access token>
+```bash
+/blue/nessie/mostafarezaali/.conda/envs/torch_b200/bin/python -m pip install tensorstore
 ```
 
-The data-build Slurm script exports this file through `CDSAPI_RC`. An existing
-`~/.cdsapirc` configured with `https://ecds.ecmwf.int/api` may remain unchanged
-for the ECMWF ECDS/S2S workflow; that endpoint does not serve ERA5 collection
-IDs.
+Keep `~/.cdsapirc` configured with `https://ecds.ecmwf.int/api` for the
+separate ECMWF S2S/ENS workflow. ARCO-ERA5 is reanalysis and does not contain
+the initialization, member, lead-time, or cycle dimensions required by ENS.
 
 ## 2. Local/data-free preflight
 
@@ -88,14 +86,16 @@ git status --short
 Expected: every contract passes, pytest is green, the smoke result reports
 `grid_shape=[121,240]`, and Git contains no data/runtime artifacts.
 
-## 3. Download fresh ERA5, then build the cache and fold sidecars
+## 3. Stream fresh ERA5, then build the cache and fold sidecars
 
-The pressure-level source is pinned to the official CDS identifier
-`reanalysis-era5-pressure-levels`. The fresh-data workflow does not inspect or
-reuse the original HeatCast archive. Requests cover all days of 1979--2024 and
-default to one NetCDF per variable group per year: 231 total tasks instead of
-2,761 monthly tasks. Every file is validated before its atomic rename, and
-resume skips only files whose task metadata and NetCDF headers agree.
+The source is pinned to Google's public
+`gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3` store.
+The workflow reads only required variables and times, computes UTC-day Tmax and
+daily means incrementally, and preserves the existing 00 UTC sampling for the
+other predictors. It writes the same annual NetCDF layout used by the cache
+builder: 231 logical tasks over 1979--2024. Every file is validated before its
+atomic rename. Per-file progress sidecars let an interrupted annual transfer
+resume at the next day, and existing valid CDS-created files remain reusable.
 
 Submit the download alone first:
 
@@ -103,22 +103,20 @@ Submit the download alone first:
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0 slurm/submit_global_data_build.slurm
 ```
 
-The downloader uses `DOWNLOAD_CHUNKING=yearly` by default. It runs eight local
-worker threads, but admits at most one active
-request per CDS dataset. The three ERA5 collections can therefore progress in
-parallel without flooding any one dataset queue. Temporary CDS queue-limit
-responses are retried automatically with exponential backoff from 60 seconds
-to 15 minutes; completed valid files remain resume-safe. `DOWNLOAD_WORKERS`
-controls the local task pool, while `DOWNLOAD_PER_DATASET=1` should remain the
-production default:
+The downloader uses `DOWNLOAD_CHUNKING=yearly` and eight parallel annual
+streams by default. TensorStore performs anonymous range reads from GCS;
+temporary transport failures are retried with bounded exponential backoff.
+Local NetCDF writes are serialized for the HiPerGator HDF5 build, while remote
+reads overlap. `DOWNLOAD_WORKERS` controls the number of annual streams:
 
 ```bash
-cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0,DOWNLOAD_WORKERS=8,DOWNLOAD_PER_DATASET=1 slurm/submit_global_data_build.slurm
+cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch --export=ALL,DOWNLOAD_ONLY=1,BUILD_FOLD_SIDECARS=0,DOWNLOAD_WORKERS=8 slurm/submit_global_data_build.slurm
 ```
 
-If CDS rejects a particular annual payload for request-size rather than queue
-pressure, resubmit with `DOWNLOAD_CHUNKING=monthly`; annual and monthly target
-names are distinct, and the cache builder follows the same configured layout.
+If an annual task repeatedly fails, resubmit unchanged to continue from its
+last committed UTC day. `DOWNLOAD_CHUNKING=monthly` remains available when
+smaller output files are preferred; annual and monthly target names are
+distinct, and the cache builder follows the same configured layout.
 
 Raw files and the deterministic request manifest are written below:
 
@@ -128,7 +126,7 @@ Raw files and the deterministic request manifest are written below:
 ```
 
 After the download completes, run the post-download path below. It does not
-contact CDS or require CDS credentials. It revalidates all 231 manifest tasks
+contact Google Cloud. It revalidates all 231 manifest tasks
 and their metadata/NetCDF headers, conservatively regrids Tmax, bilinearly
 regrids predictors, writes resumable `time=1` Zarr chunks, then validates the
 complete UTC-day axis, grid, schema, and bounded representative slices:
@@ -175,32 +173,21 @@ not prove scientific correctness.
 
 ### Build the Heat Index target (required)
 
-The predictor cache remains unchanged. This CPU job adds only 46 annual ERA5
-daily-mean 2 m dewpoint requests to the completed archive, calculates Heat
-Index on the native grid, writes the separate lazy target array, and rebuilds
-all fold-safe normalization and threshold sidecars:
+The predictor cache remains unchanged. This CPU job streams only the 46 annual
+ERA5 daily-mean 2 m dewpoint files from public Google ARCO-ERA5, calculates
+Heat Index on the native grid, writes the separate lazy target array, and
+rebuilds all fold-safe normalization and threshold sidecars:
 
 ```bash
 cd /blue/nessie/mostafarezaali/HeatCast-Global && sbatch slurm/submit_global_heat_index_build.slurm
 ```
 
-The Heat Index submission uses eight downloader workers and sixteen request
-lanes for the daily-statistics dataset, so the missing annual dewpoint requests
-are submitted concurrently. Resumes are resolved before any lane opens: a target
-whose metadata sidecar matches the task and its recorded byte count is skipped
-without reopening the NetCDF header, because that sidecar is published only
-after the header was validated. The 231 files already in the archive therefore
-cost one `stat` each instead of a serialized HDF5 open, and the missing requests
-reach the CDS queue immediately. Pass `--revalidate` to force the full header
-audit during a resume; `validate_pipeline raw` always performs it.
-
-A ready result is handed to the transfer pool and the lane submits its next CDS
-request at once, so queue time is never spent waiting on local writes. Each
-result is additionally attempted with four HTTP byte-range segments written
-directly into their offsets in one preallocated file; if the signed CDS result
-server does not support ranges, the downloader automatically falls back to its
-standard single stream. CDS may still queue or throttle transfers server-side;
-completed files remain atomic and resume-safe.
+The Heat Index submission uses eight parallel annual streams. Each stream reads
+24 hourly dewpoint fields per UTC day, writes the reduced daily mean, and records
+its last committed day in a progress sidecar. A restart therefore continues
+inside the interrupted annual file. The 231 completed predictor files retain
+their original validated metadata and are not opened or replaced. Final raw
+validation still reopens all 277 NetCDF headers before target construction.
 
 Progress is reported as `HEAT_INDEX_PROGRESS`. Completion requires
 `heat_index_complete=1` for all 16,802 UTC days. Do not submit training until

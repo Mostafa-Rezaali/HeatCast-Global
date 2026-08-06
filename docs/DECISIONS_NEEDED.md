@@ -48,16 +48,12 @@ interpolation. The only affected full-W34 MJJAS model initialization is
 Monday/Thursday evaluation calendar. Missing PNA/NAO values on 2006-10-26 and
 2007-01-26 fall outside the valid MJJAS initialization season.
 
-## CDS credentials
+## ERA5 source -- resolved 2026-08-06
 
-`TODO(USER)`: Install and validate the ERA5 Climate Data Store API token in
-`~/.cdsapirc-era5` on HiPerGator, using
-`url: https://cds.climate.copernicus.eu/api`, and accept the required ERA5
-dataset licenses before running the download workflow. Keep any existing
-`~/.cdsapirc` using `https://ecds.ecmwf.int/api` for the separate ECMWF S2S
-workflow.
-
-This is an operational credential decision; no key or token belongs in Git.
+The user selected the public Google ARCO-ERA5 versioned Zarr dataset instead of CDS
+for ERA5 reanalysis acquisition. Public ARCO reads require no CDS token. Any
+existing `~/.cdsapirc` using `https://ecds.ecmwf.int/api` remains dedicated to
+the separate ECMWF S2S/ENS workflow; no key or token belongs in Git.
 
 ## W34 storyline summers
 

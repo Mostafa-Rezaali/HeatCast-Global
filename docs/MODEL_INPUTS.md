@@ -55,9 +55,16 @@ positional/calendar/insolation channels are assembled lazily per sample. The
 store is opened inside each Dataset worker, never in the parent process, and
 has `time=1` chunks.
 
-Daily-mean 2 m dewpoint is target-construction data, not an additional model
-input. Tmax remains the three lagged thermal-state inputs after the target is
-changed to Heat Index, so the established 26-channel architecture is unchanged.
+The production reanalysis source is the public Google ARCO-ERA5
+`full_37-1h-0p25deg-chunk-1.zarr-v3` store. Hourly temperature is reduced to
+UTC-day Tmax and daily mean, while the remaining dynamic predictors preserve
+the established 00 UTC sampling contract before downstream regridding. Source
+URLs and provider identity are recorded beside every raw NetCDF file.
+
+Daily-mean 2 m dewpoint is streamed from the same ARCO-ERA5 store and is
+target-construction data, not an additional model input. Tmax remains the three
+lagged thermal-state inputs after the target is changed to Heat Index, so the
+established 26-channel architecture is unchanged.
 
 ### Vector input: 8 channels
 
