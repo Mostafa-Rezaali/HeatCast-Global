@@ -22,6 +22,11 @@ path remains available for full-field ensemble and tail analyses.
 This repository is code-only. ERA5, ECMWF S2S data, zarr stores, checkpoints,
 figures, logs, and other runtime artifacts are intentionally excluded.
 
+ERA5 reanalysis is streamed anonymously from Google's public ARCO-ERA5 Zarr
+store and reduced into resumable annual NetCDF files with the repository's
+existing raw-data layout. ECMWF S2S ensemble forecasts and reforecasts remain a
+separate ECDS workflow; ARCO-ERA5 is reanalysis and is not an ENS substitute.
+
 ## Domain modes
 
 All global behavior is introduced behind `Config.DOMAIN`:

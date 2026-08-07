@@ -34,6 +34,7 @@ DEFAULT_SEGMENTS_PER_FILE = 1
 DEFAULT_MAX_RETRIES = 12
 DEFAULT_RETRY_BASE_SECONDS = 60.0
 MAX_RETRY_DELAY_SECONDS = 900.0
+CLIENT_POLL_SECONDS = 15.0
 YEAR_RANGE: Tuple[int, ...] = tuple(range(1979, 2025))
 MONTHS: Tuple[int, ...] = tuple(range(1, 13))
 HOURS: Tuple[str, ...] = tuple(f"{hour:02d}:00" for hour in range(24))
@@ -69,6 +70,11 @@ NETCDF_VARIABLE_CANDIDATES = {
 # The HiPerGator netCDF4/HDF5 build is not thread-safe. CDS requests and HTTP
 # transfers remain parallel, but every local NetCDF header open is serialized.
 _NETCDF_VALIDATION_LOCK = threading.Lock()
+
+# One cdsapi client per request lane. Building a client per task re-read the
+# credential file and opened a new session for every retrieval, and the default
+# result-polling interval leaves a finished result idle for up to two minutes.
+_LANE_STATE = threading.local()
 
 
 @dataclass(frozen=True)
@@ -342,6 +348,25 @@ def build_download_tasks(
     return tuple(tasks)
 
 
+def lane_cds_client():
+    """Return this request lane's cached cdsapi client with tight result polling."""
+    client = getattr(_LANE_STATE, "client", None)
+    if client is not None:
+        return client
+    try:
+        import cdsapi
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install cdsapi and configure ~/.cdsapirc-era5 on HiPerGator."
+        ) from exc
+    try:
+        client = cdsapi.Client(sleep_max=CLIENT_POLL_SECONDS)
+    except TypeError:
+        client = cdsapi.Client()
+    _LANE_STATE.client = client
+    return client
+
+
 def _metadata_path(target: Path) -> Path:
     return target.with_suffix(target.suffix + ".metadata.json")
 
@@ -388,8 +413,16 @@ def validate_download_file(path: Path, task: DownloadTask) -> None:
         raise RuntimeError(f"Invalid NetCDF payload for {task.group}: {path}: {exc}") from exc
 
 
-def task_complete(task: DownloadTask) -> bool:
-    """Return whether a non-empty target and matching task metadata exist."""
+def task_complete(task: DownloadTask, *, deep: bool = False) -> bool:
+    """Return whether a non-empty target and matching task metadata exist.
+
+    The metadata sidecar is published only after ``validate_download_file``
+    accepts the payload, so a matching sidecar is itself proof that the NetCDF
+    header was read and approved once. Resumes therefore compare the recorded
+    byte count instead of reopening every archived file through the serialized,
+    thread-unsafe HDF5 reader; ``deep=True`` restores the full header audit for
+    ``validate_pipeline`` and for ``--revalidate`` runs.
+    """
     target = Path(task.target)
     metadata_path = _metadata_path(target)
     if not target.is_file() or target.stat().st_size <= 0 or not metadata_path.is_file():
@@ -400,6 +433,11 @@ def task_complete(task: DownloadTask) -> bool:
         return False
     if metadata.get("task") != _task_record(task):
         return False
+    validated_bytes = metadata.get("validated_bytes")
+    if validated_bytes is not None and int(validated_bytes) != target.stat().st_size:
+        return False
+    if not deep:
+        return True
     try:
         validate_download_file(target, task)
     except RuntimeError:
@@ -435,15 +473,12 @@ def _download_result_in_segments(result, target: Path, segments: int) -> bool:
          ((index + 1) * content_length // segment_count) - 1)
         for index in range(segment_count)
     ]
-    segment_paths = tuple(
-        target.with_suffix(target.suffix + f".segment{index:02d}")
-        for index in range(segment_count)
-    )
 
+    # Each range is written straight into its slot in one sparse file. Staging
+    # segments as separate files and joining them afterwards doubled the local
+    # write volume and added a full serial read of every multi-gigabyte result.
     def fetch(index: int) -> None:
         start, stop = boundaries[index]
-        path = segment_paths[index]
-        path.unlink(missing_ok=True)
         with requests.get(
             str(location),
             headers={"Range": f"bytes={start}-{stop}", "Accept-Encoding": "identity"},
@@ -455,14 +490,17 @@ def _download_result_in_segments(result, target: Path, segments: int) -> bool:
                     f"CDS result server did not honor byte range {start}-{stop}: "
                     f"HTTP {response.status_code}."
                 )
-            with path.open("wb") as output:
+            written = 0
+            with target.open("r+b") as output:
+                output.seek(start)
                 for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
                     if chunk:
                         output.write(chunk)
+                        written += len(chunk)
         expected = stop - start + 1
-        if path.stat().st_size != expected:
+        if written != expected:
             raise RuntimeError(
-                f"CDS range size mismatch for {path}: {path.stat().st_size} != {expected}."
+                f"CDS range size mismatch for bytes {start}-{stop}: {written} != {expected}."
             )
 
     try:
@@ -470,18 +508,12 @@ def _download_result_in_segments(result, target: Path, segments: int) -> bool:
             f"Using {segment_count} HTTP range segments for {content_length / 2**20:.1f} MiB CDS result.",
             flush=True,
         )
+        with target.open("wb") as output:
+            output.truncate(content_length)
         with ThreadPoolExecutor(max_workers=segment_count) as executor:
             futures = [executor.submit(fetch, index) for index in range(segment_count)]
             for future in as_completed(futures):
                 future.result()
-        with target.open("wb") as output:
-            for path in segment_paths:
-                with path.open("rb") as source:
-                    while True:
-                        chunk = source.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        output.write(chunk)
         if target.stat().st_size != content_length:
             raise RuntimeError(
                 f"Joined CDS result size mismatch: {target.stat().st_size} != {content_length}."
@@ -494,9 +526,6 @@ def _download_result_in_segments(result, target: Path, segments: int) -> bool:
             flush=True,
         )
         return False
-    finally:
-        for path in segment_paths:
-            path.unlink(missing_ok=True)
 
 
 def download_prepared_task(
@@ -517,11 +546,13 @@ def download_prepared_task(
         if not _download_result_in_segments(result, partial, segments_per_file):
             result.download(str(partial))
         validate_download_file(partial, task)
+        validated_bytes = partial.stat().st_size
         partial.replace(target)
         metadata = {
             "task": _task_record(task),
             "target_source": task.source_choice,
             "utc_days": True,
+            "validated_bytes": int(validated_bytes),
         }
         metadata_path = _metadata_path(target)
         metadata_partial = metadata_path.with_suffix(metadata_path.suffix + ".part")
@@ -567,6 +598,7 @@ def run_tasks(
     segments_per_file: int = DEFAULT_SEGMENTS_PER_FILE,
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_base_seconds: float = DEFAULT_RETRY_BASE_SECONDS,
+    revalidate: bool = False,
 ) -> None:
     """Run parallel CDS requests with per-dataset limits and queue backoff."""
     if int(workers) < 1:
@@ -582,27 +614,45 @@ def run_tasks(
     pending_tasks = tuple(tasks)
     config_path = validate_cds_endpoint()
     os.environ["CDSAPI_RC"] = str(config_path)
-    tasks_by_dataset = {}
+
+    progress_lock = threading.Lock()
+    completed = 0
+
+    def report(message):
+        nonlocal completed
+        with progress_lock:
+            completed += 1
+            print(f"[{completed}/{len(pending_tasks)}] {message}", flush=True)
+
+    # Resolve every resume before a single lane opens. Completed tasks used to be
+    # discovered one at a time inside the lanes, so an archive that is already
+    # almost complete pushed each genuinely missing request behind a long serial
+    # walk of files that were never going to be downloaded.
+    outstanding = []
     for task in pending_tasks:
+        if task_complete(task, deep=bool(revalidate)):
+            report(f"exists, skipping: {task.target}")
+        else:
+            outstanding.append(task)
+    if not outstanding:
+        print(f"All {len(pending_tasks)} CDS tasks are already complete.", flush=True)
+        return
+
+    tasks_by_dataset = {}
+    for task in outstanding:
         tasks_by_dataset.setdefault(task.dataset, []).append(task)
     print(
-        f"Starting {len(pending_tasks)} CDS tasks with "
+        f"Starting {len(outstanding)} CDS tasks with "
         f"{int(workers)} download workers, {int(per_dataset_workers)} "
         f"independent request lane(s) per dataset, {int(segments_per_file)} "
         "HTTP segment(s) per file, and automatic queue backoff.",
         flush=True,
     )
 
-    def prepare_with_retry(task):
-        try:
-            import cdsapi
-        except ImportError as exc:
-            raise RuntimeError(
-                "Install cdsapi and configure ~/.cdsapirc-era5 on HiPerGator."
-            ) from exc
+    def prepare_with_retry(client, task):
         for retry_number in range(int(max_retries) + 1):
             try:
-                return prepare_task(cdsapi.Client(), task)
+                return prepare_task(client, task)
             except Exception as exc:
                 if (
                     not is_retryable_cds_error(exc)
@@ -624,17 +674,9 @@ def run_tasks(
                 time.sleep(delay)
         raise AssertionError("CDS retry loop ended unexpectedly.")
 
-    progress_lock = threading.Lock()
     download_slots = threading.BoundedSemaphore(int(workers))
     download_futures = []
     download_futures_lock = threading.Lock()
-    completed = 0
-
-    def report(message):
-        nonlocal completed
-        with progress_lock:
-            completed += 1
-            print(f"[{completed}/{len(pending_tasks)}] {message}", flush=True)
 
     def finish_download(future):
         download_slots.release()
@@ -644,24 +686,24 @@ def run_tasks(
             # The main thread re-raises the same failure after joining lanes.
             pass
 
+    def bounded_download(result, task):
+        # The transfer, not the request lane that produced it, holds the slot.
+        download_slots.acquire()
+        return download_prepared_task(result, task, int(segments_per_file))
+
     with ThreadPoolExecutor(max_workers=int(workers)) as download_executor:
         def request_lane(lane_tasks):
+            client = lane_cds_client()
             for task in lane_tasks:
-                result = prepare_with_retry(task)
+                result = prepare_with_retry(client, task)
                 if result is None:
                     report(f"exists, skipping: {task.target}")
                     continue
-                download_slots.acquire()
-                try:
-                    future = download_executor.submit(
-                        download_prepared_task,
-                        result,
-                        task,
-                        int(segments_per_file),
-                    )
-                except BaseException:
-                    download_slots.release()
-                    raise
+                # Hand the ready result to the transfer pool and submit the next
+                # CDS request immediately. Blocking the lane on a free download
+                # slot left the far more expensive CDS queue idle while the node
+                # finished writing the previous multi-gigabyte result.
+                future = download_executor.submit(bounded_download, result, task)
                 with download_futures_lock:
                     download_futures.append(future)
                 future.add_done_callback(finish_download)
@@ -711,6 +753,14 @@ def main() -> int:
         "--retry_base_seconds", type=float, default=DEFAULT_RETRY_BASE_SECONDS
     )
     parser.add_argument("--enable_heat_index", action="store_true", default=False)
+    parser.add_argument(
+        "--revalidate",
+        action="store_true",
+        help=(
+            "Reopen every archived NetCDF header while resolving resumes instead "
+            "of trusting the validated byte count in each metadata sidecar."
+        ),
+    )
     parser.add_argument("--manifest_only", action="store_true")
     args = parser.parse_args()
     raw_root = args.data_root / "raw" / "era5"
@@ -739,6 +789,7 @@ def main() -> int:
         segments_per_file=args.segments_per_file,
         max_retries=args.max_retries,
         retry_base_seconds=args.retry_base_seconds,
+        revalidate=args.revalidate,
     )
     return 0
 

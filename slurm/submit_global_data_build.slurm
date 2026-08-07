@@ -20,16 +20,17 @@ YEARS=${YEARS:-1979-2024}
 MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
 DOWNLOAD_CHUNKING=${DOWNLOAD_CHUNKING:-yearly}
-DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-1}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
 DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
+ARCO_PROGRESS_EVERY=${ARCO_PROGRESS_EVERY:-10}
+ARCO_ERA5_STORE=${ARCO_ERA5_STORE:-gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3}
+ARCO_GROUPS=${ARCO_GROUPS:-daily_tmax,daily_t2m,single_levels,pressure_geopotential,pressure_850,static}
 BUILD_FOLD_SIDECARS=${BUILD_FOLD_SIDECARS:-1}
 DOWNLOAD_ONLY=${DOWNLOAD_ONLY:-0}
 SKIP_DOWNLOAD=${SKIP_DOWNLOAD:-0}
 CACHE_SAMPLE_COUNT=${CACHE_SAMPLE_COUNT:-9}
 CACHE_WORKERS=${CACHE_WORKERS:-64}
 CACHE_PROGRESS_EVERY=${CACHE_PROGRESS_EVERY:-30}
-ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
 
 cd "$REPO_DIR"
 unset PYTHONHOME PYTHONPATH
@@ -46,14 +47,6 @@ case "$SKIP_DOWNLOAD" in
         exit 2
         ;;
 esac
-if [ "$SKIP_DOWNLOAD" = "0" ]; then
-    ERA5_CDS_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}
-    export CDSAPI_RC="$ERA5_CDS_RC"
-    test -s "$CDSAPI_RC" || {
-        echo "Missing ERA5 CDS credentials at $CDSAPI_RC. Resolve TODO(USER) in docs/DECISIONS_NEEDED.md."
-        exit 2
-    }
-fi
 case "$DOWNLOAD_WORKERS" in
     ''|*[!0-9]*|0)
         echo "DOWNLOAD_WORKERS must be a positive integer; got '$DOWNLOAD_WORKERS'."
@@ -64,12 +57,6 @@ case "$DOWNLOAD_CHUNKING" in
     yearly|monthly) ;;
     *)
         echo "DOWNLOAD_CHUNKING must be yearly or monthly; got '$DOWNLOAD_CHUNKING'."
-        exit 2
-        ;;
-esac
-case "$DOWNLOAD_PER_DATASET" in
-    ''|*[!0-9]*|0)
-        echo "DOWNLOAD_PER_DATASET must be a positive integer; got '$DOWNLOAD_PER_DATASET'."
         exit 2
         ;;
 esac
@@ -93,27 +80,31 @@ case "$CACHE_PROGRESS_EVERY" in
 esac
 
 git pull --ff-only origin main
-"$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py src/data_pipeline/validate_pipeline.py
+"$PY" -m py_compile src/repo_integrity.py src/data_pipeline/download_era5.py src/data_pipeline/download_arco_era5.py src/data_pipeline/regrid.py src/data_pipeline/build_cache.py src/data_pipeline/check_cache.py src/data_pipeline/validate_pipeline.py
 "$PY" src/repo_integrity.py
 
 if [ "$SKIP_DOWNLOAD" = "0" ]; then
-    echo "ERA5 download plan: $DOWNLOAD_CHUNKING files, $DOWNLOAD_WORKERS local workers, $DOWNLOAD_PER_DATASET active request per dataset"
+    "$PY" -c 'import tensorstore' || {
+        echo "Missing TensorStore. Install once with: $PY -m pip install tensorstore"
+        exit 2
+    }
+    echo "Google ARCO-ERA5 plan: $DOWNLOAD_CHUNKING files, $DOWNLOAD_WORKERS workers, groups=$ARCO_GROUPS"
     (
         cd src
-        "$PY" -m data_pipeline.download_era5 \
+        "$PY" -m data_pipeline.download_arco_era5 \
           --data_root "$DATA_ROOT" \
           --years "$YEARS" \
           --months "$MONTHS" \
           --chunking "$DOWNLOAD_CHUNKING" \
-          --target_source "$TARGET_SOURCE" \
-          --pressure_dataset "$ERA5_PRESSURE_DATASET" \
+          --groups "$ARCO_GROUPS" \
           --workers "$DOWNLOAD_WORKERS" \
-          --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
+          --store "$ARCO_ERA5_STORE" \
           --max_retries "$DOWNLOAD_MAX_RETRIES" \
-          --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS"
+          --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS" \
+          --progress_every "$ARCO_PROGRESS_EVERY"
     )
 else
-    echo "SKIP_DOWNLOAD=1: using the completed local ERA5 archive without contacting CDS"
+    echo "SKIP_DOWNLOAD=1: using the completed local ERA5 archive without contacting Google Cloud"
 fi
 
 (

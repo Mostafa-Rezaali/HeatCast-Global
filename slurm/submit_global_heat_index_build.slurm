@@ -19,14 +19,13 @@ YEARS=${YEARS:-1979-2024}
 MONTHS=${MONTHS:-1,2,3,4,5,6,7,8,9,10,11,12}
 DOWNLOAD_CHUNKING=${DOWNLOAD_CHUNKING:-yearly}
 DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
-DOWNLOAD_PER_DATASET=${DOWNLOAD_PER_DATASET:-8}
-DOWNLOAD_SEGMENTS_PER_FILE=${DOWNLOAD_SEGMENTS_PER_FILE:-4}
 DOWNLOAD_MAX_RETRIES=${DOWNLOAD_MAX_RETRIES:-12}
 DOWNLOAD_RETRY_BASE_SECONDS=${DOWNLOAD_RETRY_BASE_SECONDS:-60}
+ARCO_PROGRESS_EVERY=${ARCO_PROGRESS_EVERY:-10}
+ARCO_ERA5_STORE=${ARCO_ERA5_STORE:-gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3}
 HEAT_INDEX_WORKERS=${HEAT_INDEX_WORKERS:-64}
 HEAT_INDEX_PROGRESS_EVERY=${HEAT_INDEX_PROGRESS_EVERY:-30}
 FOLD_YEARS_JSON=${FOLD_YEARS_JSON:-$REPO_DIR/configs/global_fold_years.json}
-ERA5_PRESSURE_DATASET=${ERA5_PRESSURE_DATASET:-reanalysis-era5-pressure-levels}
 
 cd "$REPO_DIR"
 unset PYTHONHOME PYTHONPATH
@@ -39,33 +38,34 @@ export HEATCAST_DOMAIN=global
 export HEATCAST_RESOLUTION="$RESOLUTION"
 export HEATCAST_GLOBAL_TARGET=heat_index
 export HEATCAST_FOLD_YEARS_JSON="$FOLD_YEARS_JSON"
-export CDSAPI_RC=${ERA5_CDS_RC:-$HOME/.cdsapirc-era5}
 
-test -s "$CDSAPI_RC"
 test -s "$DATA_ROOT/cache/era5_${RESOLUTION}.zarr/heatcast_cache_metadata.json"
 test -s "$DATA_ROOT/cache/teleconnection_5.npy"
 test -s "$DATA_ROOT/drivers/rmm.txt"
 test -s "$FOLD_YEARS_JSON"
 
 git pull --ff-only origin main
-"$PY" -m py_compile src/heat_index.py src/data_pipeline/download_era5.py src/data_pipeline/build_heat_index_target.py src/build_global_fold_sidecars.py
+"$PY" -m py_compile src/heat_index.py src/data_pipeline/download_era5.py src/data_pipeline/download_arco_era5.py src/data_pipeline/build_heat_index_target.py src/build_global_fold_sidecars.py
 "$PY" src/repo_integrity.py
+"$PY" -c 'import tensorstore' || {
+    echo "Missing TensorStore. Install once with: $PY -m pip install tensorstore"
+    exit 2
+}
 
-echo "Downloading only missing Heat Index source data: 46 annual daily-mean dewpoint files"
+echo "Streaming only missing Heat Index source data from public Google ARCO-ERA5: 46 annual daily-mean dewpoint files"
 (
     cd src
-    "$PY" -m data_pipeline.download_era5 \
+    "$PY" -m data_pipeline.download_arco_era5 \
       --data_root "$DATA_ROOT" \
       --years "$YEARS" \
       --months "$MONTHS" \
       --chunking "$DOWNLOAD_CHUNKING" \
-      --target_source daily_statistics \
-      --pressure_dataset "$ERA5_PRESSURE_DATASET" \
+      --groups daily_d2m \
       --workers "$DOWNLOAD_WORKERS" \
-      --per_dataset_workers "$DOWNLOAD_PER_DATASET" \
-      --segments_per_file "$DOWNLOAD_SEGMENTS_PER_FILE" \
+      --store "$ARCO_ERA5_STORE" \
       --max_retries "$DOWNLOAD_MAX_RETRIES" \
       --retry_base_seconds "$DOWNLOAD_RETRY_BASE_SECONDS" \
+      --progress_every "$ARCO_PROGRESS_EVERY" \
       --enable_heat_index
 
     "$PY" -m data_pipeline.validate_pipeline raw \

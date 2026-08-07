@@ -23,8 +23,10 @@ not merely that Python files compile.
 - The ECMWF downloader and evaluation import one full-W34-valid MJJAS
   Monday/Thursday initialization calendar.
 - Global spatial reductions use the shared normalized cosine-latitude helper.
-- ERA5 requests are monthly, resumable, atomic, source-recorded, and blocked
-  when an unspecified CDS dataset identifier would otherwise be guessed.
+- ERA5 reanalysis acquisition uses the pinned public Google ARCO-ERA5 Zarr
+  store, reduces hourly temperature/dewpoint over UTC days, preserves 00 UTC
+  predictor sampling, and writes resumable, atomic, source-recorded NetCDFs.
+  The legacy CDS downloader remains tested as an explicit fallback.
 - Conservative target and bilinear predictor regridding have a pure-SciPy
   fallback; zarr uses `time=1` chunks and opens only within Dataset workers.
 - Global mesh refinement derives from resolution, keeps the complete sphere,
